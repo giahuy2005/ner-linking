@@ -1,0 +1,12 @@
+vncorenlp
+lxml
+openpyxl
+numpy
+torch
+transformers
+faiss-cpu
+tqdm
+rapidfuzz
+python-dotenv
+pandas
+pytorch-crf

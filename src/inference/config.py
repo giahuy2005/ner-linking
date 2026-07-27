@@ -1,0 +1,55 @@
+"""Cấu hình cho pipeline inference/ner.
+
+Không đặt logic ở đây — chỉ hằng số / default path. Sửa các giá trị này
+(hoặc override bằng biến môi trường / CLI arg ở tầng gọi) khi đổi model,
+KHÔNG hard-code lại ở engine.py.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+# ---------------------------------------------------------------------------
+# Model NER + assertion (bản CRF, khớp train_ner_colab_crf)
+# ---------------------------------------------------------------------------
+DEFAULT_BACKBONE = "demdecuong/vihealthbert-base-word"
+DEFAULT_CHECKPOINT_PATH = Path("models/ner/best_ner_assertion_model.pth")
+DEFAULT_LABEL_DICTS_PATH = Path("models/ner/label_dicts_crf.json")
+DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# PHẢI khớp giá trị dùng lúc train — sai giá trị này thì load_state_dict
+# vẫn chạy được (không đổi shape) nhưng assertion head sẽ pool sai vùng
+# context, làm assertion prediction sai lệch không báo lỗi.
+CONTEXT_WINDOW = 10
+
+# ---------------------------------------------------------------------------
+# VnCoreNLP (word segmenter dùng để map offset)
+# ---------------------------------------------------------------------------
+DEFAULT_VNCORENLP_JAR = Path("vncorenlp/VnCoreNLP-1.1.1.jar")
+
+# ---------------------------------------------------------------------------
+# Suy luận / chunking
+# ---------------------------------------------------------------------------
+MAX_LEN = 256
+OVERLAP_WORDS = 32
+ASSERTION_THRESHOLD = 0.5
+SINGLE_ASSERTION = False  # True nếu submit yêu cầu ép 1 assertion/entity
+
+# ---------------------------------------------------------------------------
+# Rule filter (repair_gate) — bật/tắt để dễ so sánh A/B khi tune
+# ---------------------------------------------------------------------------
+ENABLE_REPAIR_GATE = True
+
+# ---------------------------------------------------------------------------
+# Linking (RxNorm cho THUỐC, ICD-10 cho CHẨN_ĐOÁN) — dùng ở pipeline.py.
+# Để None thì pipeline tự skip linking, chỉ chạy NER (test nhanh không cần
+# build index/model linker).
+# ---------------------------------------------------------------------------
+RXNORM_INDEX_DIR: Path | None = Path("models/rxnorm")
+RXNORM_CLEAN_PATH: Path | None = None
+ICD10_INDEX_DIR: Path | None = Path("models/icd10")
+LINKER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LINKER_TOP_K = 10  # số candidate tối đa trả về mỗi entity
