@@ -11,6 +11,13 @@ from pathlib import Path
 
 import torch
 
+
+from ..linking.rxnorm.config import (
+    DEFAULT_INDEX_DIR as DEFAULT_RXNORM_INDEX_DIR,
+    DEFAULT_CLEAN_PATH as DEFAULT_RXNORM_CLEAN_PATH,
+)
+from ..linking.icd10.config import DEFAULT_INDEX_DIR as DEFAULT_ICD10_INDEX_DIR
+
 # ---------------------------------------------------------------------------
 # Model NER + assertion (bản CRF, khớp train_ner_colab_crf)
 # ---------------------------------------------------------------------------
@@ -48,8 +55,8 @@ ENABLE_REPAIR_GATE = True
 # Để None thì pipeline tự skip linking, chỉ chạy NER (test nhanh không cần
 # build index/model linker).
 # ---------------------------------------------------------------------------
-RXNORM_INDEX_DIR: Path | None = Path("models/rxnorm")
-RXNORM_CLEAN_PATH: Path | None = None
-ICD10_INDEX_DIR: Path | None = Path("models/icd10")
+RXNORM_INDEX_DIR: Path | None = DEFAULT_RXNORM_INDEX_DIR
+RXNORM_CLEAN_PATH: Path | None = DEFAULT_RXNORM_CLEAN_PATH
+ICD10_INDEX_DIR: Path | None = DEFAULT_ICD10_INDEX_DIR
 LINKER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LINKER_TOP_K = 10  # số candidate tối đa trả về mỗi entity
