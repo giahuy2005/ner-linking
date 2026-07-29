@@ -88,6 +88,7 @@ def _is_single_word_noise(text: str, ent_type: str) -> bool:
 # để bạn tự quyết định log/drop khi review.
 # ---------------------------------------------------------------------------
 _SUSPECT_TRUNCATED_DIAGNOSIS = {"da", "gan", "thận", "phổi", "tim", "thiếu", "suy"}
+LOW_CONFIDENCE_THRESHOLD = 0.80
 
 
 def _is_suspect_truncated(text: str, ent_type: str) -> bool:
@@ -137,6 +138,8 @@ def filter_entities(entities: list[dict], *, drop_suspect_truncated: bool = Fals
                 dropped.append({**ent, "reason": "suspect_truncated_diagnosis"})
                 continue
             ent = {**ent, "flag": "suspect_truncated_diagnosis"}
+        elif float(ent.get("score", 1.0)) < LOW_CONFIDENCE_THRESHOLD:
+            ent = {**ent, "flag": "low_emission_confidence"}
 
         kept.append(ent)
 

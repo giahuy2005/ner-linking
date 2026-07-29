@@ -33,7 +33,6 @@ data/synthetic/
 data/input/
 data/input_/
 data/output/
-src/data_gen
 *.csv
 *.tsv
 *.xlsx
@@ -50,6 +49,7 @@ dict/
 *.memmap
 output/
 outputs/
+output_candidate_fixed/
 submissions/
 *.zip
 notebook/

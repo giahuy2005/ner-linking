@@ -28,16 +28,18 @@ class GenerateProfileTests(unittest.TestCase):
         counts = {}
         for focus in schedule:
             counts[focus["key"]] = counts.get(focus["key"], 0) + 1
-        self.assertEqual(180, counts["contrastive_assertions"])
-        self.assertEqual(150, counts["dense_ner_boundaries"])
+        self.assertEqual(130, counts["contrastive_assertions"])
+        self.assertEqual(110, counts["dense_ner_boundaries"])
         self.assertEqual(
-            100,
+            90,
             counts["sparse_zero_entity"]
             + counts["sparse_one_type"]
             + counts["sparse_two_types"],
         )
-        self.assertEqual(100, counts["false_cues_and_scope"])
-        self.assertEqual(70, counts["dirty_btc_text"])
+        self.assertEqual(80, counts["false_cues_and_scope"])
+        self.assertEqual(50, counts["dirty_btc_text"])
+        self.assertEqual(80, counts["btc_medication_lists"])
+        self.assertEqual(60, counts["complete_occurrence_recall"])
         self.assertEqual(
             round(600 * V5_DIRTY_RECORD_PERCENT / 100),
             sum(bool(focus.get("boundary_noise")) for focus in schedule),
@@ -81,6 +83,41 @@ class GenerateProfileTests(unittest.TestCase):
         self.assertIn("`entities` bắt buộc là []", prompt)
         self.assertIn("Record thưa được phép có 0 entity", prompt)
         self.assertIn("không cải thiện", prompt)
+
+    def test_v5_medication_focus_anchors_btc_boundaries_and_assertions(self):
+        focus = next(f for f in V5_FOCUS_AREAS if f["key"] == "btc_medication_lists")
+        messages = build_generation_messages(
+            SECTION_TYPES[0], [], [], [], {}, {}, None, focus_cfg=focus
+        )
+        prompt = messages[-1]["content"]
+        self.assertIn("tên + strength + dose form + route + frequency", prompt)
+        self.assertIn("không tự kế thừa isHistorical", prompt)
+        self.assertIn("Không được bỏ item cuối", prompt)
+
+        valid = {
+            "input_text": "a b c d e ho",
+            "entities": [
+                {"text": value, "type": "THUỐC", "assertions": ["isHistorical"]}
+                for value in "abcde"
+            ] + [{"text": "ho", "type": "TRIỆU_CHỨNG", "assertions": []}],
+        }
+        self.assertIsNone(validate_focus_quality(valid, focus))
+
+        invalid = dict(valid)
+        invalid["entities"] = [dict(entity) for entity in valid["entities"]]
+        invalid["entities"][-1]["assertions"] = ["isHistorical"]
+        self.assertIn("không được kế thừa", validate_focus_quality(invalid, focus))
+
+    def test_v5_recall_focus_rejects_missing_repeated_occurrence(self):
+        focus = next(f for f in V5_FOCUS_AREAS if f["key"] == "complete_occurrence_recall")
+        record = {
+            "input_text": "ho khan, ho khan và sốt.",
+            "entities": [
+                {"text": "ho khan", "type": "TRIỆU_CHỨNG", "assertions": []},
+                {"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": []},
+            ],
+        }
+        self.assertIn("occurrence", validate_focus_quality(record, focus))
 
     def test_v4_covers_observed_btc_long_formats(self):
         self.assertEqual(

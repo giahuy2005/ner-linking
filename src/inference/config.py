@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:  # Lightweight validation/linking utilities can run without ML deps.
+    torch = None
 
 
 from ..linking.rxnorm.config import (
@@ -24,7 +27,7 @@ from ..linking.icd10.config import DEFAULT_INDEX_DIR as DEFAULT_ICD10_INDEX_DIR
 DEFAULT_BACKBONE = "demdecuong/vihealthbert-base-word"
 DEFAULT_CHECKPOINT_PATH = Path("models/ner/best_ner_assertion_model.pth")
 DEFAULT_LABEL_DICTS_PATH = Path("models/ner/label_dicts_crf.json")
-DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEFAULT_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 
 
 # PHẢI khớp giá trị dùng lúc train — sai giá trị này thì load_state_dict
@@ -58,5 +61,5 @@ ENABLE_REPAIR_GATE = True
 RXNORM_INDEX_DIR: Path | None = DEFAULT_RXNORM_INDEX_DIR
 RXNORM_CLEAN_PATH: Path | None = DEFAULT_RXNORM_CLEAN_PATH
 ICD10_INDEX_DIR: Path | None = DEFAULT_ICD10_INDEX_DIR
-LINKER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LINKER_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 LINKER_TOP_K = 10  # số candidate tối đa trả về mỗi entity

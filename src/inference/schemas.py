@@ -22,7 +22,7 @@ class NerEntity:
     type: str
     assertions: list[str] = field(default_factory=list)
     position: tuple[int, int] = (0, 0)
-    score: float = 1.0  # điểm nội bộ (CRF không có prob per-token nên là hằng số)
+    score: float = 1.0  # confidence proxy từ emission của nhãn CRF đã decode
     flag: str | None = None  # lý do repair_gate nghi ngờ (vd "suspect_truncated_diagnosis"), None = không nghi ngờ
 
     def to_btc_dict(self, candidates: list[str] | None = None) -> dict[str, Any]:

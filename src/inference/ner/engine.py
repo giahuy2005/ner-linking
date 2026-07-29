@@ -219,6 +219,7 @@ class NerEngine:
             encoder_out = model.encoder(input_ids=input_ids_t, attention_mask=attention_mask_t)
             hidden = model.ner_dropout(encoder_out.last_hidden_state)
             ner_emissions = model.ner_head(hidden)
+            emission_probs = torch.softmax(ner_emissions, dim=-1)
 
             mask = attention_mask_t.bool()
             pred_tag_ids = model.crf.decode(ner_emissions, mask=mask)[0]
@@ -228,7 +229,10 @@ class NerEngine:
             for sw_start in word_to_subword_start:
                 pred_id = pred_tag_ids[sw_start]
                 word_tags.append(pp.get_label(self.id2nerlabel, pred_id))
-                word_confs.append(1.0)  # CRF không có prob per-token -> điểm cố định
+                # torchcrf không expose marginal probability. Xác suất emission
+                # tại nhãn mà CRF decode chọn vẫn là confidence proxy hữu ích hơn
+                # hằng số 1.0, nhất là để repair gate ưu tiên span đáng ngờ.
+                word_confs.append(float(emission_probs[0, sw_start, pred_id].item()))
 
             local_entities = pp.extract_entities_from_word_tags(
                 word_tags, line_ids=chunk_line_ids[:valid_word_count],
@@ -295,7 +299,7 @@ class NerEngine:
 
         final_dicts = [
             {"text": r["text"], "type": r["type"], "assertions": r["assertions"],
-             "position": [r["char_start"], r["char_end"]]}
+             "position": [r["char_start"], r["char_end"]], "score": r["score"]}
             for r in merged
         ]
 
@@ -304,7 +308,8 @@ class NerEngine:
 
         return [
             NerEntity(text=d["text"], type=d["type"], assertions=d["assertions"],
-                      position=(d["position"][0], d["position"][1]))
+                      position=(d["position"][0], d["position"][1]),
+                      score=float(d.get("score", 1.0)), flag=d.get("flag"))
             for d in final_dicts
         ]
 

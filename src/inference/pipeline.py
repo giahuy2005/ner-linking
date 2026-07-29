@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import config as cfg
 from . import io as inference_io
-from .ner.engine import NerEngine
 from .ner.postprocessor import clean_text_for_inference
 from .schemas import NerEntity
+
+if TYPE_CHECKING:
+    from .ner.engine import NerEngine
 
 # Map type NER -> tên linker sẽ dùng trong self._linkers. Chỉ 2 type có
 # linker đã build; các type khác luôn có candidates=[] (đúng ví dụ BTC,
@@ -40,6 +43,11 @@ from .schemas import NerEntity
 TYPE_TO_LINKER = {
     "THUỐC": "rxnorm",
     "CHẨN_ĐOÁN": "icd10",
+}
+
+MAX_OUTPUT_CANDIDATES = {
+    "THUỐC": 1,
+    "CHẨN_ĐOÁN": 3,
 }
 
 
@@ -92,6 +100,8 @@ class InferencePipeline:
         None — để test riêng NER không bắt buộc build FAISS index.
         KHÔNG load LLM ở đây — LLM lifecycle do caller (cli.py) quản lý
         riêng, xem docstring module."""
+        from .ner.engine import NerEngine
+
         ner_engine = NerEngine.load(**ner_engine_kwargs)
 
         rxnorm_linker = None
@@ -133,12 +143,22 @@ class InferencePipeline:
         raw_texts_by_id: dict[str, str],
         entities_by_id: dict[str, list[NerEntity]],
         fixer_llm,
+        *,
+        audit_missing: bool = True,
     ) -> dict[str, list[NerEntity]]:
-        from .ner.llm_fixer import fix_flagged_entities
+        from .ner.llm_fixer import audit_missing_entities_batch, fix_flagged_entities
 
         fixed_by_id: dict[str, list[NerEntity]] = {}
         for rid, entities in entities_by_id.items():
-            fixed_by_id[rid] = fix_flagged_entities(raw_texts_by_id[rid], entities, fixer_llm)
+            raw_text = raw_texts_by_id[rid]
+            fixed = fix_flagged_entities(raw_text, entities, fixer_llm)
+            fixed_by_id[rid] = fixed
+        if audit_missing:
+            fixed_by_id = audit_missing_entities_batch(
+                raw_texts_by_id,
+                fixed_by_id,
+                fixer_llm,
+            )
         return fixed_by_id
 
     # ------------------------------------------------------------
@@ -165,10 +185,18 @@ class InferencePipeline:
             print(f"[pipeline] linking lỗi cho '{ent.text}' ({ent.type}): {exc}", file=sys.stderr)
             return None
 
-    def attach_candidates(self, entities: list[NerEntity], *, selector_llm=None) -> dict[int, list[str]]:
+    def attach_candidates(
+        self,
+        entities: list[NerEntity],
+        *,
+        selector_llm=None,
+        raw_text: str | None = None,
+    ) -> dict[int, list[str]]:
         """selector_llm=None -> chỉ cắt top-k theo score linker (không LLM).
         selector_llm=instance đã load -> gọi candidate_selector re-rank."""
         candidates_by_entity: dict[int, list[str]] = {}
+        selector_indexes: list[int] = []
+        selector_items: list[dict] = []
 
         for i, ent in enumerate(entities):
             raw_candidates = self._get_raw_candidates(ent)
@@ -176,23 +204,82 @@ class InferencePipeline:
                 continue
 
             if selector_llm is not None:
-                from .selection.candidate_selector import select_candidates
-                candidates_by_entity[i] = select_candidates(
-                    ent.text, ent.type, raw_candidates, selector_llm,
-                    top_k_context=self.top_k_candidates,
-                )
+                context = ""
+                if raw_text is not None:
+                    start, end = ent.position
+                    context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)]
+                selector_indexes.append(i)
+                selector_items.append({
+                    "entity_text": ent.text,
+                    "entity_type": ent.type,
+                    "candidates": raw_candidates,
+                    "context": context,
+                })
             else:
-                candidates_by_entity[i] = _extract_codes(raw_candidates, self.top_k_candidates)
+                output_limit = MAX_OUTPUT_CANDIDATES[ent.type]
+                candidates_by_entity[i] = _extract_codes(raw_candidates, output_limit)
+
+        if selector_items:
+            from .selection.candidate_selector import select_candidates_many
+
+            selected_batches = select_candidates_many(
+                selector_items,
+                selector_llm,
+                top_k_context=self.top_k_candidates,
+            )
+            for index, selected in zip(selector_indexes, selected_batches):
+                candidates_by_entity[index] = selected
 
         return candidates_by_entity
 
     def run_linking_stage(
-        self, entities_by_id: dict[str, list[NerEntity]], *, selector_llm=None,
+        self,
+        entities_by_id: dict[str, list[NerEntity]],
+        *,
+        selector_llm=None,
+        raw_texts_by_id: dict[str, str] | None = None,
     ) -> dict[str, dict[int, list[str]]]:
-        return {
-            rid: self.attach_candidates(entities, selector_llm=selector_llm)
-            for rid, entities in entities_by_id.items()
+        if selector_llm is None:
+            return {
+                rid: self.attach_candidates(entities)
+                for rid, entities in entities_by_id.items()
+            }
+
+        from .selection.candidate_selector import select_candidates_many
+
+        results: dict[str, dict[int, list[str]]] = {
+            rid: {} for rid in entities_by_id
         }
+        destinations: list[tuple[str, int]] = []
+        selector_items: list[dict] = []
+        raw_texts_by_id = raw_texts_by_id or {}
+
+        for rid, entities in entities_by_id.items():
+            raw_text = raw_texts_by_id.get(rid)
+            for index, entity in enumerate(entities):
+                raw_candidates = self._get_raw_candidates(entity)
+                if not raw_candidates:
+                    continue
+                context = ""
+                if raw_text is not None:
+                    start, end = entity.position
+                    context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)]
+                destinations.append((rid, index))
+                selector_items.append({
+                    "entity_text": entity.text,
+                    "entity_type": entity.type,
+                    "candidates": raw_candidates,
+                    "context": context,
+                })
+
+        selected_batches = select_candidates_many(
+            selector_items,
+            selector_llm,
+            top_k_context=self.top_k_candidates,
+        )
+        for (rid, index), selected in zip(destinations, selected_batches):
+            results[rid][index] = selected
+        return results
 
     # ------------------------------------------------------------
     # Build output cuối — thuần ghép dữ liệu, không gọi model gì nữa
@@ -212,13 +299,30 @@ class InferencePipeline:
     # TRONG lệnh gọi này KHÔNG hợp lý cho batch, chỉ dùng cho test đơn lẻ.
     # Muốn dùng LLM ở đây, tự load fixer_llm/selector_llm rồi truyền vào.
     # ------------------------------------------------------------
-    def process_record(self, raw_text: str, *, fixer_llm=None, selector_llm=None, **predict_kwargs) -> list[dict]:
+    def process_record(
+        self,
+        raw_text: str,
+        *,
+        fixer_llm=None,
+        selector_llm=None,
+        audit_missing: bool = True,
+        **predict_kwargs,
+    ) -> list[dict]:
         entities_by_id = self.run_ner_stage({"_single": raw_text}, **predict_kwargs)
 
         if fixer_llm is not None:
-            entities_by_id = self.run_fixer_stage({"_single": raw_text}, entities_by_id, fixer_llm)
+            entities_by_id = self.run_fixer_stage(
+                {"_single": raw_text},
+                entities_by_id,
+                fixer_llm,
+                audit_missing=audit_missing,
+            )
 
-        candidates_by_id = self.run_linking_stage(entities_by_id, selector_llm=selector_llm)
+        candidates_by_id = self.run_linking_stage(
+            entities_by_id,
+            selector_llm=selector_llm,
+            raw_texts_by_id={"_single": raw_text},
+        )
         return self.build_outputs(entities_by_id, candidates_by_id)["_single"]
 
     def process_file(self, path: str | Path, **kwargs) -> list[dict]:

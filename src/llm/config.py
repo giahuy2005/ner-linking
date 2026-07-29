@@ -36,7 +36,7 @@ NER_FIXER_CONFIG = LocalModelConfig(
     cache_dir=None,
     load_in_4bit=True,
     local_files_only=False,
-    max_new_tokens=256,
+    max_new_tokens=512,
     supports_thinking=True,
     enable_thinking=False,  # tắt thinking: chỉ cần chọn boundary/type, không cần suy luận dài
 )
@@ -47,7 +47,7 @@ CANDIDATE_SELECTOR_CONFIG = LocalModelConfig(
     cache_dir=None,
     load_in_4bit=True,
     local_files_only=False,
-    max_new_tokens=256,
+    max_new_tokens=96,
     supports_thinking=False,
     enable_thinking=False,
 )

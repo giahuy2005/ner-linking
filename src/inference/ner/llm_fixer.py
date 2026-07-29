@@ -1,7 +1,7 @@
-"""Dùng LocalLLM (NER_FIXER_CONFIG) sửa CÁC ENTITY BỊ repair_gate FLAG
-nghi ngờ (vd 'suspect_truncated_diagnosis') — KHÔNG gửi toàn bộ entity
-của document, chỉ gửi phần cần nghi vấn, để tiết kiệm gọi model 7-tỷ-lần
-mỗi record.
+"""Dùng LocalLLM 1.7B để sửa entity bị repair_gate flag và audit omissions.
+
+Repair chỉ gọi theo entity nghi ngờ; recall audit gọi một lần/document rồi
+lọc đề xuất bằng exact substring, offset, overlap và schema deterministic.
 
 Lifecycle load/unload model do CALLER quản lý (không tự load() trong
 module này) — đúng ý đồ "load 1 lần, sửa cả batch, rồi unload" của bạn,
@@ -11,14 +11,21 @@ xem cli.py/pipeline.py chỗ gọi.
 from __future__ import annotations
 
 import sys
+from typing import TYPE_CHECKING
 
-from ...llm.backend import LocalLLM
 from ...llm.json_guard import extract_json
-from ...llm.prompts import build_ner_fixer_prompt
-from ...llm.response_schemas import NerFixSuggestion
+from ...llm.prompts import build_ner_fixer_prompt, build_ner_recall_audit_prompt
+from ...llm.response_schemas import NerAuditResponse, NerFixSuggestion
 from ..schemas import NerEntity
+from . import repair_gate
+
+if TYPE_CHECKING:
+    from ...llm.backend import LocalLLM
 
 CONTEXT_RADIUS = 60  # số ký tự lấy thêm mỗi bên entity làm context cho LLM
+MAX_AUDIT_DOCUMENT_CHARS = 12000
+MAX_AUDIT_ADDITIONS = 12
+LAB_TYPES = {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}
 
 
 def _get_context(raw_text: str, position: tuple[int, int], radius: int = CONTEXT_RADIUS) -> str:
@@ -37,12 +44,192 @@ def _locate_span(raw_text: str, position: tuple[int, int], new_text: str, radius
     ctx_end = min(len(raw_text), end + radius)
     window = raw_text[ctx_start:ctx_end]
 
-    idx = window.find(new_text)
-    if idx == -1:
+    matches = []
+    cursor = 0
+    while True:
+        idx = window.find(new_text, cursor)
+        if idx == -1:
+            break
+        abs_start = ctx_start + idx
+        matches.append((abs_start, abs_start + len(new_text)))
+        cursor = idx + 1
+
+    if not matches:
         return None
-    abs_start = ctx_start + idx
-    abs_end = abs_start + len(new_text)
-    return abs_start, abs_end
+    # Một thuật ngữ có thể lặp trong cùng context. Chọn occurrence gần span
+    # gốc nhất thay vì window.find() luôn lấy occurrence đầu tiên.
+    return min(matches, key=lambda span: (abs(span[0] - start), abs(span[1] - end)))
+
+
+def _overlaps(span: tuple[int, int], occupied: list[tuple[int, int]]) -> bool:
+    start, end = span
+    return any(start < other_end and end > other_start for other_start, other_end in occupied)
+
+
+def _resolve_audit_span(raw_text: str, suggestion, occupied: list[tuple[int, int]]):
+    """Resolve only exact, currently-uncovered occurrences.
+
+    LLM character arithmetic is often off for Vietnamese text. A supplied offset
+    is accepted only when exact; without a valid offset we accept text only when
+    exactly one uncovered occurrence exists, so repeated mentions cannot drift.
+    """
+    if suggestion.start is not None and suggestion.end is not None:
+        span = (suggestion.start, suggestion.end)
+        if (
+            0 <= span[0] < span[1] <= len(raw_text)
+            and raw_text[span[0]:span[1]] == suggestion.text
+            and not _overlaps(span, occupied)
+        ):
+            return span
+
+    matches = []
+    cursor = 0
+    while True:
+        index = raw_text.find(suggestion.text, cursor)
+        if index < 0:
+            break
+        span = (index, index + len(suggestion.text))
+        if not _overlaps(span, occupied):
+            matches.append(span)
+        cursor = index + 1
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validated_audit_entity(raw_text: str, suggestion, occupied: list[tuple[int, int]]):
+    if suggestion.type in LAB_TYPES and suggestion.assertions:
+        return None
+    span = _resolve_audit_span(raw_text, suggestion, occupied)
+    if span is None:
+        return None
+    candidate = {
+        "text": raw_text[span[0]:span[1]],
+        "type": suggestion.type,
+        "assertions": suggestion.assertions,
+        "position": [span[0], span[1]],
+    }
+    kept, dropped = repair_gate.filter_entities([candidate])
+    if dropped or not kept or kept[0].get("flag") is not None:
+        return None
+    return NerEntity(
+        text=candidate["text"],
+        type=candidate["type"],
+        assertions=list(candidate["assertions"]),
+        position=span,
+        score=0.5,
+        flag=None,
+    )
+
+
+def audit_missing_entities(
+    raw_text: str,
+    entities: list[NerEntity],
+    llm: LocalLLM,
+    *,
+    max_document_chars: int = MAX_AUDIT_DOCUMENT_CHARS,
+) -> list[NerEntity]:
+    """Ask 1.7B for high-precision omissions, then validate deterministically."""
+    if len(raw_text) > max_document_chars:
+        print(
+            f"[llm_audit] bỏ audit document dài {len(raw_text)} > {max_document_chars} ký tự",
+            file=sys.stderr,
+        )
+        return entities
+
+    existing_payload = [
+        {
+            "text": entity.text,
+            "type": entity.type,
+            "assertions": list(entity.assertions),
+            "position": list(entity.position),
+        }
+        for entity in entities
+    ]
+    system_prompt, user_prompt = build_ner_recall_audit_prompt(raw_text, existing_payload)
+    try:
+        raw_output = llm.generate(system_prompt, user_prompt)
+        response = NerAuditResponse.from_dict(extract_json(raw_output))
+    except Exception as exc:
+        print(f"[llm_audit] lỗi gọi/parse LLM: {exc} -> không thêm entity", file=sys.stderr)
+        return entities
+    if response is None:
+        print("[llm_audit] LLM trả sai schema -> không thêm entity", file=sys.stderr)
+        return entities
+
+    return _merge_audit_response(raw_text, entities, response)
+
+
+def _merge_audit_response(
+    raw_text: str,
+    entities: list[NerEntity],
+    response: NerAuditResponse,
+) -> list[NerEntity]:
+    occupied = [entity.position for entity in entities]
+    additions = []
+    for suggestion in response.additions[:MAX_AUDIT_ADDITIONS]:
+        entity = _validated_audit_entity(raw_text, suggestion, occupied)
+        if entity is None:
+            continue
+        additions.append(entity)
+        occupied.append(entity.position)
+
+    return sorted([*entities, *additions], key=lambda entity: entity.position)
+
+
+def audit_missing_entities_batch(
+    raw_texts_by_id: dict[str, str],
+    entities_by_id: dict[str, list[NerEntity]],
+    llm: LocalLLM,
+    *,
+    batch_size: int = 4,
+    max_document_chars: int = MAX_AUDIT_DOCUMENT_CHARS,
+) -> dict[str, list[NerEntity]]:
+    """Batch the one-audit-call-per-document pass for local GPU throughput."""
+    results = {record_id: list(entities) for record_id, entities in entities_by_id.items()}
+    record_ids = []
+    prompts = []
+    for record_id, raw_text in raw_texts_by_id.items():
+        if len(raw_text) > max_document_chars:
+            continue
+        entities = results.get(record_id, [])
+        existing_payload = [
+            {
+                "text": entity.text,
+                "type": entity.type,
+                "assertions": list(entity.assertions),
+                "position": list(entity.position),
+            }
+            for entity in entities
+        ]
+        record_ids.append(record_id)
+        prompts.append(build_ner_recall_audit_prompt(raw_text, existing_payload))
+
+    try:
+        if hasattr(llm, "generate_batch"):
+            raw_outputs = llm.generate_batch(prompts, batch_size=batch_size)
+        else:
+            raw_outputs = [llm.generate(system, user) for system, user in prompts]
+        if len(raw_outputs) != len(prompts):
+            raise ValueError(
+                f"batch returned {len(raw_outputs)} outputs for {len(prompts)} prompts"
+            )
+    except Exception as exc:
+        print(f"[llm_audit] batch generation lỗi: {exc} -> giữ nguyên batch", file=sys.stderr)
+        return results
+
+    for record_id, raw_output in zip(record_ids, raw_outputs):
+        try:
+            response = NerAuditResponse.from_dict(extract_json(raw_output))
+        except Exception as exc:
+            print(f"[llm_audit] lỗi parse record '{record_id}': {exc} -> giữ nguyên", file=sys.stderr)
+            continue
+        if response is None:
+            continue
+        results[record_id] = _merge_audit_response(
+            raw_texts_by_id[record_id],
+            results[record_id],
+            response,
+        )
+    return results
 
 
 def fix_flagged_entities(
@@ -89,7 +276,8 @@ def fix_flagged_entities(
             continue
 
         if suggestion.action == "retype":
-            fixed.append(NerEntity(text=ent.text, type=suggestion.type, assertions=ent.assertions,
+            assertions = [] if suggestion.type in LAB_TYPES else ent.assertions
+            fixed.append(NerEntity(text=ent.text, type=suggestion.type, assertions=assertions,
                                     position=ent.position, score=ent.score, flag=None))
             continue
 
@@ -100,7 +288,16 @@ def fix_flagged_entities(
                       f"'{ent.text}' -> giữ nguyên entity", file=sys.stderr)
                 fixed.append(ent)
                 continue
-            fixed.append(NerEntity(text=suggestion.text, type=suggestion.type, assertions=ent.assertions,
+            other_spans = [other.position for other in entities if other is not ent]
+            if _overlaps(span, other_spans):
+                print(
+                    f"[llm_fixer] retrim '{suggestion.text}' overlap entity khác -> giữ nguyên",
+                    file=sys.stderr,
+                )
+                fixed.append(ent)
+                continue
+            assertions = [] if suggestion.type in LAB_TYPES else ent.assertions
+            fixed.append(NerEntity(text=suggestion.text, type=suggestion.type, assertions=assertions,
                                     position=span, score=ent.score, flag=None))
             continue
 

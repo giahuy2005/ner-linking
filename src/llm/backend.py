@@ -54,6 +54,9 @@ class LocalLLM:
             cache_dir=self.config.cache_dir,
             local_files_only=self.config.local_files_only,
         )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_id,
@@ -111,3 +114,48 @@ class LocalLLM:
             text = _strip_thinking_block(text)
 
         return text.strip()
+
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        prompts: list[tuple[str, str]],
+        *,
+        batch_size: int = 4,
+    ) -> list[str]:
+        """Generate multiple short JSON responses with left-padded batches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size phải dương")
+        if not prompts:
+            return []
+        self.load()
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model chưa load được")
+
+        responses = []
+        for start in range(0, len(prompts), batch_size):
+            group = prompts[start:start + batch_size]
+            prompt_texts = [
+                self._build_prompt_text(system_prompt, user_prompt)
+                for system_prompt, user_prompt in group
+            ]
+            inputs = self.tokenizer(
+                prompt_texts,
+                return_tensors="pt",
+                add_special_tokens=False,
+                padding=True,
+            ).to(self.model.device)
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.config.max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+            )
+            prompt_width = inputs["input_ids"].shape[1]
+            for row in outputs:
+                text = self.tokenizer.decode(row[prompt_width:], skip_special_tokens=True)
+                if self.config.supports_thinking:
+                    text = _strip_thinking_block(text)
+                responses.append(text.strip())
+        return responses

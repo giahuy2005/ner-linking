@@ -5,6 +5,8 @@ không phải model cực mạnh, few-shot ngắn giúp giảm lệch schema.
 
 from __future__ import annotations
 
+import json
+
 ENTITY_TYPES = ("THUỐC", "TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM")
 
 _NER_FIXER_SYSTEM = f"""Bạn là trợ lý sửa lỗi NER y tế tiếng Việt. Bạn nhận 1 đoạn văn cảnh (context) \
@@ -34,25 +36,86 @@ def build_ner_fixer_prompt(context: str, entity_text: str, entity_type: str, fla
     return _NER_FIXER_SYSTEM, user_prompt
 
 
+_NER_RECALL_AUDIT_SYSTEM = f"""Bạn là bộ kiểm tra recall NER y tế tiếng Việt sau một model NER.
+Input gồm nguyên văn tài liệu và danh sách entity đã tìm được. Chỉ trả những entity y tế RÕ RÀNG
+bị bỏ sót; không lặp lại entity đã có và không sửa entity cũ trong task này.
+
+Schema type duy nhất: {ENTITY_TYPES}.
+Assertions duy nhất: isNegated, isHistorical, isFamily; lab/finding luôn assertions=[].
+
+Quy tắc precision bắt buộc:
+- text phải là substring liên tục y nguyên trong tài liệu, boundary trọn nghĩa và không overlap entity đã có.
+- THUỐC gồm tên + strength/dose form/route/frequency liền kề khi chúng thuộc cùng regimen; không bắt
+  riêng liều, thực phẩm, hóa chất, thủ thuật hoặc cụm chung "uống thuốc".
+- TRIỆU_CHỨNG/CHẨN_ĐOÁN phải là cụm lâm sàng đầy đủ; không trả từ vụn, giải phẫu trần, thời gian,
+  yếu tố nguy cơ, mục đích điều trị như "giảm đau/hạ sốt".
+- TÊN_XÉT_NGHIỆM là tên chỉ số/kỹ thuật cụ thể; KẾT_QUẢ_XÉT_NGHIỆM là giá trị hoặc finding đầy đủ.
+- Cue assertion chỉ áp dụng cục bộ. "không nhớ", "không cải thiện", "không dùng đều" không phủ định
+  bệnh/triệu chứng. Thuốc trong danh sách trước nhập viện là isHistorical; triệu chứng sau "điều trị"
+  không kế thừa isHistorical của thuốc.
+- Nếu không chắc, không thêm. False positive bị phạt nặng hơn việc bỏ qua một mention mơ hồ.
+
+Trả JSON thuần, tối đa 12 additions:
+{{"additions":[{{"text":"...","type":"...","assertions":[],"start":0,"end":3}}]}}
+start inclusive, end exclusive theo ký tự Python. Nếu không chắc offset có thể bỏ start/end; hệ thống
+chỉ nhận khi text còn đúng một occurrence chưa được annotate."""
+
+
+def build_ner_recall_audit_prompt(raw_text: str, existing_entities: list[dict]) -> tuple[str, str]:
+    existing_json = json.dumps(existing_entities, ensure_ascii=False, separators=(",", ":"))
+    user_prompt = (
+        "TÀI LIỆU NGUYÊN VĂN:\n"
+        f"{raw_text}\n\n"
+        "ENTITY ĐÃ CÓ (position=[start,end]):\n"
+        f"{existing_json}\n\n"
+        "Tìm omissions rõ ràng. Chỉ trả JSON additions."
+    )
+    return _NER_RECALL_AUDIT_SYSTEM, user_prompt
+
+
 _CANDIDATE_SELECTOR_SYSTEM = """Bạn là trợ lý chọn mã chuẩn hoá y tế (RxNorm cho thuốc, ICD-10 cho \
 chẩn đoán) đúng nhất cho 1 mention trong hồ sơ bệnh án tiếng Việt. Bạn nhận mention gốc và danh sách \
 candidate (đã được hệ thống retrieval xếp hạng sẵn theo độ tương đồng), nhiệm vụ là chọn lại — có thể \
-giữ nguyên top candidate, chọn candidate khác trong danh sách phù hợp hơn, hoặc chọn NHIỀU candidate \
-nếu mention thực sự khớp nhiều mã (vd thuốc phối hợp). CHỈ được chọn code có trong danh sách đưa vào, \
-KHÔNG bịa code mới.
+giữ nguyên top candidate hoặc chọn candidate khác trong danh sách phù hợp hơn. THUỐC luôn đúng 1 code; \
+CHẨN_ĐOÁN chỉ được nhiều code khi mention biểu đạt nhiều chẩn đoán độc lập. CHỈ chọn code trong danh sách, \
+KHÔNG bịa code mới. Candidate score/rank chỉ là gợi ý, phải ưu tiên nghĩa của mention và context.
+
+RxNorm:
+- Bắt buộc đúng 1 code. So khớp ingredient trước, rồi strength, dose form và release type.
+- Route/frequency là cách dùng, không tự tạo ingredient khác. Mention thiếu strength/form thì ưu tiên
+  concept không bịa thêm độ cụ thể; mention có đủ strength/form thì ưu tiên clinical drug phù hợp.
+- Không chọn nhiều code cho thuốc phối hợp; danh sách candidate đã chứa concept phối hợp nếu hợp lệ.
+
+ICD-10:
+- Mặc định chọn 1 code cụ thể nhất được mention/context trực tiếp hỗ trợ.
+- Không đồng thời chọn mã cha và mã con, không thêm sibling/biến chứng chỉ vì liên quan.
+- Chỉ chọn 2-3 code khi chính một entity thật sự biểu đạt nhiều chẩn đoán độc lập.
 
 CHỈ trả JSON, không giải thích thêm, đúng format:
 {"chosen_codes": ["code1", "code2", ...], "reason": "lý do ngắn gọn"}"""
 
 
 def build_candidate_selector_prompt(
-    entity_text: str, entity_type: str, candidates: list[tuple[str, str]], max_choices: int = 3,
+    entity_text: str,
+    entity_type: str,
+    candidates: list[tuple[str, str]],
+    max_choices: int = 3,
+    context: str = "",
 ) -> tuple[str, str]:
     """candidates: list[(code, display_label)] theo đúng thứ tự retrieval trả về (top trước)."""
     candidate_lines = "\n".join(f"- code={code} | {label}" for code, label in candidates)
+    selection_rule = (
+        "Bắt buộc chọn đúng 1 RxNorm code."
+        if entity_type == "THUỐC"
+        else (
+            "Ưu tiên chọn 1 ICD-10 code cụ thể nhất; chỉ chọn nhiều code khi mention "
+            "thực sự chứa nhiều chẩn đoán độc lập."
+        )
+    )
     user_prompt = (
         f"Mention: \"{entity_text}\" (type={entity_type})\n"
+        f"Context: \"{context}\"\n"
         f"Danh sách candidate (đã xếp hạng, top trước):\n{candidate_lines}\n"
-        f"Chọn tối đa {max_choices} code đúng nhất, trả JSON."
+        f"{selection_rule} Chọn tối đa {max_choices} code, trả JSON."
     )
     return _CANDIDATE_SELECTOR_SYSTEM, user_prompt

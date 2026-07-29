@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from linking.icd10 import build_icd10_faiss_index as build_module
 from linking.icd10.build_icd10_faiss_index import load_embedding_terms, write_metadata
 from linking.icd10.icd10_linker import Icd10Linker, aggregate_term_results
-from linking.icd10.sapbert_encoder import clean_query_text, l2_normalize
+from linking.sapbert_encoder import clean_query_text, l2_normalize
 
 
 class Icd10LinkingTests(unittest.TestCase):

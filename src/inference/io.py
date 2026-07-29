@@ -352,6 +352,7 @@ def remap_entities_to_raw(
                 assertions=list(entity.assertions),
                 position=(raw_start, raw_end),
                 score=entity.score,
+                flag=entity.flag,
             )
         )
 
@@ -542,6 +543,17 @@ def validate_record_output(
             ):
                 raise TypeError(
                     f"Entity {entity_index}: mọi candidate phải là str."
+                )
+
+            max_candidates = 1 if entity_type == "THUỐC" else 3
+            if len(candidates) > max_candidates:
+                raise ValueError(
+                    f"Entity {entity_index} loại {entity_type!r} chỉ được có "
+                    f"tối đa {max_candidates} candidate."
+                )
+            if len(candidates) != len(set(candidates)):
+                raise ValueError(
+                    f"Entity {entity_index}: candidates không được trùng nhau."
                 )
 
         elif "candidates" in item:

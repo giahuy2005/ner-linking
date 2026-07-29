@@ -113,6 +113,28 @@ Neu tai nguyen han che, co the build tung tier bang `--tiers product` hoac
 `--tiers support`. Pooling/model/max length duoc ghi vao
 `models/rxnorm/rxnorm_index_config.json`; metadata va vector luon cung thu tu.
 
+## Inference BTC
+
+Chay batch day du voi 1.7B repair/recall audit va 7B candidate selector:
+
+```bash
+python -m src.inference.cli \
+  --input-dir data/public_test \
+  --output-dir output \
+  --with-rxnorm --with-icd10 \
+  --with-llm-fixer --with-llm-selector
+```
+
+Fixer sua cac entity bi repair gate danh dau, sau do audit mot lan moi tai lieu
+de bo sung mention bi sot. Moi bo sung phai la substring nguyen van, co offset
+hop le, khong overlap va qua repair gate. Selector bo qua LLM khi top candidate
+la exact match chac chan; cac truong hop mo ho duoc chay batch. Output gioi han
+mot RxNorm code cho `THUOC` va toi da ba ICD-10 code cho `CHAN_DOAN`.
+
+Profile sinh V5 bo sung `btc_medication_lists` va
+`complete_occurrence_recall`. Du lieu sinh ra can qua QC va chuyen BIO bang
+`entity_spans`; can train lai checkpoint NER de cac thay doi data co hieu luc.
+
 ### Chay tren Colab
 
 Notebook Colab nen clone repo va goi script, thay vi copy logic preprocess vao notebook:

@@ -18,6 +18,20 @@ from . import config
 from .repository import RxNormRepository
 from .schemas import ParsedDrugMention, RxNormCandidate
 
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def resolve_project_path(path_str: str) -> str:
+    path_str = str(path_str).replace("\\", "/")
+
+    p = Path(path_str)
+
+    if not p.is_absolute():
+        p = _PROJECT_ROOT / p
+
+    return p.as_posix()
 
 class SentenceEncoder:
     """Bọc model + tokenizer để encode query thành dense vector.
@@ -30,7 +44,7 @@ class SentenceEncoder:
     def __init__(self, index_config: dict[str, Any], device: str | None = None):
         model_cfg = index_config["model"]
 
-        self.model_id = model_cfg["model_id"]
+        self.model_id = resolve_project_path(model_cfg["model_id"])
         self.pooling = model_cfg["pooling"]
         self.max_length = int(model_cfg["max_length"])
         self.dimension = int(model_cfg["dimension"])

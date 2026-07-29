@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-icd10", action="store_true", help="bật linking ICD-10 cho CHẨN_ĐOÁN")
     parser.add_argument("--with-llm-fixer", action="store_true", help="bật LLM sửa entity bị repair_gate flag")
     parser.add_argument("--with-llm-selector", action="store_true", help="bật LLM chọn lại candidate linking")
+    parser.add_argument(
+        "--no-llm-recall-audit",
+        action="store_true",
+        help="khi bật fixer, chỉ sửa span bị flag và không audit entity bị sót",
+    )
 
     parser.add_argument("--checkpoint", type=Path, default=cfg.DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--label-dicts", type=Path, default=cfg.DEFAULT_LABEL_DICTS_PATH)
@@ -91,7 +96,12 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
         print("[cli] Đang load LLM fixer...", file=sys.stderr)
         fixer_llm = LocalLLM(NER_FIXER_CONFIG)
         fixer_llm.load()
-        entities_by_id = pipeline.run_fixer_stage(raw_texts_by_id, entities_by_id, fixer_llm)
+        entities_by_id = pipeline.run_fixer_stage(
+            raw_texts_by_id,
+            entities_by_id,
+            fixer_llm,
+            audit_missing=not args.no_llm_recall_audit,
+        )
         fixer_llm.unload()
         print("[cli] LLM fixer xong, đã unload.", file=sys.stderr)
 
@@ -105,7 +115,11 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
         selector_llm = LocalLLM(CANDIDATE_SELECTOR_CONFIG)
         selector_llm.load()
 
-    candidates_by_id = pipeline.run_linking_stage(entities_by_id, selector_llm=selector_llm)
+    candidates_by_id = pipeline.run_linking_stage(
+        entities_by_id,
+        selector_llm=selector_llm,
+        raw_texts_by_id=raw_texts_by_id,
+    )
 
     if selector_llm is not None:
         selector_llm.unload()

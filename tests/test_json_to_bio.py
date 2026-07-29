@@ -91,6 +91,32 @@ class JSONToBioBoundaryTests(unittest.TestCase):
         )
         self.assertEqual((4, 8), actual_offsets[2])
 
+    def test_explicit_spans_preserve_repeated_occurrence_identity(self):
+        text = "Không sốt. Hôm qua từng sốt."
+        entities = [
+            {"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": ["isNegated"]},
+            {"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": ["isHistorical"]},
+        ]
+        spans = [
+            {"char_start": 6, "char_end": 9, "text": "sốt", "type": "TRIỆU_CHỨNG"},
+            {"char_start": 24, "char_end": 27, "text": "sốt", "type": "TRIỆU_CHỨNG"},
+        ]
+
+        resolved, skipped = JSONToBioConverter.resolve_entity_char_spans(text, entities, spans)
+
+        self.assertEqual([], skipped)
+        self.assertEqual([(6, 9), (24, 27)], [
+            (entity["char_start"], entity["char_end"]) for entity in resolved
+        ])
+
+    def test_explicit_spans_reject_stale_offsets(self):
+        with self.assertRaisesRegex(ValueError, "không khớp text"):
+            JSONToBioConverter.resolve_entity_char_spans(
+                "Không sốt",
+                [{"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": []}],
+                [{"char_start": 0, "char_end": 3}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

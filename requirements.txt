@@ -10,3 +10,8 @@ rapidfuzz
 python-dotenv
 pandas
 pytorch-crf
+accelerate
+safetensors 
+sentencepiece 
+protobuf
+bitsandbytes

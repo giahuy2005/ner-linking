@@ -237,6 +237,46 @@ class JSONToBioConverter:
             spans.append({**ent, "char_start": s, "char_end": e})
         return spans, skipped
 
+    @staticmethod
+    def resolve_entity_char_spans(input_text: str, entities: list, explicit_spans=None):
+        """Prefer generator-provided offsets and strictly validate alignment.
+
+        Legacy files without ``entity_spans`` still use text matching. New data
+        must not lose occurrence identity between generation/QC and BIO export.
+        """
+        if explicit_spans is None:
+            return JSONToBioConverter.find_entity_char_spans(input_text, entities)
+        if not isinstance(explicit_spans, list) or len(explicit_spans) != len(entities):
+            raise ValueError("entity_spans phải là list cùng độ dài với entities")
+
+        resolved = []
+        previous_end = -1
+        for index, (entity, span) in enumerate(zip(entities, explicit_spans)):
+            if not isinstance(span, dict):
+                raise ValueError(f"entity_spans[{index}] không phải object")
+            start = span.get("char_start")
+            end = span.get("char_end")
+            if not isinstance(start, int) or isinstance(start, bool):
+                raise ValueError(f"entity_spans[{index}].char_start không phải int")
+            if not isinstance(end, int) or isinstance(end, bool):
+                raise ValueError(f"entity_spans[{index}].char_end không phải int")
+            if not (0 <= start < end <= len(input_text)):
+                raise ValueError(f"entity_spans[{index}] ngoài phạm vi input_text: {(start, end)}")
+            if start < previous_end:
+                raise ValueError(f"entity_spans[{index}] overlap hoặc không theo thứ tự")
+            if input_text[start:end] != entity["text"]:
+                raise ValueError(
+                    f"entity_spans[{index}] không khớp text: "
+                    f"{input_text[start:end]!r} != {entity['text']!r}"
+                )
+            if span.get("text", entity["text"]) != entity["text"]:
+                raise ValueError(f"entity_spans[{index}].text lệch entities[{index}].text")
+            if span.get("type", entity["type"]) != entity["type"]:
+                raise ValueError(f"entity_spans[{index}].type lệch entities[{index}].type")
+            resolved.append({**entity, "char_start": start, "char_end": end})
+            previous_end = end
+        return resolved, []
+
     # ------------------------------------------------------------------
     # 3. Map char span -> word-token index -> BIO
     # ------------------------------------------------------------------
@@ -357,7 +397,11 @@ class JSONToBioConverter:
     def process_sample(self, sample: dict) -> dict:
         input_text = sample["input_text"]
         tokens, offsets = self.segment_with_offsets(input_text)
-        entity_spans, skipped = self.find_entity_char_spans(input_text, sample["entities"])
+        entity_spans, skipped = self.resolve_entity_char_spans(
+            input_text,
+            sample["entities"],
+            sample.get("entity_spans"),
+        )
         bio_tags = self.build_bio_tags(tokens, offsets, entity_spans)
 
         assertion_spans, dropped = self._match_entities_to_bio_ranges(entity_spans, offsets, bio_tags)

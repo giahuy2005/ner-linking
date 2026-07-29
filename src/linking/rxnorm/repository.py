@@ -16,9 +16,94 @@ from . import config
 from .parser import normalize_text
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _normalize_path_string(path_str: str | Path) -> str:
+    """Chuẩn hóa slash và gỡ absolute Windows path cũ.
+
+    Ví dụ:
+    -> models/sapbert hoặc /workspace/ner-linking/models/sapbert tùy resolve.
+    """
+    s = str(path_str).strip().replace("\\", "/")
+
+    project_root_posix = _PROJECT_ROOT.as_posix()
+
+    old_roots = [
+        "/workspace/ner-linking",
+    ]
+
+    for old_root in old_roots:
+        if s.startswith(old_root):
+            suffix = s[len(old_root):].lstrip("/")
+            return f"{project_root_posix}/{suffix}" if suffix else project_root_posix
+
+    # Trường hợp path Windows khác nhưng vẫn có tên project trong path
+    marker_candidates = [
+        "/viettel_ai_ner/",
+        "/ner-linking/",
+    ]
+    for marker in marker_candidates:
+        if marker in s:
+            suffix = s.split(marker, 1)[1]
+            return f"{project_root_posix}/{suffix}" if suffix else project_root_posix
+
+    return s
+
+
+def _looks_like_windows_abs(path_str: str) -> bool:
+    return len(path_str) >= 3 and path_str[1] == ":" and path_str[2] == "/"
+
+
+def resolve_project_path(
+    path_str: str | Path,
+    *,
+    base_dir: str | Path | None = None,
+) -> str:
+
+    s = _normalize_path_string(path_str)
+
+    if not s:
+        raise ValueError("Path rỗng")
+
+    # Linux absolute path
+    if s.startswith("/"):
+        return Path(s).as_posix()
+
+    # Windows absolute path còn sót nhưng không map được project root
+    if _looks_like_windows_abs(s):
+        # Cố gắng bỏ phần drive, nhưng báo rõ nếu sau đó không tồn tại.
+        # Thực tế nên tránh case này bằng cách lưu relative path trong JSON.
+        p = Path(s)
+        return p.as_posix()
+
+    rel = Path(s)
+
+    candidates: list[Path] = []
+
+    # Path dạng project-relative
+    if s.startswith(("models/", "data/", "src/", "configs/")):
+        candidates.append(_PROJECT_ROOT / rel)
+    else:
+        # Path dạng file name nằm trong index_dir, ví dụ product_sapbert.index
+        if base_dir is not None:
+            candidates.append(Path(base_dir) / rel)
+
+        # Fallback: relative theo project root
+        candidates.append(_PROJECT_ROOT / rel)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve().as_posix()
+
+    # Nếu chưa tồn tại thì trả candidate đầu tiên để error message dễ hiểu
+    return candidates[0].as_posix()
+
+
 def _entity_name(entity: Any) -> str | None:
     """clean record lưu ingredient/dose_form/brand dạng {'rxcui','tty','name'}
-    hoặc đôi khi string trần — hàm này lấy tên ra thống nhất."""
+    hoặc đôi khi string trần — hàm này lấy tên ra thống nhất.
+    """
 
     if isinstance(entity, dict):
         return entity.get("name")
@@ -38,11 +123,20 @@ def _add_unique(bucket: list[str], value: str | None) -> None:
 
 class RxNormRepository:
     def __init__(self, index_dir: str | Path, clean_path: str | Path | None = None):
-        self.index_dir = Path(index_dir)
-        self.clean_path = Path(clean_path) if clean_path else self.index_dir / "rxnorm_clean.jsonl"
+        self.index_dir = Path(resolve_project_path(index_dir, base_dir=_PROJECT_ROOT))
+
+        if clean_path is not None:
+            self.clean_path = Path(resolve_project_path(clean_path, base_dir=_PROJECT_ROOT))
+        else:
+            default_clean_path = getattr(config, "DEFAULT_CLEAN_PATH", None)
+            if default_clean_path is not None:
+                self.clean_path = Path(resolve_project_path(default_clean_path, base_dir=_PROJECT_ROOT))
+            else:
+                self.clean_path = self.index_dir / "rxnorm_clean.jsonl"
 
         self.config = self._load_config()
         self._validate_config()
+        self._resolve_paths()
 
         self.indexes: dict[str, faiss.Index] = self._load_indexes()
         self.metadata: dict[str, list[dict[str, Any] | None]] = self._load_metadata()
@@ -82,6 +176,40 @@ class RxNormRepository:
             if field_name not in self.config["model"]:
                 raise ValueError(f"config['model'] thiếu '{field_name}'")
 
+    def _resolve_paths(self) -> None:
+        """Resolve toàn bộ path trong rxnorm_index_config.json.
+
+        Sau hàm này:
+        - config["model"]["model_id"] là path POSIX nếu là local model.
+        - index_file / metadata_file / embedding_file là path POSIX tuyệt đối.
+        """
+
+        model_id = self.config["model"]["model_id"]
+        model_id_str = str(model_id).replace("\\", "/")
+
+        # Nếu là local path thì resolve. Nếu là HF repo id như "cambridgeltl/..."
+        # thì giữ nguyên.
+        if (
+            model_id_str.startswith(("models/", "data/", ".", "/", "~"))
+            or "Viettel_AI" in model_id_str
+            or "viettel_ai_ner" in model_id_str
+            or "ner-linking" in model_id_str
+            or _looks_like_windows_abs(model_id_str)
+        ):
+            self.config["model"]["model_id"] = resolve_project_path(
+                model_id_str,
+                base_dir=_PROJECT_ROOT,
+            )
+
+        for tier in config.VALID_TIERS:
+            info = self.config["indexes"][tier]
+
+            for field_name in ("index_file", "metadata_file", "embedding_file"):
+                info[field_name] = resolve_project_path(
+                    info[field_name],
+                    base_dir=self.index_dir,
+                )
+
     # ----------------------------------------------------------------
     # Index & metadata
     # ----------------------------------------------------------------
@@ -91,12 +219,12 @@ class RxNormRepository:
 
         for tier in config.VALID_TIERS:
             info = self.config["indexes"][tier]
-            index_path = self.index_dir / info["index_file"]
+            index_path = Path(info["index_file"])
 
             if not index_path.is_file():
                 raise FileNotFoundError(f"Thiếu index file cho tier '{tier}': {index_path}")
 
-            indexes[tier] = faiss.read_index(str(index_path))
+            indexes[tier] = faiss.read_index(index_path.as_posix())
 
         return indexes
 
@@ -105,7 +233,7 @@ class RxNormRepository:
 
         for tier in config.VALID_TIERS:
             info = self.config["indexes"][tier]
-            metadata_path = self.index_dir / info["metadata_file"]
+            metadata_path = Path(info["metadata_file"])
 
             if not metadata_path.is_file():
                 raise FileNotFoundError(f"Thiếu metadata file cho tier '{tier}': {metadata_path}")
@@ -194,10 +322,14 @@ class RxNormRepository:
 
     @staticmethod
     def _compact_clean_record(row: dict[str, Any]) -> dict[str, Any]:
-        """Dẹp phẳng 1 record rxnorm_clean.jsonl (schema thật: strength nằm
-        trong clinical_components[].strength.display, dose_forms là list
-        object {'rxcui','tty','name'}) thành dict phẳng để reranker.py dùng
-        trực tiếp qua candidate.structured.get('strengths'/'dose_forms'/...).
+        """Dẹp phẳng 1 record rxnorm_clean.jsonl.
+
+        Schema thật:
+        - strength nằm trong clinical_components[].strength.display
+        - dose_forms là list object {'rxcui','tty','name'}
+
+        Output phẳng để reranker.py dùng qua:
+        candidate.structured.get('strengths'/'dose_forms'/...)
         """
 
         ingredients: list[str] = []

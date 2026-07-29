@@ -5,10 +5,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "data_gen"))
 
-from gen_reject import detect_section, process_record
+from gen_reject import (
+    SampleRejected,
+    build_entity_span_metadata,
+    detect_section,
+    process_record,
+)
 
 
 class GenRejectRuleTests(unittest.TestCase):
+    def test_rejects_numeric_entity_cut_inside_word_token(self):
+        entities = [
+            {"text": "03", "type": "KẾT_QUẢ_XÉT_NGHIỆM", "assertions": []},
+            {"text": "4", "type": "KẾT_QUẢ_XÉT_NGHIỆM", "assertions": []},
+        ]
+        with self.assertRaisesRegex(SampleRejected, "cắt giữa một token số"):
+            build_entity_span_metadata(entities, "034")
+
     def test_v5_can_keep_zero_entity_without_relaxing_default_minimum(self):
         sparse_record = {
             "input_text": "Người gọi hẹn tái khám vào sáng thứ hai và sẽ mang giấy tờ tùy thân.",

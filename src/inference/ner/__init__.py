@@ -1,8 +1,15 @@
-from .engine import NerAssertionModel, NerEngine
 from .repair_gate import filter_entities
 from .sectioner import split_sections_by_header
 from .postprocessor import clean_text_for_inference
 from .llm_fixer import fix_flagged_entities
+
+
+def __getattr__(name):
+    if name in {"NerAssertionModel", "NerEngine"}:
+        from .engine import NerAssertionModel, NerEngine
+
+        return {"NerAssertionModel": NerAssertionModel, "NerEngine": NerEngine}[name]
+    raise AttributeError(name)
 
 __all__ = [
     "NerAssertionModel",
