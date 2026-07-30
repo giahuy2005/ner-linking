@@ -160,94 +160,135 @@ Validator kiểm tra tối thiểu:
 Parse/schema/generation lỗi sau retry sẽ fallback về output NER trước 7B. Log
 accepted/rejected/fallback được lưu ở `InferencePipeline.last_7b_logs`.
 
-## 4. Assertion head học gì?
+## 4. Retrieval và 7B linking
 
-Assertion không phải token classification. Sau khi có entity span, model lấy
-mean pooling hidden states của các subword nằm trong span đó:
-
-```text
-hidden_states[token_start : token_end]
-        |
-        v
-mean pooling
-        |
-        v
-span vector
-        |
-        v
-Linear(hidden_size, num_assert_labels)
-```
-
-Assertion là bài toán multi-label:
+Linking chỉ chạy sau khi NER đã hoàn tất:
 
 ```text
-isHistorical
-isNegated
-isFamily
+THUỐC      -> RxNormLinker
+CHẨN_ĐOÁN -> Icd10Linker
 ```
 
-Một entity có thể có nhiều assertion cùng lúc, ví dụ:
+Index, embedding, FAISS, retrieval và ranking hiện có không bị thay đổi. Nếu 7B
+đã sửa text/type NER, linker chạy lại trên entity cuối; candidate cũ không được
+tái sử dụng.
+
+Khi không bật 7B, pipeline lấy theo ranking của linker: tối đa 1 RxNorm code
+cho thuốc và 3 ICD-10 code cho chẩn đoán.
+
+Khi bật 7B, `select_candidates_many()` gom các entity mơ hồ của nhiều document
+thành batch. Prompt linking nhận entity text/type, raw context và candidate kèm
+metadata/ranking feature. 7B có quyền chọn/rerank candidate, với các giới hạn:
+
+- Chỉ được chọn code có trong candidate do retriever trả về.
+- Không được bịa code mới.
+- THUỐC luôn tối đa 1 RxNorm code.
+- CHẨN_ĐOÁN tối đa 3 ICD-10 code.
+- JSON lỗi, code không hợp lệ hoặc lỗi generation sẽ fallback về top candidate
+  của linker.
+
+Exact match chắc chắn có thể bypass 7B để tiết kiệm generation: ICD-10 khi text
+khớp normalized `matched_term`; RxNorm khi ingredient exact và
+strength/form/release không mismatch.
+
+## 5. Lifecycle model và cấu hình
+
+CLI quản lý model theo trình tự:
+
+```text
+1. Load NER engine và các linker được bật.
+2. Chạy two-pass NER cho toàn bộ input batch.
+3. Load Qwen2.5-7B đúng một lần.
+4. Chạy tất cả NER review/recovery request theo batch.
+5. Giữ 7B trên GPU.
+6. Chạy retrieval và 7B linking rerank theo batch.
+7. Unload 7B và giải phóng VRAM.
+8. Assemble và ghi BTC JSON.
+```
+
+Pipeline không load/unload 7B theo candidate hoặc document.
+
+`NER_REVIEWER_7B_CONFIG` mặc định:
+
+```text
+model_id           = Qwen/Qwen2.5-7B-Instruct
+load_in_4bit       = true
+batch_size         = 4
+max_new_tokens     = 512
+temperature        = 0.0
+max_context_length = 8192
+retry_rounds       = 1
+```
+
+## 6. Output
 
 ```json
 {
-  "text": "cường giáp",
-  "type": "CHAN_DOAN",
-  "assertions": ["isFamily", "isHistorical"]
+  "text": "amlodipine 10 mg po daily",
+  "type": "THUỐC",
+  "candidates": ["308135"],
+  "assertions": ["isHistorical"],
+  "position": [58, 83]
 }
 ```
 
-Vì vậy assertion head dùng:
+`candidates` chỉ được gắn ở stage linking sau khi NER hoàn tất. Entity không
+thuộc type cần linking không nhận code.
 
-```text
-BCEWithLogitsLoss
+## 7. CLI
+
+Chỉ NER:
+
+```bash
+python -m src.inference.cli --input data/1.txt --print
 ```
 
-Không cần class `NONE`. Entity không có assertion được biểu diễn bằng vector
-toàn 0:
+NER + linker, không dùng 7B:
 
-```text
-[0, 0, 0]
+```bash
+python -m src.inference.cli \
+  --input-dir data/public_test \
+  --output-dir output \
+  --with-rxnorm --with-icd10
 ```
 
-## 5. Luồng dữ liệu train cho khối NER
+Pipeline đầy đủ, gồm 7B NER và 7B linking:
 
-```text
-data/synthetic/train.jsonl
-        |
-        v
-input_text + entities
-        |
-        v
-VnCoreNLP word segmentation + char span mapping
-        |
-        v
-tokens + ner_tags + assertion_spans
-        |
-        v
-NerDataset
-        |
-        +--> chunk tokens: chunk_size=200, overlap=50
-        +--> tokenize with ViHealthBERT tokenizer
-        +--> align BIO label to first subword
-        +--> remap assertion spans to subword index
-        |
-        v
-DataLoader
-        |
-        v
-NerAssertionModel
-        |
-        +--> ner_loss
-        +--> assertion_loss
-        |
-        v
-total_loss = ner_loss + assertion_loss_weight * assertion_loss
+```bash
+python -m src.inference.cli \
+  --input-dir data/public_test \
+  --output-dir output \
+  --with-rxnorm --with-icd10 --with-llm-7b
 ```
 
-Tóm lại, phần NER hiện tại gồm hai nhiệm vụ chạy chung một encoder:
+Cờ tương thích:
 
-- Token-level BIO tagging để tìm ranh giới và loại entity.
-- Span-level assertion classification để gắn trạng thái cho entity đã tìm được.
+- `--with-llm-fixer`: alias của `--with-llm-7b`.
+- `--with-llm-selector`: alias của `--with-llm-7b`.
+- `--no-llm-recall-audit`: tắt recovery NER, vẫn review NER và rerank linking.
+- `--no-repair-gate`: tắt repair gate để A/B test.
 
-Sau khối này mới đến validate span, linking ICD10/RxNorm và reconstruct offset
-theo sơ đồ inference ở trên.
+## 8. Module chịu trách nhiệm
+
+| Module | Trách nhiệm |
+|---|---|
+| `src/inference/pipeline.py` | Điều phối stage và dữ liệu batch |
+| `src/inference/ner/engine.py` | ViHealthBERT + CRF + assertion inference |
+| `src/inference/ner/two_pass.py` | Suspicious region, Pass 2, merge |
+| `src/inference/rule/clinical.py` | Cleanup, boundary, hard-negative, medication rules |
+| `src/inference/rule/routing.py` | Tạo grouped 7B NER requests |
+| `src/inference/ner/reviewer_7b.py` | Batch/retry/validate/apply NER response |
+| `src/inference/selection/candidate_selector.py` | 7B linking rerank và code validation |
+| `src/linking/rxnorm/` | RxNorm retrieval/ranking hiện có |
+| `src/linking/icd10/` | ICD-10 retrieval/ranking hiện có |
+| `src/llm/backend.py` | Local model load, batch generation, unload |
+| `src/inference/io.py` | Raw-offset mapping, output assembly/validation |
+
+## 9. Test và invariant chính
+
+`tests/test_new_ner_pipeline.py` kiểm tra gold 11 thuốc trước nhập viện,
+assertion/offset, boundary, repeated token, false positive, recovery,
+batch/retry/fallback và thời điểm gắn RxNorm ID.
+
+`tests/test_inference_regressions.py` kiểm tra candidate selector theo batch,
+code allow-list, fallback linker và giới hạn số code output.

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from linking.icd10 import build_icd10_faiss_index as build_module
 from linking.icd10.build_icd10_faiss_index import load_embedding_terms, write_metadata
 from linking.icd10.icd10_linker import Icd10Linker, aggregate_term_results
-from linking.sapbert_encoder import clean_query_text, l2_normalize
+from linking.sapbert_encoder import clean_query_text, l2_normalize, resolve_model_source
 
 
 class Icd10LinkingTests(unittest.TestCase):
@@ -32,6 +32,40 @@ class Icd10LinkingTests(unittest.TestCase):
         self.assertEqual("Viêm tai giữa", clean_query_text("  Viêm\n tai   giữa "))
         with self.assertRaises(ValueError):
             clean_query_text("  \n ")
+
+    def test_resolves_stale_windows_sapbert_path_to_current_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            local_model = project_root / "models" / "sapbert"
+            local_model.mkdir(parents=True)
+
+            source, is_local = resolve_model_source(
+                r"Z:\build-machine\viettel_ai_ner\models\sapbert",
+                project_root=project_root,
+            )
+
+            self.assertTrue(is_local)
+            self.assertEqual(local_model.resolve(), Path(source))
+
+    def test_missing_foreign_sapbert_path_has_actionable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(FileNotFoundError, "SAPBERT_MODEL_ID"):
+                resolve_model_source(
+                    r"D:\old-machine\models\sapbert",
+                    project_root=directory,
+                )
+
+    def test_sapbert_environment_override_has_highest_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local_model = Path(directory) / "custom-sapbert"
+            local_model.mkdir()
+            with patch.dict("os.environ", {"SAPBERT_MODEL_ID": str(local_model)}):
+                source, is_local = resolve_model_source(
+                    "models/sapbert",
+                    project_root=Path(directory) / "different-project",
+                )
+            self.assertTrue(is_local)
+            self.assertEqual(local_model.resolve(), Path(source))
 
     def test_aggregate_uses_max_score_per_code(self):
         term_results = [

@@ -17,6 +17,7 @@ from transformers import AutoModel, AutoTokenizer
 from . import config
 from .repository import RxNormRepository
 from .schemas import ParsedDrugMention, RxNormCandidate
+from ..sapbert_encoder import resolve_model_source
 
 from pathlib import Path
 
@@ -24,14 +25,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def resolve_project_path(path_str: str) -> str:
-    path_str = str(path_str).replace("\\", "/")
-
-    p = Path(path_str)
-
-    if not p.is_absolute():
-        p = _PROJECT_ROOT / p
-
-    return p.as_posix()
+    """Compatibility wrapper around the cross-platform SapBERT resolver."""
+    source, _is_local = resolve_model_source(
+        str(path_str),
+        project_root=_PROJECT_ROOT,
+    )
+    return source
 
 class SentenceEncoder:
     """Bọc model + tokenizer để encode query thành dense vector.

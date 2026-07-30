@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -19,9 +20,21 @@ from preprocessing.rxnorm.build_rxnorm_corpus import (
     read_relations,
 )
 from linking.rxnorm.build_rxnorm_faiss_indexes import load_clean_by_rxcui, load_terms, metadata_row
+from linking.rxnorm import retriever as rxnorm_retriever
 
 
 class RxNormPipelineTests(unittest.TestCase):
+    def test_rxnorm_resolves_stale_windows_sapbert_path_on_linux_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            local_model = project_root / "models" / "sapbert"
+            local_model.mkdir(parents=True)
+            with patch.object(rxnorm_retriever, "_PROJECT_ROOT", project_root):
+                resolved = rxnorm_retriever.resolve_project_path(
+                    r"Z:\build-machine\viettel_ai_ner\models\sapbert"
+                )
+            self.assertEqual(local_model.resolve(), Path(resolved))
+
     def test_lexical_normalization_preserves_drug_information(self):
         self.assertEqual("amlodipine 10 MG oral tablet", lexical_text("  Amlodipine  10 mg Oral Tablet "))
 

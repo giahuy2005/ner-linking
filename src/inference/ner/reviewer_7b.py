@@ -25,7 +25,13 @@ def _span(value: Any) -> tuple[int, int] | None:
 def _assertions(value: Any, fallback: list[str]) -> list[str] | None:
     if value is None:
         return list(fallback)
-    if not isinstance(value, list) or any(item not in ALLOWED_ASSERTIONS for item in value):
+    # LLM may return structurally valid JSON with objects/numbers nested in the
+    # assertion list.  Check type before set membership so malformed output is
+    # rejected instead of crashing on an unhashable dict/list.
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or item not in ALLOWED_ASSERTIONS
+        for item in value
+    ):
         return None
     return list(dict.fromkeys(value))
 
@@ -46,7 +52,11 @@ def _validate_response(request: dict, parsed: Any) -> tuple[dict | None, str | N
         returned = [item["candidate_id"] for item in decisions]
         if len(decisions) != len(wanted) or sorted(returned) != sorted(wanted):
             return None, "missing_or_extra_decision"
-        if any(item.get("action") not in _ACTIONS for item in decisions):
+        if any(
+            not isinstance(item.get("action"), str)
+            or item.get("action") not in _ACTIONS
+            for item in decisions
+        ):
             return None, "invalid_action"
     else:
         if not isinstance(parsed.get("new_entities"), list):
@@ -114,7 +124,7 @@ def _apply_review(raw_text: str, entities: list[NerEntity], request: dict,
             logs.append({"status": "decision_applied", "candidate_id": candidate_id, "action": action})
             continue
         new_type = decision.get("type", original.type)
-        if new_type not in ALLOWED_TYPES:
+        if not isinstance(new_type, str) or new_type not in ALLOWED_TYPES:
             logs.append({"status": "decision_rejected", "candidate_id": candidate_id,
                          "reason": "invalid_type"})
             continue
@@ -161,7 +171,13 @@ def _apply_recovery(raw_text: str, entities: list[NerEntity], request: dict,
         text = suggestion.get("text")
         entity_type = suggestion.get("type")
         assertions = _assertions(suggestion.get("assertions", []), [])
-        if relative is None or not isinstance(text, str) or entity_type not in ALLOWED_TYPES or assertions is None:
+        if (
+            relative is None
+            or not isinstance(text, str)
+            or not isinstance(entity_type, str)
+            or entity_type not in ALLOWED_TYPES
+            or assertions is None
+        ):
             logs.append({"status": "recovery_rejected", "request_id": request["request_id"],
                          "reason": "invalid_schema"})
             continue

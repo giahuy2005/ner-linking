@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 import unicodedata
 from collections.abc import Sequence
 from typing import Any
@@ -11,6 +13,69 @@ import numpy as np
 
 DEFAULT_MODEL_ID = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
 SUPPORTED_POOLING = {"cls", "mean"}
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def resolve_model_source(
+    model_id: str,
+    *,
+    project_root: str | Path | None = None,
+) -> tuple[str, bool]:
+    """Resolve portable local model paths stored inside index configs.
+
+    FAISS configs are often built on Windows or Colab and then copied to a
+    Linux runner.  An absolute path from the build machine must not be passed to
+    Hugging Face as a repo id.  If that path ends in ``models/<name>``, remap it
+    to the same project-local model directory on the current machine.
+
+    ``SAPBERT_MODEL_ID`` has highest priority and may contain either a local
+    directory or a valid Hugging Face repo id.
+    """
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("SapBERT model_id must be a non-empty string")
+
+    configured = os.environ.get("SAPBERT_MODEL_ID", "").strip() or model_id.strip()
+    root = Path(project_root).expanduser().resolve() if project_root else _PROJECT_ROOT
+    tried: list[Path] = []
+
+    direct = Path(configured).expanduser()
+    tried.append(direct)
+    if direct.exists():
+        return str(direct.resolve()), True
+
+    if not direct.is_absolute() and not _WINDOWS_ABSOLUTE_RE.match(configured):
+        relative_to_project = root / direct
+        tried.append(relative_to_project)
+        if relative_to_project.exists():
+            return str(relative_to_project.resolve()), True
+
+    # Normalize a path produced on another OS.  Keep the suffix beginning at
+    # the last "models" component, e.g. D:\repo\models\sapbert ->
+    # <current-project>/models/sapbert.
+    portable_parts = [part for part in configured.replace("\\", "/").split("/") if part]
+    model_markers = [index for index, part in enumerate(portable_parts)
+                     if part.casefold() == "models"]
+    if model_markers:
+        suffix = portable_parts[model_markers[-1]:]
+        project_local = root.joinpath(*suffix)
+        tried.append(project_local)
+        if project_local.exists():
+            return str(project_local.resolve()), True
+
+    looks_like_foreign_path = (
+        _WINDOWS_ABSOLUTE_RE.match(configured) is not None
+        or configured.startswith(("/", "~", "\\"))
+    )
+    if looks_like_foreign_path:
+        attempted = ", ".join(str(path) for path in tried)
+        raise FileNotFoundError(
+            "SapBERT path from index config does not exist on this machine: "
+            f"{configured!r}. Tried: {attempted}. Copy the model to "
+            f"'{root / 'models' / 'sapbert'}' or set SAPBERT_MODEL_ID."
+        )
+
+    return configured, False
 
 
 def clean_query_text(text: str) -> str:
@@ -78,11 +143,9 @@ class SapBertEncoder:
         self.max_length = max_length
         self.pooling = pooling
 
-        model_path = Path(model_id).expanduser()
-        is_local_model = model_path.exists()
+        model_source, is_local_model = resolve_model_source(model_id)
 
         if is_local_model:
-            model_source = str(model_path.resolve())
             load_kwargs = {
                 "local_files_only": True,
             }
@@ -91,13 +154,12 @@ class SapBertEncoder:
             print(f"Loading SapBERT from local: {model_source}")
 
         else:
-            model_source = model_id
             load_kwargs = {}
 
-            if revision:
+            if revision and str(revision).casefold() not in {"null", "none"}:
                 load_kwargs["revision"] = revision
 
-            self.requested_revision = revision
+            self.requested_revision = load_kwargs.get("revision")
             print(f"Loading SapBERT from Hugging Face: {model_source}")
 
         self.model_id = model_source

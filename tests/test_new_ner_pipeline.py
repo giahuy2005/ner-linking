@@ -164,6 +164,40 @@ class NewNerPipelineTests(unittest.TestCase):
         self.assertEqual(2, llm.calls)
         self.assertTrue(any(log["status"] == "response_rejected" for log in logs))
 
+    def test_recovery_rejects_object_assertion_without_crashing(self):
+        raw = "Bệnh nhân rối loạn thị lực."
+        focus_start = raw.index("rối loạn thị lực")
+        focus_end = focus_start + len("rối loạn thị lực")
+        region = SuspiciousRegion(
+            0, 0, len(raw), focus_start, focus_end,
+            ("suspicious_empty_region",), 3.0,
+        )
+        handoff = build_handoff_requests(raw, [], [region])
+        request_id = handoff["region_recoveries"][0]["request_id"]
+        llm = _BatchLlm([[
+            json.dumps({
+                "request_id": request_id,
+                "new_entities": [{
+                    "text": "rối loạn thị lực",
+                    "type": "TRIỆU_CHỨNG",
+                    "relative_position": [focus_start, focus_end],
+                    "assertions": [{"name": "isHistorical"}],
+                }],
+            }, ensure_ascii=False),
+        ]])
+
+        result, logs = review_entities_batch(
+            {"doc": raw}, {"doc": []}, {"doc": handoff}, llm,
+            batch_size=4, retry_rounds=0,
+        )
+
+        self.assertEqual([], result["doc"])
+        self.assertTrue(any(
+            log.get("status") == "recovery_rejected"
+            and log.get("reason") == "invalid_schema"
+            for log in logs
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
