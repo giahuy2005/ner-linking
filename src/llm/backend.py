@@ -97,13 +97,19 @@ class LocalLLM:
             raise RuntimeError("Model chưa load được")
 
         prompt_text = self._build_prompt_text(system_prompt, user_prompt)
-        inputs = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+        inputs = self.tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.config.max_context_length,
+        ).to(self.model.device)
 
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=self.config.max_new_tokens,
-            do_sample=False,
-            temperature=None,
+            do_sample=self.config.temperature > 0,
+            temperature=self.config.temperature if self.config.temperature > 0 else None,
             top_p=None,
             top_k=None,
         )
@@ -143,12 +149,14 @@ class LocalLLM:
                 return_tensors="pt",
                 add_special_tokens=False,
                 padding=True,
+                truncation=True,
+                max_length=self.config.max_context_length,
             ).to(self.model.device)
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.config.max_new_tokens,
-                do_sample=False,
-                temperature=None,
+                do_sample=self.config.temperature > 0,
+                temperature=self.config.temperature if self.config.temperature > 0 else None,
                 top_p=None,
                 top_k=None,
             )

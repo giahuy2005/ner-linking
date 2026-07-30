@@ -115,21 +115,39 @@ Neu tai nguyen han che, co the build tung tier bang `--tiers product` hoac
 
 ## Inference BTC
 
-Chay batch day du voi 1.7B repair/recall audit va 7B candidate selector:
+Chạy batch đầy đủ với two-pass NER, 7B NER review/recovery và 7B linking rerank:
 
 ```bash
 python -m src.inference.cli \
   --input-dir data/public_test \
   --output-dir output \
-  --with-rxnorm --with-icd10 \
-  --with-llm-fixer --with-llm-selector
+  --with-rxnorm --with-icd10 --with-llm-7b
 ```
 
-Fixer sua cac entity bi repair gate danh dau, sau do audit mot lan moi tai lieu
-de bo sung mention bi sot. Moi bo sung phai la substring nguyen van, co offset
-hop le, khong overlap va qua repair gate. Selector bo qua LLM khi top candidate
-la exact match chac chan; cac truong hop mo ho duoc chay batch. Output gioi han
-mot RxNorm code cho `THUOC` va toi da ba ICD-10 code cho `CHAN_DOAN`.
+Luồng mới chạy NER pass 1, phát hiện vùng nghi ngờ, NER pass 2, merge/cleanup,
+rồi tạo hai request grouped `REVIEW_REGION` và `RECOVER_MISSING_ENTITIES` cho
+Qwen2.5-7B. Response phải qua validator exact substring, half-open offset,
+allowed type/assertion, target-id và overlap. Batch lỗi được retry riêng; hết
+retry thì giữ nguyên output trước 7B.
+
+Sau khi NER được xác nhận, RxNorm/ICD-10 retriever hiện có sinh candidate và 7B
+chọn lại trong chính danh sách đó. 7B không được bịa code ngoài candidate;
+response lỗi fallback về thứ tự retriever. `--with-llm-fixer` và
+`--with-llm-selector` là alias của `--with-llm-7b` để script cũ không vỡ.
+
+Config generation nằm ở `src/llm/config.py` trong `NER_REVIEWER_7B_CONFIG`:
+`batch_size=4`, `max_new_tokens=512`, `temperature=0`,
+`max_context_length=8192`, `retry_rounds=1`. Rule được tách trong
+`src/inference/rule/`.
+
+Log validator mẫu:
+
+```text
+7b_ner {'status': 'response_accepted', 'request_id': '1-review-region-0-10-17', 'attempt': 0}
+7b_ner {'status': 'decision_applied', 'candidate_id': 3, 'action': 'REPAIR_SPAN', 'before': 'sốt bn', 'after': 'sốt'}
+7b_ner {'status': 'recovery_rejected', 'reason': 'invalid_exact_span', 'text': 'entity bịa'}
+7b_ner {'status': 'fallback', 'request_id': '2-region-0-20-80', 'reason': 'retry_exhausted_keep_pre_7b'}
+```
 
 Profile sinh V5 bo sung `btc_medication_lists` va
 `complete_occurrence_recall`. Du lieu sinh ra can qua QC va chuyen BIO bang

@@ -119,3 +119,46 @@ def build_candidate_selector_prompt(
         f"{selection_rule} Chọn tối đa {max_choices} code, trả JSON."
     )
     return _CANDIDATE_SELECTOR_SYSTEM, user_prompt
+
+
+_NER_7B_SYSTEM = f"""Bạn là validator/sửa lỗi NER y tế tiếng Việt. Trong request NER này,
+bạn không làm linking và không sinh ICD-10/RxNorm. Linking được xử lý ở prompt riêng sau khi
+NER hoàn tất. Chỉ dùng năm type: {ENTITY_TYPES}.
+
+Quy tắc tuyệt đối:
+- Mọi text trả về phải là substring liên tục, nguyên văn trong context; offset là [start,end).
+- Không suy diễn entity không được nhắc trực tiếp. Không sửa candidate ngoài target_candidate_ids.
+- Assertion chỉ gồm isHistorical/isNegated/isFamily và chỉ khi cue cục bộ rõ ràng.
+- Danh sách thuốc trước nhập viện: thuốc có isHistorical; triệu chứng chỉ định sau "điều trị"
+  (ho, đau nhức, sốt đau, táo bón, lo âu, mất ngủ) không kế thừa isHistorical.
+- Sửa boundary thừa/thiếu: "sốt bn"→"sốt", "bn vàng da"→"vàng da",
+  "Thiếu men G6PD ("→"Thiếu men G6PD", "bệnh Kawasaki ở"→"bệnh Kawasaki",
+  "đau thắt ngực ổn địnhkhi"→"đau thắt ngực ổn định".
+- Loại false positive như ◦ 8, đứng dậy, đánh răng không, ăn ngủ, tĩnh mạch L giọt/phút,
+  cấp tính; không coi tên người Tomisaku Kawasaki là thuốc, giải phẫu trần là chẩn đoán,
+  hay G6PD trong mô tả enzyme là tên xét nghiệm.
+- Với token lặp, chọn span nguyên văn không lặp phù hợp. Phân biệt chẩn đoán, triệu chứng,
+  tên xét nghiệm và kết quả xét nghiệm theo đúng context.
+Chỉ trả một JSON object, không markdown và không giải thích ngoài JSON."""
+
+
+def build_ner_7b_request_prompt(request: dict) -> tuple[str, str]:
+    task = request.get("task")
+    payload = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+    if task == "REVIEW_REGION":
+        instruction = (
+            "Trả đúng một decision cho từng candidate_id trong target_candidate_ids. "
+            "Action: KEEP, DROP, REPAIR_SPAN hoặc RETYPE. KEEP giữ nguyên; DROP xóa; "
+            "REPAIR_SPAN trả text/type/global_position; RETYPE chỉ đổi type. Schema: "
+            '{"request_id":"...","decisions":[{"candidate_id":0,"action":"KEEP"}]}.'
+        )
+    elif task == "RECOVER_MISSING_ENTITIES":
+        instruction = (
+            "Chỉ trả entity thật sự bị sót. relative_position tính trên context. Không lặp entity "
+            "đã có, trừ boundary repair. Schema: "
+            '{"request_id":"...","new_entities":[{"text":"...","type":"TRIỆU_CHỨNG",'
+            '"relative_position":[0,3],"assertions":[]}]}.'
+        )
+    else:
+        raise ValueError(f"Unsupported 7B NER task: {task!r}")
+    return _NER_7B_SYSTEM, f"{instruction}\nREQUEST:\n{payload}"

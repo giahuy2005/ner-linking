@@ -1,178 +1,164 @@
 # Kiến trúc model và luồng dữ liệu hiện tại
 
+> Cập nhật 2026-07-30: notebook `predict_ner_crf_and__llm_fixed.ipynb`
+> là nguồn chuẩn cho phần NER. Luồng production hiện tại là:
+
+```text
+NER Pass 1
+  -> rule audit + suspicious regions
+  -> NER Pass 2 trên các region
+  -> exact dedup + conflict resolution
+  -> deterministic cleanup/rule recovery
+  -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
+  -> Qwen2.5-7B NER batch (retry riêng request/batch lỗi)
+  -> exact-span/type/assertion/overlap validation
+  -> RxNorm + ICD-10 retriever hiện có
+  -> Qwen2.5-7B chọn/rerank trong candidate linking
+  -> BTC JSON
+```
+
+Trong task NER, 7B không được sinh mã. Ở stage linking riêng, 7B được chọn
+RxNorm/ICD-10 nhưng chỉ trong candidate do retriever hiện tại trả về; code ngoài
+danh sách bị validator từ chối. Khi response lỗi, NER trước 7B được giữ nguyên
+và linking fallback theo thứ tự retriever. Các rule deterministic nằm trong
+`src/inference/rule/`.
+
 
 ## 1. Luồng xử lý inference tổng thể
 
-tách văn bản thành section, xử lý tuần tự từng section, section nào NER xong thì đi tiếp sang validate/linking/offset.
-
 ```text
-                 +----------------------+
- file.txt  ----> |  Section Splitter    |
-                 |  + Offset Map Builder|
-                 +----------+-----------+
-                            |
-                            v
-                 for section in sections:
-                            |
-                            v
-                 +----------------------+
-                 | 1. NER + Assertion  |
-                 |    current section  |
-                 +----------+-----------+
-                            |
-                            v
-                 +----------------------+
-                 | 2. Span Validation  |
-                 |    match raw text   |
-                 +----------+-----------+
-                            |
-                            v
-                 +----------------------+
-                 | 3. Candidate        |
-                 |    Retrieval/Rerank |
-                 +----------+-----------+
-                            |
-          +-----------------+-----------------+
-          |                                   |
-          v                                   v
-   THUOC entities                      CHAN_DOAN entities
-   -> RxNorm                           -> ICD10
-                            |
-                            v
-                 +----------------------+
-                 | 4. Offset           |
-                 |    Reconstruction   |
-                 +----------+-----------+
-                            |
-                            v
-                 entities_section.append(...)
-                            |
-                            v
-                 +----------------------+
-                 | Assembler           |
-                 | + schema validation |
-                 +----------+-----------+
-                            |
-                            v
-                    output/{id}.json
+Nhiều file .txt
+  -> clean text + ánh xạ offset về raw text
+  -> NER Pass 1: ViHealthBERT + CRF + assertion
+  -> rule audit + phát hiện suspicious regions
+  -> NER Pass 2 chỉ trên các region
+  -> exact dedup + merge + conflict resolution
+  -> deterministic cleanup/rule recovery
+  -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
+  -> Qwen2.5-7B review/recover NER theo batch
+  -> validator exact span/type/assertion/overlap
+  -> danh sách NER cuối cùng
+  -> RxNorm retrieval cho THUỐC / ICD-10 retrieval cho CHẨN_ĐOÁN
+  -> Qwen2.5-7B rerank candidate linking theo batch
+  -> validate code, fallback linker nếu cần
+  -> assemble BTC JSON
 ```
 
-Điểm chính của luồng này:
+Văn bản được ánh xạ offset về raw text ngay sau mỗi lượt NER. Mọi stage sau đó
+dùng half-open position `[start, end)` trên raw text và phải thỏa:
 
-- `Section Splitter` chia note dài thành các đoạn nhỏ hơn để model dễ xử lý.
-- `Offset Map Builder` lưu mapping từ text đã làm sạch/đã tách section về text
-  gốc.
-- `NER + Assertion` là khối model ner multitask, nhận một section và trả về entity
-  span kèm assertion.
-- `Span Validation` loại entity mà text dự đoán không match lại được với
-  section gốc.
-- `Candidate Retrieval/Rerank` chỉ áp dụng cho entity cần linking, ví dụ thuốc
-  và chẩn đoán.
-- `Offset Reconstruction` đổi offset trong section về offset toàn file.
-- `Assembler` gom entity của các section theo đúng thứ tự văn bản.
-
-## 2. Khối NER hiện tại
-
-Khối NER hiện tại không còn là LLM generate JSON trực tiếp. Notebook demo đang
-train một model multi-task dựa trên ViHealthBERT:
-
-```text
-section text
-    |
-    v
-VnCoreNLP word segmentation
-    |
-    v
-word tokens
-    |
-    v
-ViHealthBERT tokenizer
-    |
-    v
-input_ids + attention_mask
-    |
-    v
-+--------------------------------------------------+
-| ViHealthBERT encoder                             |
-| demdecuong/vihealthbert-base-word                |
-+----------------------+---------------------------+
-                       |
-                       v
-              hidden_states
-                       |
-        +--------------+--------------+
-        |                             |
-        v                             v
-+---------------+             +--------------------+
-| NER head      |             | Span mean pooling  |
-| token linear  |             | over entity spans  |
-+-------+-------+             +---------+----------+
-        |                               |
-        v                               v
- BIO logits                    span representations
-        |                               |
-        v                               v
- decode BIO                    +--------------------+
-        |                      | Assertion head     |
-        v                      | span linear        |
- entity spans                  +---------+----------+
-                                        |
-                                        v
-                              assertion logits
+```python
+0 <= start < end <= len(raw_text)
+raw_text[start:end] == entity.text
 ```
 
-Output logic:
+Ba type `TRIỆU_CHỨNG`, `TÊN_XÉT_NGHIỆM` và
+`KẾT_QUẢ_XÉT_NGHIỆM` không chạy linking.
+
+## 2. Stage 1 — Two-pass NER
+
+Điểm vào là `InferencePipeline.run_ner_stage()`.
+
+### 2.1. NER Pass 1
+
+`NerEngine` dùng VnCoreNLP để word-segment, ViHealthBERT làm encoder, linear
+head tạo BIO emission và CRF để decode chuỗi tag. Assertion head pool entity
+cùng context xung quanh để dự đoán `isHistorical`, `isNegated`, `isFamily`.
+
+Năm type hợp lệ:
 
 ```text
-BIO logits
-  -> argmax per token
-  -> B-/I-/O tags
-  -> decode thành entity spans
-
-assertion logits
-  -> sigmoid
-  -> multi-label assertion per span
-  -> isHistorical / isNegated / isFamily
+TRIỆU_CHỨNG
+CHẨN_ĐOÁN
+THUỐC
+TÊN_XÉT_NGHIỆM
+KẾT_QUẢ_XÉT_NGHIỆM
 ```
 
-## 3. NER head học gì?
+### 2.2. Suspicious-region detection và Pass 2
 
-NER head là một lớp `Linear(hidden_size, num_ner_tags)` đặt trên từng token của
-ViHealthBERT.
+`detect_suspicious_regions()` trong `src/inference/ner/two_pass.py` route vùng
+có confidence thấp, repair flag, boundary đáng ngờ, token lặp, occurrence bị
+sót, dòng y tế không có entity hoặc long medical gap. Các hit gần nhau được
+gộp thành `SuspiciousRegion`; mặc định tối đa 24 region mỗi document.
 
-Ví dụ label BIO:
+Pass 2 dùng lại chính `NerEngine` đã load và chỉ predict context của các region.
+Offset local được đổi về global raw offset. Region lỗi sẽ log `pass2_error` và
+không làm mất candidate Pass 1.
 
-```text
-Tokens:
-["đang", "dùng", "atorvastatin", "20", "mg", "điều_trị", "rối_loạn", "lipid", "máu"]
+### 2.3. Merge và deterministic cleanup
 
-NER tags:
-["O", "O", "B-THUOC", "I-THUOC", "I-THUOC", "O",
- "B-CHAN_DOAN", "I-CHAN_DOAN", "I-CHAN_DOAN"]
+Candidate Pass 1 và Pass 2 được exact-dedup theo `(start, end, type)`, hợp
+assertions, rồi resolve overlap deterministic theo score, độ dài và vị trí.
+Rule production nằm trong `src/inference/rule/clinical.py`, gồm:
+
+- Boundary thừa/thiếu như `sốt bn`, `bn vàng da`, ngoặc/newline/connector thừa.
+- Repeated token/cụm như `chụp chụp...`, `Chụp lại chụp...`.
+- Specimen boundary `hầu họng` -> `dịch hầu họng` khi context hỗ trợ.
+- Hard negatives: `◦ 8`, `đứng dậy`, `đánh răng không`, `ăn ngủ`,
+  `tĩnh mạch L giọt/phút`, `cấp tính`, `Tomisaku Kawasaki`.
+- Giải phẫu trần bị gán chẩn đoán và `G6PD` bị gán sai thành xét nghiệm.
+- Danh sách thuốc trước nhập viện: recover regimen; chỉ thuốc nhận
+  `isHistorical`, triệu chứng chỉ định không kế thừa assertion của thuốc.
+
+## 3. Handoff và 7B NER
+
+`build_handoff_requests()` trong `src/inference/rule/routing.py` tạo schema
+`7b_handoff_v2_grouped` với hai task.
+
+### 3.1. `REVIEW_REGION`
+
+Nhiều target gần nhau được gom trong cùng context. Request giữ `request_id`,
+`candidate_id`, global/relative position, assertions và allowed actions.
+
+```json
+{
+  "task": "REVIEW_REGION",
+  "request_id": "record-review-region-0-100-150",
+  "context_global_position": [20, 250],
+  "target_candidate_ids": [3, 4],
+  "targets": [{
+    "candidate_id": 3,
+    "text": "sốt bn",
+    "type": "TRIỆU_CHỨNG",
+    "global_position": [100, 106],
+    "relative_position": [80, 86],
+    "assertions": [],
+    "allowed_actions": ["KEEP", "DROP", "REPAIR_SPAN", "RETYPE"]
+  }]
+}
 ```
 
-Ý nghĩa:
+7B phải trả đúng một decision cho mỗi target. `KEEP` giữ nguyên; `DROP` xóa;
+`REPAIR_SPAN` sửa boundary; `RETYPE` đổi sang một trong năm type hợp lệ.
 
-- `B-*`: token bắt đầu một entity.
-- `I-*`: token tiếp tục entity cùng loại.
-- `O`: token không thuộc entity nào.
+### 3.2. `RECOVER_MISSING_ENTITIES`
 
-Khi inference, model dự đoán BIO tag cho từng token, sau đó decode các chuỗi
-`B-*` + `I-*` liền nhau thành entity span. Ví dụ:
+Request chứa suspicious region, focus span và entity đã tồn tại trong context.
+7B chỉ được trả entity thật sự bị bỏ sót hoặc boundary rộng hơn cho fragment
+cùng type. `relative_position` luôn là `[start, end)` trên context request.
 
-```text
-B-THUOC I-THUOC I-THUOC
-=> entity: "atorvastatin 20 mg", type = THUOC
-```
+`--no-llm-recall-audit` chỉ tắt recovery request; review target đã có và 7B
+linking vẫn chạy.
 
-NER loss dùng:
+### 3.3. Batch, retry và validator
 
-```text
-CrossEntropyLoss(ignore_index = -100)
-```
+`review_entities_batch()` gom request của nhiều document và gọi Qwen2.5-7B qua
+`generate_batch()`. Chỉ request lỗi được retry; request hợp lệ không chạy lại.
 
-`-100` được dùng cho padding và các subword phụ, để loss chỉ tính trên token
-đầu của mỗi word-token.
+Validator kiểm tra tối thiểu:
+
+- `request_id` khớp và mỗi target có đúng một decision.
+- Không chỉnh candidate ngoài `target_candidate_ids`.
+- Action/type/assertion thuộc allow-list.
+- Text khớp chính xác `raw_text[start:end]`.
+- Span sửa nằm trong context và gần/overlap span gốc.
+- Relative position không âm, không vượt context.
+- Không tạo exact duplicate hoặc overlap không an toàn.
+- Recovery chỉ được thay fragment cùng type khi span mới bao trọn fragment.
+
+Parse/schema/generation lỗi sau retry sẽ fallback về output NER trước 7B. Log
+accepted/rejected/fallback được lưu ở `InferencePipeline.last_7b_logs`.
 
 ## 4. Assertion head học gì?
 

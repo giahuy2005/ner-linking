@@ -1,9 +1,7 @@
-"""CLI chạy pipeline NER (+ linking, + LLM fixer/selector nếu bật cờ).
+"""CLI chạy two-pass NER, 7B NER review và 7B-assisted linking.
 
-QUAN TRỌNG về thứ tự load model khi bật cả 2 LLM: fixer LLM load -> chạy
-CHO TOÀN BỘ batch -> unload -> selector LLM load -> chạy CHO TOÀN BỘ batch
--> unload. KHÔNG bao giờ 2 model cùng ở trên GPU (đúng nguyên tắc bạn
-chốt) — đây là lý do --input-dir không đơn giản là loop process_record().
+Qwen 7B được load một lần cho toàn bộ batch: trước tiên review/recover NER,
+sau đó chọn trong candidate do RxNorm/ICD-10 retriever trả về, rồi mới unload.
 
 Ví dụ dùng:
 
@@ -14,9 +12,9 @@ Ví dụ dùng:
     python -m src.inference.cli --input-dir data/public_test --output-dir output \\
         --with-rxnorm --with-icd10
 
-    # batch full pipeline + cả 2 LLM
+    # batch full pipeline + 7B NER review
     python -m src.inference.cli --input-dir data/public_test --output-dir output \\
-        --with-rxnorm --with-icd10 --with-llm-fixer --with-llm-selector
+        --with-rxnorm --with-icd10 --with-llm-7b
 """
 
 from __future__ import annotations
@@ -29,6 +27,17 @@ from pathlib import Path
 from . import config as cfg
 from . import io as inference_io
 from .pipeline import InferencePipeline
+
+
+def _configure_utf8_stdio() -> None:
+    """Keep Vietnamese help/log/JSON usable on Windows legacy consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,8 +54,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--with-rxnorm", action="store_true", help="bật linking RxNorm cho THUỐC")
     parser.add_argument("--with-icd10", action="store_true", help="bật linking ICD-10 cho CHẨN_ĐOÁN")
-    parser.add_argument("--with-llm-fixer", action="store_true", help="bật LLM sửa entity bị repair_gate flag")
-    parser.add_argument("--with-llm-selector", action="store_true", help="bật LLM chọn lại candidate linking")
+    parser.add_argument("--with-llm-7b", action="store_true",
+                        help="bật Qwen 7B cho NER review/recovery và linking rerank")
+    parser.add_argument("--with-llm-fixer", action="store_true",
+                        help="alias cũ của --with-llm-7b")
+    parser.add_argument("--with-llm-selector", action="store_true",
+                        help="alias cũ của --with-llm-7b")
     parser.add_argument(
         "--no-llm-recall-audit",
         action="store_true",
@@ -88,47 +101,42 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
     # ---- Stage 1: NER cho toàn bộ batch (không LLM) ----
     entities_by_id = pipeline.run_ner_stage(raw_texts_by_id, **predict_kwargs)
 
-    # ---- Stage 2 (optional): LLM fixer, load 1 lần cho cả batch rồi unload ----
-    if args.with_llm_fixer:
+    # ---- Stage 2 (optional): grouped 7B NER review/recovery ----
+    use_7b = args.with_llm_7b or args.with_llm_fixer or args.with_llm_selector
+    reviewer_llm = None
+    if use_7b:
         from ..llm.backend import LocalLLM
-        from ..llm.config import NER_FIXER_CONFIG
+        from ..llm.config import NER_REVIEWER_7B_CONFIG
 
-        print("[cli] Đang load LLM fixer...", file=sys.stderr)
-        fixer_llm = LocalLLM(NER_FIXER_CONFIG)
-        fixer_llm.load()
-        entities_by_id = pipeline.run_fixer_stage(
+        print("[cli] Đang load 7B NER reviewer...", file=sys.stderr)
+        reviewer_llm = LocalLLM(NER_REVIEWER_7B_CONFIG)
+        reviewer_llm.load()
+        entities_by_id = pipeline.run_7b_ner_stage(
             raw_texts_by_id,
             entities_by_id,
-            fixer_llm,
-            audit_missing=not args.no_llm_recall_audit,
+            reviewer_llm,
+            batch_size=NER_REVIEWER_7B_CONFIG.batch_size,
+            retry_rounds=NER_REVIEWER_7B_CONFIG.retry_rounds,
+            include_recovery=not args.no_llm_recall_audit,
         )
-        fixer_llm.unload()
-        print("[cli] LLM fixer xong, đã unload.", file=sys.stderr)
+        print("[cli] 7B NER reviewer xong; giữ model để rerank linking.", file=sys.stderr)
 
-    # ---- Stage 3 (+4 optional): linking, kèm LLM selector nếu bật, load 1 lần ----
-    selector_llm = None
-    if args.with_llm_selector:
-        from ..llm.backend import LocalLLM
-        from ..llm.config import CANDIDATE_SELECTOR_CONFIG
-
-        print("[cli] Đang load LLM selector...", file=sys.stderr)
-        selector_llm = LocalLLM(CANDIDATE_SELECTOR_CONFIG)
-        selector_llm.load()
-
+    # ---- Stage 3: retriever hiện tại -> optional 7B chọn trong candidate ----
     candidates_by_id = pipeline.run_linking_stage(
         entities_by_id,
-        selector_llm=selector_llm,
+        selector_llm=reviewer_llm,
         raw_texts_by_id=raw_texts_by_id,
     )
 
-    if selector_llm is not None:
-        selector_llm.unload()
-        print("[cli] LLM selector xong, đã unload.", file=sys.stderr)
+    if reviewer_llm is not None:
+        reviewer_llm.unload()
+        print("[cli] 7B linking rerank xong, đã unload.", file=sys.stderr)
 
     return pipeline.build_outputs(entities_by_id, candidates_by_id)
 
 
 def main() -> None:
+    _configure_utf8_stdio()
     args = parse_args()
 
     if args.input_dir is not None and args.output_dir is None and not args.do_print:

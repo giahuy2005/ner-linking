@@ -1,20 +1,13 @@
-"""Điều phối end-to-end: raw text -> NER -> (optional) LLM fix -> linking
--> (optional) LLM select candidate -> BTC JSON.
+"""Điều phối end-to-end: two-pass NER -> 7B NER review -> linking -> BTC JSON.
 
-THIẾT KẾ TÁCH STAGE, không phải 1 hàm process_record() làm hết — vì 2
-model LLM (fixer 1.7B, selector 7B) PHẢI load 1 LẦN CHO CẢ BATCH rồi mới
-loop qua record, không được load/unload theo từng record (batch 100 record
-x 600s timeout/lần nộp -> load lại model mỗi record là hết giờ chắc chắn).
+THIẾT KẾ TÁCH STAGE để 7B được load đúng một lần cho cả batch: model review
+NER trước, sau đó tiếp tục rerank candidate linking rồi mới unload.
 
 Luồng dùng đúng cho batch (xem cli.py):
     entities_by_id = pipeline.run_ner_stage(raw_texts_by_id)
-    if dùng fixer:
-        fixer_llm.load(); entities_by_id = pipeline.run_fixer_stage(...); fixer_llm.unload()
-    if dùng selector:
-        selector_llm.load()
-    candidates_by_id = pipeline.run_linking_stage(entities_by_id, selector_llm=selector_llm)
-    if dùng selector:
-        selector_llm.unload()
+    reviewer_7b.load(); entities_by_id = pipeline.run_7b_ner_stage(...)
+    candidates_by_id = pipeline.run_linking_stage(entities_by_id, selector_llm=reviewer_7b)
+    reviewer_7b.unload()
     outputs = pipeline.build_outputs(entities_by_id, candidates_by_id)
 
 `process_record()` / `process_file()` vẫn giữ lại cho test nhanh 1 file
@@ -86,6 +79,9 @@ class InferencePipeline:
         self.ner_engine = ner_engine
         self._linkers = {"rxnorm": rxnorm_linker, "icd10": icd10_linker}
         self.top_k_candidates = top_k_candidates
+        self.last_two_pass_results = {}
+        self.last_handoffs = {}
+        self.last_7b_logs = []
 
     @classmethod
     def load(
@@ -126,17 +122,51 @@ class InferencePipeline:
     # ------------------------------------------------------------
     # Stage 1: NER (không LLM) — an toàn chạy cho cả batch bất kỳ lúc nào
     # ------------------------------------------------------------
-    def run_ner_stage(self, raw_texts_by_id: dict[str, str], **predict_kwargs) -> dict[str, list[NerEntity]]:
+    def run_ner_stage(
+        self,
+        raw_texts_by_id: dict[str, str],
+        *,
+        two_pass: bool = True,
+        maximum_second_pass_regions: int = 24,
+        **predict_kwargs,
+    ) -> dict[str, list[NerEntity]]:
+        from .ner.two_pass import run_two_pass_ner
+        from .rule.clinical import apply_clinical_rules
+        from .rule.routing import build_handoff_requests
+
         entities_by_id: dict[str, list[NerEntity]] = {}
         for rid, raw_text in raw_texts_by_id.items():
             cleaned = clean_text_for_inference(raw_text)
             entities = self.ner_engine.predict_text(cleaned, **predict_kwargs)
-            entities_by_id[rid] = inference_io.remap_entities_to_raw(raw_text, cleaned, entities)
+            pass1 = inference_io.remap_entities_to_raw(raw_text, cleaned, entities)
+            if two_pass:
+                def predict_region(region_text: str) -> list[NerEntity]:
+                    cleaned_region = clean_text_for_inference(region_text)
+                    local = self.ner_engine.predict_text(cleaned_region, **predict_kwargs)
+                    return inference_io.remap_entities_to_raw(region_text, cleaned_region, local)
+
+                result = run_two_pass_ner(
+                    raw_text,
+                    pass1,
+                    predict_region,
+                    maximum_regions=maximum_second_pass_regions,
+                )
+                final = result.final_entities
+                self.last_two_pass_results[rid] = result
+                self.last_handoffs[rid] = build_handoff_requests(
+                    raw_text, final, result.regions, request_prefix=rid
+                )
+            else:
+                final, logs = apply_clinical_rules(raw_text, pass1)
+                self.last_two_pass_results[rid] = None
+                self.last_handoffs[rid] = build_handoff_requests(
+                    raw_text, final, [], request_prefix=rid
+                )
+            entities_by_id[rid] = final
         return entities_by_id
 
     # ------------------------------------------------------------
-    # Stage 2 (optional): LLM sửa entity bị repair_gate flag — nhận
-    # fixer_llm ĐÃ LOAD, gọi cho toàn bộ batch trong 1 lượt model ở VRAM.
+    # Stage 2 (optional): grouped 7B NER review/recovery, before linking.
     # ------------------------------------------------------------
     def run_fixer_stage(
         self,
@@ -146,24 +176,43 @@ class InferencePipeline:
         *,
         audit_missing: bool = True,
     ) -> dict[str, list[NerEntity]]:
-        from .ner.llm_fixer import audit_missing_entities_batch, fix_flagged_entities
+        """Backward-compatible alias for :meth:`run_7b_ner_stage`."""
+        return self.run_7b_ner_stage(
+            raw_texts_by_id, entities_by_id, fixer_llm,
+            include_recovery=audit_missing,
+        )
 
-        fixed_by_id: dict[str, list[NerEntity]] = {}
-        for rid, entities in entities_by_id.items():
-            raw_text = raw_texts_by_id[rid]
-            fixed = fix_flagged_entities(raw_text, entities, fixer_llm)
-            fixed_by_id[rid] = fixed
-        if audit_missing:
-            fixed_by_id = audit_missing_entities_batch(
-                raw_texts_by_id,
-                fixed_by_id,
-                fixer_llm,
-            )
-        return fixed_by_id
+    def run_7b_ner_stage(
+        self,
+        raw_texts_by_id: dict[str, str],
+        entities_by_id: dict[str, list[NerEntity]],
+        reviewer_llm,
+        *,
+        batch_size: int = 4,
+        retry_rounds: int = 1,
+        include_recovery: bool = True,
+    ) -> dict[str, list[NerEntity]]:
+        from .ner.reviewer_7b import review_entities_batch
+
+        handoffs = self.last_handoffs
+        if not include_recovery:
+            handoffs = {
+                rid: {**handoff, "region_recoveries": [], "region_recovery_count": 0}
+                for rid, handoff in handoffs.items()
+            }
+        reviewed, logs = review_entities_batch(
+            raw_texts_by_id,
+            entities_by_id,
+            handoffs,
+            reviewer_llm,
+            batch_size=batch_size,
+            retry_rounds=retry_rounds,
+        )
+        self.last_7b_logs = logs
+        return reviewed
 
     # ------------------------------------------------------------
-    # Stage 3 (+ stage 4 lồng vào): linking, có thể kèm LLM re-rank nếu
-    # selector_llm được truyền vào (đã load sẵn).
+    # Stage 3: existing retrievers followed by optional 7B candidate selection.
     # ------------------------------------------------------------
     def _get_raw_candidates(self, ent: NerEntity):
         """Trả candidate RAW (list[RxNormCandidate] hoặc list[dict]) CHƯA
@@ -192,32 +241,35 @@ class InferencePipeline:
         selector_llm=None,
         raw_text: str | None = None,
     ) -> dict[int, list[str]]:
-        """selector_llm=None -> chỉ cắt top-k theo score linker (không LLM).
-        selector_llm=instance đã load -> gọi candidate_selector re-rank."""
+        """Attach linker candidates, optionally reranked by the loaded 7B.
+
+        The selector may only choose codes already returned by the existing
+        retriever; schema validation in ``candidate_selector`` rejects invented
+        codes.  NER is already final before this method is called.
+        """
         candidates_by_entity: dict[int, list[str]] = {}
         selector_indexes: list[int] = []
         selector_items: list[dict] = []
-
         for i, ent in enumerate(entities):
             raw_candidates = self._get_raw_candidates(ent)
             if not raw_candidates:
                 continue
 
-            if selector_llm is not None:
-                context = ""
-                if raw_text is not None:
-                    start, end = ent.position
-                    context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)]
-                selector_indexes.append(i)
-                selector_items.append({
-                    "entity_text": ent.text,
-                    "entity_type": ent.type,
-                    "candidates": raw_candidates,
-                    "context": context,
-                })
-            else:
+            if selector_llm is None:
                 output_limit = MAX_OUTPUT_CANDIDATES[ent.type]
                 candidates_by_entity[i] = _extract_codes(raw_candidates, output_limit)
+                continue
+            context = ""
+            if raw_text is not None:
+                start, end = ent.position
+                context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)]
+            selector_indexes.append(i)
+            selector_items.append({
+                "entity_text": ent.text,
+                "entity_type": ent.type,
+                "candidates": raw_candidates,
+                "context": context,
+            })
 
         if selector_items:
             from .selection.candidate_selector import select_candidates_many
@@ -247,13 +299,10 @@ class InferencePipeline:
 
         from .selection.candidate_selector import select_candidates_many
 
-        results: dict[str, dict[int, list[str]]] = {
-            rid: {} for rid in entities_by_id
-        }
+        results: dict[str, dict[int, list[str]]] = {rid: {} for rid in entities_by_id}
         destinations: list[tuple[str, int]] = []
         selector_items: list[dict] = []
         raw_texts_by_id = raw_texts_by_id or {}
-
         for rid, entities in entities_by_id.items():
             raw_text = raw_texts_by_id.get(rid)
             for index, entity in enumerate(entities):
@@ -271,7 +320,6 @@ class InferencePipeline:
                     "candidates": raw_candidates,
                     "context": context,
                 })
-
         selected_batches = select_candidates_many(
             selector_items,
             selector_llm,

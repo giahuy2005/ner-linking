@@ -1,4 +1,4 @@
-"""Config cho 2 model LLM local: sửa span NER + chọn candidate linking.
+"""Config cho model local dùng để sửa NER và chọn candidate linking.
 
 RÀNG BUỘC VÒNG 1: model self-host tối đa 9B tham số — Qwen3-1.7B và
 Qwen2.5-7B-Instruct đều nằm trong giới hạn khi chạy TÁCH BIỆT (không
@@ -23,6 +23,10 @@ class LocalModelConfig:
     # thì KHÔNG có tham số này (truyền vào sẽ lỗi) -> phải phân biệt rõ.
     supports_thinking: bool = False
     enable_thinking: bool = False
+    batch_size: int = 4
+    temperature: float = 0.0
+    max_context_length: int = 8192
+    retry_rounds: int = 1
 
 
 # --- Máy dev (có mạng): model_id = repo Hub, local_files_only=False.
@@ -41,13 +45,20 @@ NER_FIXER_CONFIG = LocalModelConfig(
     enable_thinking=False,  # tắt thinking: chỉ cần chọn boundary/type, không cần suy luận dài
 )
 
-CANDIDATE_SELECTOR_CONFIG = LocalModelConfig(
+NER_REVIEWER_7B_CONFIG = LocalModelConfig(
     model_id="Qwen/Qwen2.5-7B-Instruct",
     revision=None,
     cache_dir=None,
     load_in_4bit=True,
     local_files_only=False,
-    max_new_tokens=96,
+    max_new_tokens=512,
     supports_thinking=False,
     enable_thinking=False,
+    batch_size=4,
+    temperature=0.0,
+    max_context_length=8192,
+    retry_rounds=1,
 )
+
+# Compatibility alias: cùng model 7B xử lý NER trước rồi linking rerank.
+CANDIDATE_SELECTOR_CONFIG = NER_REVIEWER_7B_CONFIG

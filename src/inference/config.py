@@ -53,6 +53,13 @@ SINGLE_ASSERTION = False  # True nếu submit yêu cầu ép 1 assertion/entity
 # ---------------------------------------------------------------------------
 ENABLE_REPAIR_GATE = True
 
+# Notebook V11 two-pass / grouped 7B handoff defaults.
+MAXIMUM_SECOND_PASS_REGIONS = 24
+ENTITY_REVIEW_SCORE_THRESHOLD = 0.82
+MAXIMUM_REVIEW_REGIONS = 15
+MAXIMUM_REVIEW_TARGETS_PER_REGION = 8
+MAXIMUM_RECOVERY_REGIONS = 12
+
 # ---------------------------------------------------------------------------
 # Linking (RxNorm cho THUỐC, ICD-10 cho CHẨN_ĐOÁN) — dùng ở pipeline.py.
 # Để None thì pipeline tự skip linking, chỉ chạy NER (test nhanh không cần
