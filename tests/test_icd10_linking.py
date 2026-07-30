@@ -140,6 +140,13 @@ class Icd10LinkingTests(unittest.TestCase):
             "viêm bao tử": "K29",
             "Bệnh đa xơ cứng": "G35",
             "thiếu men G6PD": "D55.0",
+            "thiếu máu": "D64.9",
+            "nhiễm khuẩn tiết niệu": "N39.0",
+            "co giật": "R56.8",
+            "sốt siêu vi": "B34.9",
+            "Viêm cơ tim": "I51.4",
+            "Tràn dịch màng tim": "I31.3",
+            "ngoại tâm thu thất": "I49.3",
         }
         for mention, code in expected.items():
             with self.subTest(mention=mention):

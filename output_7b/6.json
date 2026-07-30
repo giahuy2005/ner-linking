@@ -1,0 +1,398 @@
+[
+  {
+    "text": "xơ vữa động mạch",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I70"],
+    "assertions": ["isHistorical"],
+    "position": [38, 54]
+  },
+  {
+    "text": "ăng huyết áp",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I10"],
+    "assertions": ["isHistorical"],
+    "position": [56, 68]
+  },
+  {
+    "text": "Rối loạn lipid máu",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["E75.5"],
+    "assertions": ["isHistorical"],
+    "position": [69, 87]
+  },
+  {
+    "text": "Đái tháo đường",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["E14"],
+    "assertions": [],
+    "position": [89, 103]
+  },
+  {
+    "text": "rối loạn ý thức",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [136, 151]
+  },
+  {
+    "text": "cơn co giật",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["P90"],
+    "assertions": [],
+    "position": [173, 184]
+  },
+  {
+    "text": "xuất huyết dưới nhện",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I60.4"],
+    "assertions": ["isHistorical"],
+    "position": [253, 273]
+  },
+  {
+    "text": "Chụp cắt lớp vi tính sọ não",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [275, 302]
+  },
+  {
+    "text": "xuất huyết dưới nhện vùng trán phải, bầm dập nhu mô vùng trán phải và trán - thái dương phải,",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [317, 410]
+  },
+  {
+    "text": "lớp dịch dưới màng cứng mỏng vùng thùy trán phải",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [419, 467]
+  },
+  {
+    "text": "nang màng nhện",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["G93.0"],
+    "assertions": [],
+    "position": [484, 498]
+  },
+  {
+    "text": "tụ dịch/tụ máu dưới màng cứng mạn tính",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["P10.0"],
+    "assertions": [],
+    "position": [504, 542]
+  },
+  {
+    "text": "chụp CT theo dõi",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [553, 569]
+  },
+  {
+    "text": "đau đầu kéo dài",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [711, 726]
+  },
+  {
+    "text": "Chụp kiểm tra",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [729, 742]
+  },
+  {
+    "text": "tụ máu ngoài màng cứng phải cấp tính trên nền tổn thương mạn tính",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [752, 817]
+  },
+  {
+    "text": "chụp CT kiểm tra",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [862, 878]
+  },
+  {
+    "text": "diễn tiến xấu",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [894, 907]
+  },
+  {
+    "text": "đau đầu vùng thái dương phải và đỉnh đầu",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1001, 1041]
+  },
+  {
+    "text": "tê bì nửa mặt phải",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1056, 1074]
+  },
+  {
+    "text": "trán phải và da đầu phải",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1090, 1114]
+  },
+  {
+    "text": "mất định hướng",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1376, 1390]
+  },
+  {
+    "text": "đi lại không vững",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1392, 1409]
+  },
+  {
+    "text": "ngất",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1421, 1425]
+  },
+  {
+    "text": "kích thích",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1596, 1606]
+  },
+  {
+    "text": "run giật tay chân",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1889, 1906]
+  },
+  {
+    "text": "cứng đờ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1914, 1921]
+  },
+  {
+    "text": "cắn lưỡi",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1929, 1937]
+  },
+  {
+    "text": "tiểu tiện không tự chủ trong",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1947, 1975]
+  },
+  {
+    "text": "Đau đầu vùng thái dương phải",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2008, 2036]
+  },
+  {
+    "text": "đỉnh đầu",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2038, 2046]
+  },
+  {
+    "text": "Tê bì vùng trán phải, da đầu phải và nửa mặt phải",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2077, 2126]
+  },
+  {
+    "text": "rối loạn ý thức",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2132, 2147]
+  },
+  {
+    "text": "Mất định hướng",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2159, 2173]
+  },
+  {
+    "text": "Mất thăng bằng",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2175, 2189]
+  },
+  {
+    "text": "Gần ngất",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2190, 2198]
+  },
+  {
+    "text": "ý thức",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2266, 2272]
+  },
+  {
+    "text": "mất định hướng",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2360, 2374]
+  },
+  {
+    "text": "đi lại không vững",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2378, 2395]
+  },
+  {
+    "text": "kích thích nhẹ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2442, 2456]
+  },
+  {
+    "text": "ngửa đầu ra sau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2458, 2473]
+  },
+  {
+    "text": "Chụp cắt lớp vi tính",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2496, 2516]
+  },
+  {
+    "text": "CT Scanner)",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2518, 2529]
+  },
+  {
+    "text": "Điện tâm đồ",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2655, 2666]
+  },
+  {
+    "text": "điện tim cấp cứu",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2672, 2688]
+  },
+  {
+    "text": "Xét nghiệm Máu Huyết học",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2792, 2816]
+  },
+  {
+    "text": "Đông máu",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2819, 2827]
+  },
+  {
+    "text": "WBC",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2828, 2831]
+  },
+  {
+    "text": "14.99 G/L",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2834, 2843]
+  },
+  {
+    "text": "NEUT%",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2844, 2849]
+  },
+  {
+    "text": "82.9 %",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2852, 2858]
+  },
+  {
+    "text": "HGB (Hemoglobin)",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2867, 2883]
+  },
+  {
+    "text": "92 g/L PT",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2885, 2894]
+  },
+  {
+    "text": "INR",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2897, 2900]
+  },
+  {
+    "text": "1.05",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2902, 2906]
+  },
+  {
+    "text": "CT sọ não",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2921, 2930]
+  },
+  {
+    "text": "xuất huyết dưới nhện vùng trán phải",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2949, 2984]
+  },
+  {
+    "text": "Bầm dập nhu mô vùng trán phải và trán - thái dương phải",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2985, 3040]
+  },
+  {
+    "text": "dịch dưới màng cứng mỏng",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [3045, 3069]
+  },
+  {
+    "text": "thùy trán phải",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [3075, 3089]
+  },
+  {
+    "text": "nang màng nhện",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["G93.0"],
+    "assertions": [],
+    "position": [3100, 3114]
+  },
+  {
+    "text": "tụ máu dưới màng cứng mạn tính",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["P10.0"],
+    "assertions": [],
+    "position": [3120, 3150]
+  },
+  {
+    "text": "Tụ máu ngoài màng cứng phải cấp tính",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["P10.0"],
+    "assertions": [],
+    "position": [3151, 3187]
+  },
+  {
+    "text": "mạn tính",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["R53"],
+    "assertions": [],
+    "position": [3208, 3216]
+  }
+]

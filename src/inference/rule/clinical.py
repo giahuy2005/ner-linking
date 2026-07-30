@@ -23,6 +23,8 @@ _HARD_NEGATIVES = {
     "tĩnh mạch l giọt/phút", "tomisaku kawasaki", "yakult", "uống thuốc",
     "tinh bột nghệ tách tinh dầu", "mẫu", "vs", "đột biến gen",
     "glucose-6-phosphate dehydrogenase", "mang thai lần 2 được 20 tuần",
+    "thai lần 2", "huyết", "dạng đa hình", "bệnh lý", "mạn tính",
+    "75 microgam/",
 }
 _ANATOMY_ONLY = {
     "mạch máu", "động mạch vành", "bụng", "mắt", "tim", "xoang", "tuyến",
@@ -41,6 +43,10 @@ _DEVICE_PREFIXES = (
 _GENERIC_NON_ENTITIES = {
     "kết quả", "xét nghiệm", "thuốc", "mẫu", "dấu hiệu", "triệu chứng",
 }
+_UNLINKABLE_DIAGNOSIS_SURFACES = {
+    "bệnh lý chất trắng", "ung thư biểu mô tuyến",
+    "viêm lan tỏa hệ mạch máu nhỏ và vừa",
+}
 _MEASUREMENT_ONLY_RE = re.compile(
     r"^\d+(?:[.,]\d+)?\s*(?:kg|fr|tuần|week|weeks|w)$", re.I
 )
@@ -53,6 +59,9 @@ _RETYPE_EXACT = {
     "cơn nhịp tim chậm nặng": "TRIỆU_CHỨNG",
     "nhịp tim chậm nặng và hạ huyết áp": "TRIỆU_CHỨNG",
     "test hơi thở h. pylori": "TÊN_XÉT_NGHIỆM",
+    "pain": "TRIỆU_CHỨNG",
+    "vàng da nặng": "TRIỆU_CHỨNG",
+    "tự tử": "TRIỆU_CHỨNG",
 }
 _KNOWN_SURFACES = {
     "thiếu men g6pd": "CHẨN_ĐOÁN",
@@ -63,6 +72,17 @@ _KNOWN_SURFACES = {
     "khó thở": "TRIỆU_CHỨNG",
     "nhìn song thị": "TRIỆU_CHỨNG",
     "viêm dạ dày ruột do virus": "CHẨN_ĐOÁN",
+    "vàng mắt": "TRIỆU_CHỨNG",
+    "berlthyrox": "THUỐC",
+    "ảo giác thính giác": "TRIỆU_CHỨNG",
+    "tự tử": "TRIỆU_CHỨNG",
+    "đánh trống ngực": "TRIỆU_CHỨNG",
+    "ngoại tâm thu thất": "CHẨN_ĐOÁN",
+    "ứ nước": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "dịch rò rỉ quanh ống thông": "TRIỆU_CHỨNG",
+    "nhấc chân phải khỏi mặt giường": "TRIỆU_CHỨNG",
+    "xét nghiệm phân tìm cryptosporidium": "TÊN_XÉT_NGHIỆM",
+    "loét thực quản dưới 6 mm có điểm sắc tố": "CHẨN_ĐOÁN",
 }
 _DRUG_HEADER_RE = re.compile(r"danh\s+sách\s+thuốc\s+trước\s+nhập\s+viện", re.I)
 _NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\.\s+", re.M)
@@ -120,7 +140,7 @@ def _is_hard_negative(entity: NerEntity) -> str | None:
     ):
         return "food_or_supplement"
     if entity.type == "CHẨN_ĐOÁN" and (
-        "dehydrogenase" in normalized or normalized == "đột biến gen"
+        "dehydrogenase" in normalized or normalized in {"đột biến gen", "oligoclonal"}
     ):
         return "enzyme_or_generic_gene_phrase"
     return None
@@ -128,7 +148,22 @@ def _is_hard_negative(entity: NerEntity) -> str | None:
 
 def is_linkable_entity(entity: NerEntity) -> bool:
     """Defense-in-depth gate used immediately before RxNorm/ICD retrieval."""
-    return entity.type in {"THUỐC", "CHẨN_ĐOÁN"} and _is_hard_negative(entity) is None
+    if entity.type not in {"THUỐC", "CHẨN_ĐOÁN"} or _is_hard_negative(entity) is not None:
+        return False
+    return not (
+        entity.type == "CHẨN_ĐOÁN"
+        and _normalize(entity.text) in _UNLINKABLE_DIAGNOSIS_SURFACES
+    )
+
+
+def is_protected_from_7b_drop(entity: NerEntity) -> bool:
+    """High-precision surfaces that 7B may retype/repair but never delete."""
+    normalized = _normalize(entity.text)
+    return bool(
+        normalized in _KNOWN_SURFACES
+        or normalized in _SHORT_MEDICAL_WHITELIST
+        or normalized in _RETYPE_EXACT
+    )
 
 
 def _numbered_section_heading(raw_text: str, position: int) -> str:
@@ -154,6 +189,10 @@ def _repair_assertion_scope(raw_text: str, entity: NerEntity) -> NerEntity:
             assertions.append("isNegated")
         if "isHistorical" not in assertions:
             assertions.append("isHistorical")
+    elif re.search(r"(?:^|\s)(?:không|chưa|phủ nhận)(?:\s+\S+){0,12}\s*$", local_prefix) \
+            and entity.type not in {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"} \
+            and "isNegated" not in assertions:
+        assertions.append("isNegated")
 
     current_cue = re.search(
         r"(?i)\b(?:hiện\s+đang|nay\s+.*?đang|hiện\s+tại|đang\s+có)\b",

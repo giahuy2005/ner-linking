@@ -1,0 +1,240 @@
+[
+  {
+    "text": "thai lần 2",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [53, 63]
+  },
+  {
+    "text": "đau bao tử",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [113, 123]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [138, 141]
+  },
+  {
+    "text": "nội soi",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [297, 304]
+  },
+  {
+    "text": "ổ loét trong bao tử",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [327, 346]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [659, 662]
+  },
+  {
+    "text": "đau bụng râm ran",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1030, 1046]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1054, 1057]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1087, 1090]
+  },
+  {
+    "text": "chân tay",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1145, 1153]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1161, 1164]
+  },
+  {
+    "text": "siêu âm",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1347, 1354]
+  },
+  {
+    "text": "bên thận có 1 viên sỏi 4mm",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1400, 1426]
+  },
+  {
+    "text": "ứ nước",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1439, 1445]
+  },
+  {
+    "text": "sỏi thận",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [1455, 1463]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1491, 1494]
+  },
+  {
+    "text": "viêm bao tử",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [1517, 1528]
+  },
+  {
+    "text": "nghiệm/siêu âm/",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1879, 1894]
+  },
+  {
+    "text": "nội soi cần thiết",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1894, 1911]
+  },
+  {
+    "text": "Aquima",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2032, 2038]
+  },
+  {
+    "text": "nhôm hydroxid",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2040, 2053]
+  },
+  {
+    "text": "magie hydroxid",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2055, 2069]
+  },
+  {
+    "text": "Simenic",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2085, 2092]
+  },
+  {
+    "text": "Alverin citrate 40mg",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2094, 2114]
+  },
+  {
+    "text": "Simethicon 100mg",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2118, 2134]
+  },
+  {
+    "text": "Pimperam",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2135, 2143]
+  },
+  {
+    "text": "metoclopramide 10mg",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2145, 2164]
+  },
+  {
+    "text": "Nhôm hydroxid",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2249, 2262]
+  },
+  {
+    "text": "magie hydroxid",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [2266, 2280]
+  },
+  {
+    "text": "ợ nóng",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2346, 2352]
+  },
+  {
+    "text": "trào ngược dạ dày thực quản",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [2358, 2385]
+  },
+  {
+    "text": "đại tràng giãn",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": ["isHistorical"],
+    "position": [2703, 2717]
+  },
+  {
+    "text": "xét nghiệm máu",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2790, 2804]
+  },
+  {
+    "text": "tăng bạch cầuNgày",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2808, 2825]
+  },
+  {
+    "text": "chụp CT",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2860, 2867]
+  },
+  {
+    "text": "bất thường",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2897, 2907]
+  },
+  {
+    "text": "lơ mơ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2980, 2985]
+  }
+]

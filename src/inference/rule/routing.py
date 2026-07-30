@@ -9,7 +9,12 @@ from ..ner.two_pass import SuspiciousRegion
 
 
 def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) -> dict:
+    from .clinical import is_protected_from_7b_drop
+
     start, end = entity.position
+    allowed_actions = ["KEEP", "REPAIR_SPAN", "RETYPE"]
+    if not is_protected_from_7b_drop(entity):
+        allowed_actions.insert(1, "DROP")
     return {
         "candidate_id": candidate_id,
         "text": entity.text,
@@ -19,7 +24,7 @@ def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) ->
         "assertions": list(entity.assertions),
         "score": round(float(entity.score), 6),
         "small_llm_review_hints": list(entity.review_hints),
-        "allowed_actions": ["KEEP", "DROP", "REPAIR_SPAN", "RETYPE"],
+        "allowed_actions": allowed_actions,
     }
 
 

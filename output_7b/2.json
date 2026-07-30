@@ -1,0 +1,314 @@
+[
+  {
+    "text": "Bệnh Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [3, 16]
+  },
+  {
+    "text": "Bệnh Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [25, 38]
+  },
+  {
+    "text": "sốt cấp kéo dài",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [53, 68]
+  },
+  {
+    "text": "phát ban toàn thân",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [84, 102]
+  },
+  {
+    "text": "viêm lan tỏa hệ mạch máu nhỏ và vừa",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["N60.1"],
+    "assertions": [],
+    "position": [126, 161]
+  },
+  {
+    "text": "viêm tim",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I51.8"],
+    "assertions": [],
+    "position": [555, 563]
+  },
+  {
+    "text": "phình giãn động mạch vành",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I25.4"],
+    "assertions": [],
+    "position": [565, 590]
+  },
+  {
+    "text": "đột tử",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["R96.0"],
+    "assertions": [],
+    "position": [592, 598]
+  },
+  {
+    "text": "nhồi máu cơ tim",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I22"],
+    "assertions": [],
+    "position": [600, 615]
+  },
+  {
+    "text": "hẹp tắc mạch vành",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I87.1"],
+    "assertions": [],
+    "position": [622, 639]
+  },
+  {
+    "text": "suy tim",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I50"],
+    "assertions": [],
+    "position": [644, 651]
+  },
+  {
+    "text": "Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [670, 678]
+  },
+  {
+    "text": "bệnh Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [775, 788]
+  },
+  {
+    "text": "bệnh Kawasaki ở trẻ em",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["L12.2"],
+    "assertions": [],
+    "position": [1336, 1358]
+  },
+  {
+    "text": "Sốt cao kéo dài",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1439, 1454]
+  },
+  {
+    "text": "Sốt 39–40°C",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1458, 1469]
+  },
+  {
+    "text": "Mắt đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1534, 1540]
+  },
+  {
+    "text": "Viêm kết mạc",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["H10"],
+    "assertions": [],
+    "position": [1544, 1556]
+  },
+  {
+    "text": "Môi đỏ, nứt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1619, 1630]
+  },
+  {
+    "text": "rỉ máu",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1639, 1645]
+  },
+  {
+    "text": "Lưỡi đỏ như dâu tây",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1650, 1669]
+  },
+  {
+    "text": "Họng đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1674, 1681]
+  },
+  {
+    "text": "Sưng, đỏ mu bàn tay – chân",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1710, 1736]
+  },
+  {
+    "text": "Đỏ gan bàn tay – chân",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1741, 1762]
+  },
+  {
+    "text": "Bong da đầu ngón tay",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1767, 1787]
+  },
+  {
+    "text": "Ban đỏ toàn thân",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1827, 1843]
+  },
+  {
+    "text": "dạng đa hình",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I48.3"],
+    "assertions": [],
+    "position": [1851, 1863]
+  },
+  {
+    "text": "mảng đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1877, 1884]
+  },
+  {
+    "text": "Bệnh đa xơ cứng",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["G35"],
+    "assertions": [],
+    "position": [1916, 1931]
+  },
+  {
+    "text": "Ảo giác",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1971, 1978]
+  },
+  {
+    "text": "loạn thần",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["F68.0"],
+    "assertions": ["isNegated"],
+    "position": [2030, 2039]
+  },
+  {
+    "text": "Công thức máu",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2042, 2055]
+  },
+  {
+    "text": "CRP",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2057, 2060]
+  },
+  {
+    "text": "máu lắng",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2062, 2070]
+  },
+  {
+    "text": "Men gan",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2074, 2081]
+  },
+  {
+    "text": "albumin",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2083, 2090]
+  },
+  {
+    "text": "Xét nghiệm nước tiểu",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2094, 2114]
+  },
+  {
+    "text": "Cấy máu, dịch hầu họng",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2118, 2140]
+  },
+  {
+    "text": "Siêu âm tim",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2144, 2155]
+  },
+  {
+    "text": "ECG điện tâm đồ",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2204, 2219]
+  },
+  {
+    "text": "bệnh Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [2233, 2246]
+  },
+  {
+    "text": "siêu âm tim",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2841, 2852]
+  },
+  {
+    "text": "Bệnh Kawasaki",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["M30.3"],
+    "assertions": [],
+    "position": [3407, 3420]
+  },
+  {
+    "text": "sốt cao",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3550, 3557]
+  },
+  {
+    "text": "đỏ mắt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3587, 3593]
+  },
+  {
+    "text": "ban đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3595, 3601]
+  },
+  {
+    "text": "môi đỏ – nứt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3603, 3615]
+  },
+  {
+    "text": "lưỡi đỏ dâu tây",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3617, 3632]
+  },
+  {
+    "text": "sưng hạch cổ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3638, 3650]
+  }
+]

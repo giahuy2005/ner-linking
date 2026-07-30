@@ -58,6 +58,17 @@ def _validate_response(request: dict, parsed: Any) -> tuple[dict | None, str | N
             for item in decisions
         ):
             return None, "invalid_action"
+        target_by_id = {
+            target["candidate_id"]: target for target in request.get("targets", [])
+            if isinstance(target, dict) and isinstance(target.get("candidate_id"), int)
+        }
+        if any(
+            item["action"] not in target_by_id.get(item["candidate_id"], {}).get(
+                "allowed_actions", []
+            )
+            for item in decisions
+        ):
+            return None, "action_not_allowed_for_target"
     else:
         if not isinstance(parsed.get("new_entities"), list):
             return None, "new_entities_not_list"

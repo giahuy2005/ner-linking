@@ -1,0 +1,251 @@
+[
+  {
+    "text": "ung thư biểu mô tế bào mật",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["C22.0"],
+    "assertions": [],
+    "position": [238, 264]
+  },
+  {
+    "text": "vô sinh",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["N97"],
+    "assertions": [],
+    "position": [356, 363]
+  },
+  {
+    "text": "xét nghiệm tinh dịch đồ",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [519, 542]
+  },
+  {
+    "text": "siêu âm",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [616, 623]
+  },
+  {
+    "text": "chụp tử cung vòi trứng",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [664, 686]
+  },
+  {
+    "text": "xét nghiệm nội tiết",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [749, 768]
+  },
+  {
+    "text": "Hội chứng buồng trứng đa nang",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["E28.2"],
+    "assertions": [],
+    "position": [982, 1011]
+  },
+  {
+    "text": "rậm lông",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["L68.0"],
+    "assertions": [],
+    "position": [1021, 1029]
+  },
+  {
+    "text": "béo phì",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["E66"],
+    "assertions": [],
+    "position": [1031, 1038]
+  },
+  {
+    "text": "siêu âm buồng trứng",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1040, 1059]
+  },
+  {
+    "text": "nhiều nang",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1063, 1073]
+  },
+  {
+    "text": "vô sinh",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["N97"],
+    "assertions": [],
+    "position": [1108, 1115]
+  },
+  {
+    "text": "buồn nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1169, 1177]
+  },
+  {
+    "text": "nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1179, 1182]
+  },
+  {
+    "text": "sốt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1184, 1187]
+  },
+  {
+    "text": "ớn lạnh",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1189, 1196]
+  },
+  {
+    "text": "dịch rò rỉ quanh ống thông",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1203, 1229]
+  },
+  {
+    "text": "cholangiogram",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1250, 1263]
+  },
+  {
+    "text": "tắc nghẽn kéo dài gần chỗ nối mật tụy",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1289, 1326]
+  },
+  {
+    "text": "tế bào bất thường",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1572, 1589]
+  },
+  {
+    "text": "ung thư biểu mô tuyến",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["C44.0"],
+    "assertions": [],
+    "position": [1605, 1626]
+  },
+  {
+    "text": "buồn nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1939, 1947]
+  },
+  {
+    "text": "nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1949, 1952]
+  },
+  {
+    "text": "đau ngực",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1954, 1962]
+  },
+  {
+    "text": "khó thở",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [1969, 1976]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2011, 2014]
+  },
+  {
+    "text": "buồn nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [2366, 2374]
+  },
+  {
+    "text": "nôn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [2376, 2379]
+  },
+  {
+    "text": "sốt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [2381, 2384]
+  },
+  {
+    "text": "ớn lạnh",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [2386, 2393]
+  },
+  {
+    "text": "cholangiogram",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2447, 2460]
+  },
+  {
+    "text": "tắc nghẽn kéo dài gần chỗ nối mật tụy",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2486, 2523]
+  },
+  {
+    "text": "bàn chải",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2691, 2699]
+  },
+  {
+    "text": "các tế bào bất thường",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2758, 2779]
+  },
+  {
+    "text": "ung thư biểu mô tuyến",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["C44.0"],
+    "assertions": [],
+    "position": [2798, 2819]
+  },
+  {
+    "text": "đau khi sờ nắn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3002, 3016]
+  },
+  {
+    "text": "tế bào bất thườngtế bào bất thường",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [3137, 3171]
+  },
+  {
+    "text": "ung thư biểu mô tuyến",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["C44.0"],
+    "assertions": [],
+    "position": [3187, 3208]
+  },
+  {
+    "text": "cholangiogram",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [3241, 3254]
+  },
+  {
+    "text": "tắc nghẽn kéo dài gần chỗ nối mật tụy, ảnh hưởng đến ống dẫn trước và sau bên phải",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [3280, 3362]
+  }
+]
