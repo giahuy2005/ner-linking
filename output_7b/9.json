@@ -32,10 +32,24 @@
     "position": [327, 346]
   },
   {
+    "text": "tinh bột nghệ tách tinh dầu",
+    "type": "THUỐC",
+    "candidates": ["10603"],
+    "assertions": ["isHistorical"],
+    "position": [578, 605]
+  },
+  {
     "text": "đau",
     "type": "TRIỆU_CHỨNG",
     "assertions": ["isNegated"],
     "position": [659, 662]
+  },
+  {
+    "text": "Yakult",
+    "type": "THUỐC",
+    "candidates": ["220931"],
+    "assertions": ["isHistorical"],
+    "position": [1003, 1009]
   },
   {
     "text": "đau bụng râm ran",
@@ -56,9 +70,15 @@
     "position": [1087, 1090]
   },
   {
-    "text": "đau",
+    "text": "bụng",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
+    "position": [1111, 1115]
+  },
+  {
+    "text": "đau",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
     "position": [1161, 1164]
   },
   {
@@ -83,7 +103,7 @@
   {
     "text": "đau",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1491, 1494]
   },
   {

@@ -148,7 +148,7 @@
   {
     "text": "ngất",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1421, 1425]
   },
   {

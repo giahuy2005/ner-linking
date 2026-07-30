@@ -25,7 +25,15 @@ _GENERIC_NON_ENTITIES = {
     "kết quả", "xét nghiệm", "thuốc", "mẫu", "dấu hiệu", "triệu chứng",
 }
 _MEASUREMENT_ONLY_RE = re.compile(
-    r"^\d+(?:[.,]\d+)?\s*(?:kg|fr|tuần|week|weeks|w)$", re.I
+    r"^\d+(?:[.,]\d+)?\s*(?:kg|fr|tuần|week|weeks|w|mg|mcg|micrograms?|"
+    r"grams?|g|ml|l|iu|đơn\s+vị|units?)$",
+    re.I,
+)
+_DOSING_ONLY_RE = re.compile(
+    r"^(?:(?:iv|im|po|sc|sq|prn|bid|tid|qid|qhs|qam|daily|tĩnh\s+mạch|"
+    r"tiêm|uống|truyền|liều|giảm\s+liều|đơn\s+vị|giọt|ngày|lần|mỗi|cách)"
+    r"|\d+(?:[.,]\d+)?|[/x*+–-]|\s)+$",
+    re.I,
 )
 _DRUG_HEADER_RE = re.compile(r"danh\s+sách\s+thuốc\s+trước\s+nhập\s+viện", re.I)
 _NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\.\s+", re.M)
@@ -67,6 +75,8 @@ def _is_hard_negative(entity: NerEntity) -> str | None:
         return "isolated_number"
     if _MEASUREMENT_ONLY_RE.fullmatch(normalized):
         return "isolated_measurement"
+    if entity.type == "THUỐC" and _DOSING_ONLY_RE.fullmatch(normalized):
+        return "dosing_without_ingredient"
     if entity.type in {"THUỐC", "CHẨN_ĐOÁN"} and normalized.startswith(_DEVICE_PREFIXES):
         return "device_or_procedure"
     return None
@@ -129,6 +139,39 @@ def _repair_boundary(raw_text: str, entity: NerEntity) -> NerEntity:
     text = entity.text
     start, end = entity.position
     candidates: list[tuple[int, int]] = []
+
+    # BIO/token offset occasionally stops inside a Unicode word (for example
+    # the last accented character is omitted) or starts after its first
+    # character.  A valid Vietnamese entity boundary cannot split an
+    # alphanumeric token, so expansion to that token edge is deterministic
+    # and does not require a medical surface dictionary.
+    expanded_start, expanded_end = start, end
+    first_fragment = re.match(r"[^\W\d_]+", text, flags=re.UNICODE)
+    can_expand_left = bool(
+        first_fragment
+        and len(first_fragment.group(0)) <= 4
+        and expanded_start > 0
+        and raw_text[expanded_start - 1].isalpha()
+        and raw_text[expanded_start].isalpha()
+    )
+    if can_expand_left:
+        while expanded_start > 0 and raw_text[expanded_start - 1].isalnum():
+            expanded_start -= 1
+    last_fragment = re.search(r"[^\W\d_]+$", text, flags=re.UNICODE)
+    can_expand_right = bool(
+        last_fragment
+        and len(last_fragment.group(0)) <= 2
+        and last_fragment.group(0).islower()
+        and expanded_end < len(raw_text)
+        and raw_text[expanded_end - 1].isalpha()
+        and raw_text[expanded_end].isalpha()
+        and raw_text[expanded_end].islower()
+    )
+    if can_expand_right:
+        while expanded_end < len(raw_text) and raw_text[expanded_end].isalnum():
+            expanded_end += 1
+    if (expanded_start, expanded_end) != (start, end):
+        candidates.append((expanded_start, expanded_end))
 
     # Leading/trailing patient markers and punctuation leaked by BIO.
     trimmed = re.sub(r"^(?:bn|bệnh\s+nhân)\s+", "", text, flags=re.I)

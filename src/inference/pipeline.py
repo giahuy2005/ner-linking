@@ -332,8 +332,13 @@ class InferencePipeline:
                 continue
 
             if selector_llm is None:
-                output_limit = MAX_OUTPUT_CANDIDATES[ent.type]
-                candidates_by_entity[i] = _extract_codes(raw_candidates, output_limit)
+                from .selection.candidate_selector import select_supported_top_candidates
+                candidates_by_entity[i] = select_supported_top_candidates(
+                    ent.text,
+                    ent.type,
+                    raw_candidates,
+                    max_choices=MAX_OUTPUT_CANDIDATES[ent.type],
+                )
                 continue
             context = ""
             if raw_text is not None:

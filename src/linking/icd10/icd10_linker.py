@@ -57,9 +57,45 @@ def _normalize_alias(text: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" \t\r\n.,;:()[]{}")
 
 
-def _exact_alias_result(mention: str) -> list[dict[str, Any]] | None:
+def _build_metadata_alias_codes(metadata: Iterable[dict[str, Any]]) -> dict[str, str]:
+    """Build unambiguous Vietnamese exact aliases from the index itself.
+
+    This replaces private-test surface rules for ordinary ICD labels.  A
+    generated alias is kept only when every matching metadata row points to
+    one code.  For preferred labels we also expose a version without a generic
+    leading ``bệnh``/``hội chứng`` when that shortened form remains unique.
+    """
+    aliases: dict[str, set[str]] = {}
+    for row in metadata:
+        if str(row.get("language", "")).casefold() != "vi":
+            continue
+        normalized = _normalize_alias(str(row.get("text", "")))
+        if not normalized:
+            continue
+        forms = {normalized}
+        if row.get("term_type") == "preferred":
+            shortened = re.sub(r"^(?:bệnh|hội chứng)\s+", "", normalized).strip()
+            if len(shortened) >= 3:
+                forms.add(shortened)
+        for form in forms:
+            aliases.setdefault(form, set()).add(str(row["code"]))
+    return {
+        alias: next(iter(codes))
+        for alias, codes in aliases.items()
+        if len(codes) == 1
+    }
+
+
+def _exact_alias_result(
+    mention: str,
+    metadata_alias_codes: dict[str, str] | None = None,
+) -> list[dict[str, Any]] | None:
     normalized = _normalize_alias(mention)
     code = config.EXACT_ALIAS_CODES.get(normalized)
+    source = "configured_alias"
+    if code is None and metadata_alias_codes is not None:
+        code = metadata_alias_codes.get(normalized)
+        source = "metadata_exact_alias"
     if code is None:
         return None
     return [{
@@ -67,8 +103,8 @@ def _exact_alias_result(mention: str) -> list[dict[str, Any]] | None:
         "score": 1.0,
         "matched_term": mention,
         "language": "vi",
-        "term_type": "exact_alias",
-        "term_id": f"exact-alias:{normalized}",
+        "term_type": source,
+        "term_id": f"{source}:{normalized}",
     }]
 
 
@@ -137,6 +173,7 @@ class Icd10Linker:
 
         self.index = faiss.read_index(str(index_path))
         self.metadata = self._load_metadata(metadata_path)
+        self.metadata_alias_codes = _build_metadata_alias_codes(self.metadata)
         expected_count = int(self.config["embedding"]["count"])
         expected_dimension = int(self.config["model"]["dimension"])
         if self.index.ntotal != expected_count or len(self.metadata) != expected_count:
@@ -234,7 +271,7 @@ class Icd10Linker:
         min_score: float | None = config.DEFAULT_MIN_SCORE,
     ) -> list[dict[str, Any]]:
         """Link one NER mention and return ICD codes ranked by maximum term score."""
-        exact = _exact_alias_result(mention)
+        exact = _exact_alias_result(mention, self.metadata_alias_codes)
         if exact is not None:
             return exact
         term_results = self.search_terms(mention, top_k_terms=top_k_terms)
@@ -269,7 +306,7 @@ class Icd10Linker:
         scores, indices = self.index.search(queries, count)
         output = []
         for mention, row_scores, row_indices in zip(cleaned, scores, indices):
-            exact = _exact_alias_result(mention)
+            exact = _exact_alias_result(mention, self.metadata_alias_codes)
             if exact is not None:
                 output.append(exact)
                 continue

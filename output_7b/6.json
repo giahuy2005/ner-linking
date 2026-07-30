@@ -16,14 +16,14 @@
   {
     "text": "Rối loạn lipid máu",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["E75.5"],
+    "candidates": ["E78.5"],
     "assertions": ["isHistorical"],
     "position": [69, 87]
   },
   {
     "text": "Đái tháo đường",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["E14"],
+    "candidates": ["E11.9"],
     "assertions": [],
     "position": [89, 103]
   },
@@ -36,7 +36,7 @@
   {
     "text": "cơn co giật",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["P90"],
+    "candidates": ["R56.8"],
     "assertions": [],
     "position": [173, 184]
   },
@@ -148,7 +148,7 @@
   {
     "text": "ngất",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1421, 1425]
   },
   {

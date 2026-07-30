@@ -42,7 +42,7 @@ Nhiều file .txt
   -> danh sách NER cuối cùng
   -> RxNorm retrieval cho THUỐC / ICD-10 retrieval cho CHẨN_ĐOÁN
   -> Qwen2.5-7B rerank candidate linking theo batch
-  -> validate code, fallback linker nếu cần
+  -> validate code; abstain `[]` nếu candidate không đủ bằng chứng
   -> assemble BTC JSON
 ```
 
@@ -119,12 +119,16 @@ V9/V11 của notebook được giữ: `RETYPE` và đề nghị boundary chỉ l
 `DROP` chỉ được áp dụng khi Python guarded-drop cho phép. Quyết định bị chặn
 được lưu trong `small_llm_review_hints`, entity gốc được giữ và route cho 7B.
 Handoff được dựng lại sau stage 1.5B.
+CLI in thêm số hint theo `requested_action` (`DROP`, `RETYPE_SUGGEST`,
+`BOUNDARY_REVIEW_SUGGESTED`) để phân biệt trường hợp output BTC không đổi nhưng
+1.5B vẫn đã tạo sidecar evidence cho 7B.
 
 7B chỉ được quyết định trên `target_candidate_ids`; entity sạch ngoài target
 không được sửa. Raw hint 1.5B là bằng chứng tham khảo, 7B phải kiểm tra lại bằng
 context và validator vẫn kiểm tra schema/offset/overlap. Action `DROP` chỉ xuất
-hiện trong `allowed_actions` khi 1.5B đã độc lập đề nghị `DROP`; không entity nào
-được bảo vệ hay bị xóa dựa trên danh sách surface hard-code.
+hiện khi 1.5B đã độc lập đề nghị `DROP`; `RETYPE` chỉ mở đúng type 1.5B đề nghị;
+`REPAIR_SPAN` chỉ mở khi có hint boundary/cờ boundary. `UPDATE_ASSERTIONS` không
+được đổi text/type/position. Không entity nào được sửa dựa trên danh sách surface hard-code.
 
 `build_handoff_requests()` trong `src/inference/rule/routing.py` tạo schema
 `7b_handoff_v2_grouped` với hai task.
@@ -151,13 +155,16 @@ Nhiều target gần nhau được gom trong cùng context. Request giữ `reque
       "requested_action": "DROP",
       "status": "blocked_unsafe_drop"
     }],
-    "allowed_actions": ["KEEP", "DROP", "REPAIR_SPAN", "RETYPE"]
+    "allowed_actions": ["KEEP", "UPDATE_ASSERTIONS", "DROP"],
+    "allowed_retype_types": [],
+    "allowed_repair_types": ["TRIỆU_CHỨNG"]
   }]
 }
 ```
 
 7B phải trả đúng một decision cho mỗi target. `KEEP` giữ nguyên; `DROP` xóa;
-`REPAIR_SPAN` sửa boundary; `RETYPE` đổi sang một trong năm type hợp lệ.
+`REPAIR_SPAN` sửa boundary; `RETYPE` chỉ đổi sang type được 1.5B đề nghị;
+`UPDATE_ASSERTIONS` chỉ sửa assertion.
 
 ### 3.2. `RECOVER_MISSING_ENTITIES`
 
@@ -177,7 +184,8 @@ Validator kiểm tra tối thiểu:
 
 - `request_id` khớp và mỗi target có đúng một decision.
 - Không chỉnh candidate ngoài `target_candidate_ids`.
-- Action/type/assertion thuộc allow-list.
+- Action/type/assertion thuộc allow-list riêng của từng target; retype khác type
+  1.5B đề nghị bị từ chối.
 - Text khớp chính xác `raw_text[start:end]`.
 - Span sửa nằm trong context và gần/overlap span gốc.
 - Relative position không âm, không vượt context.
@@ -201,7 +209,7 @@ Index, embedding, FAISS, retrieval và ranking hiện có không bị thay đổ
 tái sử dụng.
 
 Khi không bật 7B, pipeline lấy theo ranking của linker: tối đa 1 RxNorm code
-cho thuốc và 3 ICD-10 code cho chẩn đoán.
+cho thuốc và 2 ICD-10 code cho chẩn đoán.
 
 Khi bật 7B, `select_candidates_many()` gom các entity mơ hồ của nhiều document
 thành batch. Prompt linking nhận entity text/type, raw context và candidate kèm
@@ -209,11 +217,11 @@ metadata/ranking feature. 7B có quyền chọn/rerank candidate, với các gi�
 
 - Chỉ được chọn code có trong candidate do retriever trả về.
 - Không được bịa code mới.
-- THUỐC luôn tối đa 1 RxNorm code.
-- CHẨN_ĐOÁN tối đa 2 ICD-10 code; exact alias trả 1 mã, semantic candidate
-  dưới ngưỡng bị loại, và khi top-1 cách top-2 đủ xa chỉ giữ top-1.
-- JSON lỗi, code không hợp lệ hoặc lỗi generation sẽ fallback về top candidate
-  của linker.
+- THUỐC tối đa 1 RxNorm code và có thể trả `[]` nếu không candidate nào đúng ingredient.
+- CHẨN_ĐOÁN mặc định tối đa 1 ICD-10; chỉ cho tối đa 2 khi mention có cấu trúc
+  phối hợp chẩn đoán rõ ràng. Exact alias trả 1 mã và semantic candidate dưới ngưỡng bị loại.
+- JSON lỗi, code không hợp lệ, LLM chọn rỗng hoặc lỗi generation sẽ trả `[]`
+  đối với candidate mơ hồ; chỉ exact match đã kiểm chứng mới fallback top-1.
 
 Exact match chắc chắn có thể bypass 7B để tiết kiệm generation: ICD-10 khi text
 khớp normalized `matched_term`; RxNorm khi ingredient exact và

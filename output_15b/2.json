@@ -33,17 +33,24 @@
     "position": [126, 161]
   },
   {
+    "text": "Tomisaku Kawasaki",
+    "type": "THUỐC",
+    "candidates": [],
+    "assertions": [],
+    "position": [265, 282]
+  },
+  {
     "text": "viêm tim",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [555, 563]
   },
   {
     "text": "phình giãn động mạch vành",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [565, 590]
   },
   {
@@ -80,6 +87,13 @@
     "candidates": [],
     "assertions": [],
     "position": [670, 678]
+  },
+  {
+    "text": "mạch máu",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [692, 700]
   },
   {
     "text": "bệnh Kawasaki",
@@ -169,11 +183,29 @@
     "position": [1827, 1843]
   },
   {
+    "text": "Ban",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1847, 1850]
+  },
+  {
     "text": "dạng đa hình",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
     "assertions": [],
     "position": [1851, 1863]
+  },
+  {
+    "text": "dát",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1865, 1868]
+  },
+  {
+    "text": "sẩn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1871, 1874]
   },
   {
     "text": "mảng đỏ",
@@ -185,7 +217,7 @@
     "text": "Bệnh đa xơ cứng",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1916, 1931]
   },
   {
@@ -268,6 +300,13 @@
     "candidates": [],
     "assertions": [],
     "position": [2233, 2246]
+  },
+  {
+    "text": "động mạch vành",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [2508, 2522]
   },
   {
     "text": "siêu âm tim",

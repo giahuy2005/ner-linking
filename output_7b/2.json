@@ -35,15 +35,15 @@
   {
     "text": "viêm tim",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["I51.8"],
-    "assertions": [],
+    "candidates": ["I51.4"],
+    "assertions": ["isNegated"],
     "position": [555, 563]
   },
   {
     "text": "phình giãn động mạch vành",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["I25.4"],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [565, 590]
   },
   {
@@ -56,14 +56,14 @@
   {
     "text": "nhồi máu cơ tim",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["I22"],
+    "candidates": ["I21.9"],
     "assertions": [],
     "position": [600, 615]
   },
   {
     "text": "hẹp tắc mạch vành",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["I87.1"],
+    "candidates": ["I25.1"],
     "assertions": [],
     "position": [622, 639]
   },
@@ -82,6 +82,13 @@
     "position": [670, 678]
   },
   {
+    "text": "mạch máu",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["C49"],
+    "assertions": [],
+    "position": [692, 700]
+  },
+  {
     "text": "bệnh Kawasaki",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["M30.3"],
@@ -91,7 +98,7 @@
   {
     "text": "bệnh Kawasaki ở trẻ em",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["L12.2"],
+    "candidates": ["M30.3"],
     "assertions": [],
     "position": [1336, 1358]
   },
@@ -170,10 +177,15 @@
   },
   {
     "text": "dạng đa hình",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": ["I48.3"],
+    "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [1851, 1863]
+  },
+  {
+    "text": "sẩn",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [1871, 1874]
   },
   {
     "text": "mảng đỏ",
@@ -185,7 +197,7 @@
     "text": "Bệnh đa xơ cứng",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["G35"],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1916, 1931]
   },
   {
@@ -197,7 +209,7 @@
   {
     "text": "loạn thần",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["F68.0"],
+    "candidates": ["F29"],
     "assertions": ["isNegated"],
     "position": [2030, 2039]
   },
@@ -261,6 +273,13 @@
     "candidates": ["M30.3"],
     "assertions": [],
     "position": [2233, 2246]
+  },
+  {
+    "text": "động mạch vành",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I25.1"],
+    "assertions": [],
+    "position": [2508, 2522]
   },
   {
     "text": "siêu âm tim",

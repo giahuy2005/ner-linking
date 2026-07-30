@@ -52,7 +52,8 @@
   },
   {
     "text": "đau thắt ngực ổn định",
-    "type": "TRIỆU_CHỨNG",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["I20.8"],
     "assertions": ["isHistorical"],
     "position": [660, 681]
   },
@@ -78,7 +79,7 @@
     "text": "Parkinson",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["G20"],
-    "assertions": ["isHistorical"],
+    "assertions": ["isNegated", "isHistorical"],
     "position": [881, 890]
   },
   {
@@ -102,7 +103,7 @@
   {
     "text": "yếu sức chân phải",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1288, 1305]
   },
   {
@@ -114,7 +115,7 @@
   {
     "text": "khuỵu chân khi được giúp đỡ đứng dậy",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1428, 1464]
   },
   {
@@ -137,7 +138,8 @@
   },
   {
     "text": "cơn nhịp tim chậm nặng",
-    "type": "TRIỆU_CHỨNG",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["R00.1"],
     "assertions": [],
     "position": [1581, 1603]
   },
@@ -156,6 +158,13 @@
     "position": [1675, 1693]
   },
   {
+    "text": "Chụp",
+    "type": "THUỐC",
+    "candidates": ["2471431"],
+    "assertions": [],
+    "position": [1701, 1705]
+  },
+  {
     "text": "chụp ct sọ não",
     "type": "TÊN_XÉT_NGHIỆM",
     "assertions": [],
@@ -170,7 +179,7 @@
   {
     "text": "tai biến mạch máu não",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["I69"],
+    "candidates": ["I64"],
     "assertions": [],
     "position": [1815, 1836]
   },
@@ -189,21 +198,21 @@
   {
     "text": "nhiễm trùng răng miệng",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["J95.0"],
+    "candidates": ["K12.2"],
     "assertions": [],
     "position": [2021, 2043]
   },
   {
     "text": "tai biến mạch máu não",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["I69"],
+    "candidates": ["I64"],
     "assertions": ["isHistorical", "isNegated"],
     "position": [2099, 2120]
   },
   {
     "text": "co giật",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["G25.3"],
+    "candidates": ["R56.8"],
     "assertions": ["isNegated", "isHistorical"],
     "position": [2126, 2133]
   },
@@ -289,6 +298,12 @@
     "position": [2872, 2890]
   },
   {
+    "text": "Chụp",
+    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2898, 2902]
+  },
+  {
     "text": "chụp ct sọ não",
     "type": "TÊN_XÉT_NGHIỆM",
     "assertions": [],
@@ -303,14 +318,14 @@
   {
     "text": "nhiễm trùng răng miệng",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["J95.0"],
+    "candidates": ["K12.2"],
     "assertions": [],
     "position": [2981, 3003]
   },
   {
     "text": "yếu sức chân phải",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3108, 3125]
   },
   {
@@ -322,7 +337,7 @@
   {
     "text": "khuỵu chân",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3174, 3184]
   },
   {

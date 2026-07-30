@@ -72,10 +72,15 @@ def filter_entities(entities: list[dict], *, drop_suspect_truncated: bool = Fals
             ent = {**ent, "text": new_text, "position": [new_start, new_end]}
             text = new_text
 
-        # Confidence comes from the model and generalizes to unseen surfaces.
+        # Very short spans are reviewed, never dropped here. This catches
+        # truncated BIO pieces without maintaining a whitelist that would miss
+        # valid unseen abbreviations or short symptoms.
         # ``drop_suspect_truncated`` remains in the signature for CLI/API
         # compatibility but no vocabulary-based "suspect" class is created.
-        if float(ent.get("score", 1.0)) < LOW_CONFIDENCE_THRESHOLD:
+        compact_length = len(re.sub(r"\s+", "", text.strip()))
+        if compact_length <= 2:
+            ent = {**ent, "flag": "short_span_review"}
+        elif float(ent.get("score", 1.0)) < LOW_CONFIDENCE_THRESHOLD:
             ent = {**ent, "flag": "low_emission_confidence"}
 
         kept.append(ent)

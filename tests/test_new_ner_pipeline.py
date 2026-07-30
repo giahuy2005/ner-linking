@@ -125,6 +125,31 @@ class NewNerPipelineTests(unittest.TestCase):
         self.assertEqual(["sốt", "vàng da", "Thiếu men G6PD", "chụp ct sọ não", "ăn ngủ"],
                          [entity.text for entity in cleaned])
 
+    def test_boundary_cleanup_expands_a_span_cut_inside_unicode_word(self):
+        raw = "Người bệnh khó thở và tăng huyết áp."
+        symptom_start = raw.index("khó thở")
+        diagnosis_start = raw.index("tăng huyết áp")
+        entities = [
+            NerEntity("khó th", "TRIỆU_CHỨNG", [],
+                      (symptom_start, symptom_start + len("khó th")), 0.95),
+            NerEntity("ăng huyết áp", "CHẨN_ĐOÁN", [],
+                      (diagnosis_start + 1, diagnosis_start + len("tăng huyết áp")), 0.95),
+        ]
+
+        cleaned, _logs = deterministic_cleanup(raw, entities)
+
+        self.assertEqual(["khó thở", "tăng huyết áp"], [entity.text for entity in cleaned])
+
+    def test_standalone_dose_is_not_a_linkable_drug(self):
+        raw = "Dùng 1 gram rồi theo dõi."
+        start = raw.index("1 gram")
+        entity = NerEntity("1 gram", "THUỐC", [], (start, start + len("1 gram")), 0.9)
+
+        cleaned, logs = deterministic_cleanup(raw, [entity])
+
+        self.assertEqual([], cleaned)
+        self.assertTrue(any(log["reason"] == "isolated_measurement" for log in logs))
+
     def test_structural_boundary_cleanup_does_not_expand_medical_vocabulary(self):
         raw = "bệnh hiếm\nMặc; Cấy mẫu, dịch vị; làm làm xét nghiệm"
         surfaces = ["bệnh hiếm\nMặc", "dịch vị", "làm làm xét nghiệm"]
@@ -251,6 +276,31 @@ class NewNerPipelineTests(unittest.TestCase):
         self.assertTrue(any(log.get("reason") == "action_not_allowed_for_target"
                             for log in logs))
 
+    def test_7b_may_drop_a_structurally_short_span_after_context_review(self):
+        raw = "Người bệnh đứng ở hành lang."
+        surface = "ở"
+        start = raw.index(surface)
+        entity = NerEntity(
+            surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.9,
+            "short_span_review",
+        )
+        handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
+        request = handoff["review_regions"][0]
+        self.assertIn("DROP", request["targets"][0]["allowed_actions"])
+        llm = _BatchLlm([[
+            json.dumps({
+                "request_id": request["request_id"],
+                "decisions": [{"candidate_id": 0, "action": "DROP"}],
+            }, ensure_ascii=False),
+        ]])
+
+        result, _logs = review_entities_batch(
+            {"doc": raw}, {"doc": [entity]}, {"doc": handoff}, llm,
+            retry_rounds=0,
+        )
+
+        self.assertEqual([], result["doc"])
+
     def test_7b_drop_is_enabled_only_when_1_5b_requested_it(self):
         raw = "Bệnh nhân có biểu hiện lạ."
         surface = "biểu hiện lạ"
@@ -264,6 +314,66 @@ class NewNerPipelineTests(unittest.TestCase):
         handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
 
         self.assertIn("DROP", handoff["review_regions"][0]["targets"][0]["allowed_actions"])
+
+    def test_7b_retype_is_limited_to_the_type_suggested_by_1_5b(self):
+        raw = "Bệnh nhân có biểu hiện lạ."
+        surface = "biểu hiện lạ"
+        start = raw.index(surface)
+        entity = NerEntity(
+            surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.5,
+            "low_emission_confidence",
+            [{"requested_action": "RETYPE_SUGGEST", "status": "suggestion_only",
+              "suggested_type": "CHẨN_ĐOÁN"}],
+        )
+        handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
+        target = handoff["review_regions"][0]["targets"][0]
+
+        self.assertIn("RETYPE", target["allowed_actions"])
+        self.assertEqual(["CHẨN_ĐOÁN"], target["allowed_retype_types"])
+
+    def test_7b_cannot_retype_from_low_confidence_alone(self):
+        raw = "Bệnh nhân có biểu hiện lạ."
+        surface = "biểu hiện lạ"
+        start = raw.index(surface)
+        entity = NerEntity(
+            surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.5,
+            "low_emission_confidence",
+        )
+        handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
+        target = handoff["review_regions"][0]["targets"][0]
+
+        self.assertNotIn("RETYPE", target["allowed_actions"])
+        self.assertNotIn("REPAIR_SPAN", target["allowed_actions"])
+
+    def test_7b_can_update_assertions_without_changing_entity_identity(self):
+        raw = "Bệnh nhân không còn biểu hiện lạ."
+        surface = "biểu hiện lạ"
+        start = raw.index(surface)
+        entity = NerEntity(
+            surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.5,
+            "low_emission_confidence",
+        )
+        handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
+        request = handoff["review_regions"][0]
+        llm = _BatchLlm([[
+            json.dumps({
+                "request_id": request["request_id"],
+                "decisions": [{
+                    "candidate_id": 0,
+                    "action": "UPDATE_ASSERTIONS",
+                    "assertions": ["isNegated"],
+                }],
+            }, ensure_ascii=False),
+        ]])
+
+        result, _logs = review_entities_batch(
+            {"doc": raw}, {"doc": [entity]}, {"doc": handoff}, llm,
+            retry_rounds=0,
+        )
+
+        self.assertEqual(surface, result["doc"][0].text)
+        self.assertEqual("TRIỆU_CHỨNG", result["doc"][0].type)
+        self.assertEqual(["isNegated"], result["doc"][0].assertions)
 
 
 if __name__ == "__main__":

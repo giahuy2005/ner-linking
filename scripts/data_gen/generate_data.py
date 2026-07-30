@@ -18,11 +18,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=("baseline", "quota_v2", "mixed_v3", "mixed_v4", "mixed_v5"),
+        choices=(
+            "baseline", "quota_v2", "mixed_v3", "mixed_v4", "mixed_v5", "mixed_v6"
+        ),
         default=DEFAULT_PROFILE,
         help=("baseline keeps the base prompt; quota_v2 uses the old soft focus; "
               "mixed_v3 mixes baseline/V3; mixed_v4 mixes long QA/theory; "
-              "mixed_v5 generates contrastive, sparse, boundary and dirty-text data."),
+              "mixed_v5 generates contrastive, sparse, boundary and dirty-text data; "
+              "mixed_v6 targets common NER failures, difficult assertion scope and the BTC "
+              "medication contract."),
     )
     parser.add_argument(
         "--samples",

@@ -10,16 +10,34 @@ from ..ner.two_pass import SuspiciousRegion
 
 def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) -> dict:
     start, end = entity.position
-    allowed_actions = ["KEEP", "REPAIR_SPAN", "RETYPE"]
-    # DROP requires independent evidence from the notebook's 1.5B stage.  It
-    # must never depend on a vocabulary/whitelist learned from local outputs.
-    small_model_requested_drop = any(
-        hint.get("requested_action") == "DROP"
-        for hint in entity.review_hints
-        if isinstance(hint, dict)
+    hints = [hint for hint in entity.review_hints if isinstance(hint, dict)]
+    requested_actions = {hint.get("requested_action") for hint in hints}
+    allowed_actions = ["KEEP", "UPDATE_ASSERTIONS"]
+
+    # Mutating actions require evidence produced before 7B. This avoids giving
+    # one model unrestricted DROP/RETYPE authority over low-confidence spans.
+    small_model_requested_drop = "DROP" in requested_actions
+    structurally_short = entity.flag == "short_span_review"
+    if small_model_requested_drop or structurally_short:
+        allowed_actions.append("DROP")
+    allowed_retype_types = sorted({
+        hint.get("suggested_type") for hint in hints
+        if hint.get("requested_action") == "RETYPE_SUGGEST"
+        and hint.get("suggested_type") in {"THUỐC", "TRIỆU_CHỨNG", "CHẨN_ĐOÁN",
+                                           "TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}
+        and hint.get("suggested_type") != entity.type
+    })
+    if allowed_retype_types:
+        allowed_actions.append("RETYPE")
+
+    boundary_requested = (
+        "BOUNDARY_REVIEW_SUGGESTED" in requested_actions
+        or entity.flag in {"boundary_signal", "suspect_truncated_diagnosis"}
     )
-    if small_model_requested_drop:
-        allowed_actions.insert(1, "DROP")
+    allowed_repair_types = [entity.type]
+    if boundary_requested:
+        allowed_actions.append("REPAIR_SPAN")
+        allowed_repair_types.extend(allowed_retype_types)
     return {
         "candidate_id": candidate_id,
         "text": entity.text,
@@ -30,6 +48,8 @@ def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) ->
         "score": round(float(entity.score), 6),
         "small_llm_review_hints": list(entity.review_hints),
         "allowed_actions": allowed_actions,
+        "allowed_retype_types": allowed_retype_types,
+        "allowed_repair_types": list(dict.fromkeys(allowed_repair_types)),
     }
 
 

@@ -1,14 +1,23 @@
+import json
 import unittest
+from collections import Counter
 from unittest.mock import patch
 
 from src.data_gen.generate_data import (
+    BTC_MEDICATION_GOLD_OUTPUT,
+    BTC_MEDICATION_GOLD_TEXT,
     SECTION_TYPES,
     V3_VERY_LONG_FOCUS,
     V4_FOCUS_AREAS,
     V5_FOCUS_AREAS,
     V5_DIRTY_RECORD_PERCENT,
     V5_QA_RECORD_PERCENT,
+    V6_ASSERTION_TAXONOMY,
+    V6_ERROR_TAXONOMY,
+    V6_FOCUS_AREAS,
+    build_btc_medication_gold_record,
     build_v5_focus_schedule,
+    build_v6_focus_schedule,
     build_generation_messages,
     choose_soft_focus,
     completion_tokens_for_focus,
@@ -20,6 +29,102 @@ from src.data_gen.generate_data import (
 
 
 class GenerateProfileTests(unittest.TestCase):
+    def test_v6_schedule_matches_failure_curriculum(self):
+        with patch("src.data_gen.generate_data.random.shuffle", side_effect=lambda items: None):
+            schedule = build_v6_focus_schedule(600)
+
+        counts = Counter(focus["key"] for focus in schedule)
+        self.assertEqual(600, len(schedule))
+        self.assertEqual(
+            {focus["key"]: focus["quota_weight"] for focus in V6_FOCUS_AREAS},
+            dict(counts),
+        )
+        self.assertIn("truncated_or_short_span", V6_ERROR_TAXONOMY)
+        self.assertIn("negation_exception_and_false_cue", V6_ASSERTION_TAXONOMY)
+
+    def test_btc_medication_anchor_is_exact_and_offset_safe(self):
+        record = build_btc_medication_gold_record(include_linking=True)
+        self.assertEqual(BTC_MEDICATION_GOLD_TEXT, record["input_text"])
+        self.assertEqual(len(BTC_MEDICATION_GOLD_OUTPUT), len(record["entities"]))
+
+        drugs = []
+        for expected, entity in zip(BTC_MEDICATION_GOLD_OUTPUT, record["entities"]):
+            text, entity_type, candidate, position, assertions = expected
+            self.assertEqual(text, record["input_text"][slice(*entity["position"])])
+            self.assertEqual(entity_type, entity["type"])
+            self.assertEqual(list(position), entity["position"])
+            self.assertEqual(list(assertions), entity["assertions"])
+            if candidate is None:
+                self.assertNotIn("candidates", entity)
+            else:
+                self.assertEqual([candidate], entity["candidates"])
+            if entity_type == "THUỐC":
+                drugs.append(entity)
+
+        self.assertEqual(11, len(drugs))
+        self.assertTrue(all(e["assertions"] == ["isHistorical"] for e in drugs))
+        symptoms = [e for e in record["entities"] if e["type"] == "TRIỆU_CHỨNG"]
+        self.assertTrue(all(e["assertions"] == [] for e in symptoms))
+
+    def test_v6_medication_prompt_and_quality_follow_btc_contract(self):
+        focus = next(f for f in V6_FOCUS_AREAS if f.get("btc_medication_contract"))
+        messages = build_generation_messages(
+            SECTION_TYPES[0], [], [], [], {}, {}, None, focus_cfg=focus
+        )
+        prompt = messages[-1]["content"]
+        escaped_anchor_text = json.dumps(BTC_MEDICATION_GOLD_TEXT, ensure_ascii=False)[1:-1]
+        self.assertIn(escaped_anchor_text, prompt)
+        self.assertIn("candidates chỉ là neo linking", prompt)
+        self.assertIn("không tự kế thừa isHistorical", prompt)
+        self.assertIn("KHÔNG sao chép nguyên văn", prompt)
+
+        record = build_btc_medication_gold_record(include_linking=False)
+        self.assertIsNone(validate_focus_quality(record, focus))
+
+    def test_v6_assertion_quality_rejects_missing_or_multiple_assertions(self):
+        focus = next(
+            f for f in V6_FOCUS_AREAS
+            if f["key"] == "assertion_negation_exception_scope"
+        )
+        valid = {
+            "input_text": "Không đau ngực, nhưng vẫn ho và sốt kèm khó thở.",
+            "entities": [
+                {"text": "đau ngực", "type": "TRIỆU_CHỨNG", "assertions": ["isNegated"]},
+                {"text": "ho", "type": "TRIỆU_CHỨNG", "assertions": []},
+                {"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": []},
+                {"text": "khó thở", "type": "TRIỆU_CHỨNG", "assertions": []},
+            ],
+        }
+        self.assertIsNone(validate_focus_quality(valid, focus))
+
+        missing = {**valid, "entities": [dict(e) for e in valid["entities"]]}
+        missing["entities"][0]["assertions"] = []
+        self.assertIn("thiếu assertion", validate_focus_quality(missing, focus))
+
+        multiple = {**valid, "entities": [dict(e) for e in valid["entities"]]}
+        multiple["entities"][0]["assertions"] = ["isNegated", "isHistorical"]
+        self.assertIn("tối đa một assertion", validate_focus_quality(multiple, focus))
+
+    def test_v6_fragment_focus_requires_long_and_short_valid_entities(self):
+        focus = next(
+            f for f in V6_FOCUS_AREAS if f["key"] == "ner_truncated_and_short_spans"
+        )
+        valid = {
+            "input_text": "Ghi nhận suy hô hấp cấp tiến triển, ho; chỉ định CT.",
+            "entities": [
+                {
+                    "text": "suy hô hấp cấp tiến triển",
+                    "type": "CHẨN_ĐOÁN",
+                    "assertions": [],
+                },
+                {"text": "CT", "type": "TÊN_XÉT_NGHIỆM", "assertions": []},
+                {"text": "ho", "type": "TRIỆU_CHỨNG", "assertions": []},
+            ],
+        }
+        self.assertIsNone(validate_focus_quality(valid, focus))
+        invalid = {**valid, "entities": valid["entities"][:1]}
+        self.assertIn("entity ngắn", validate_focus_quality(invalid, focus))
+
     def test_v5_schedule_matches_600_plan_and_dirty_ratio(self):
         with patch("src.data_gen.generate_data.random.shuffle", side_effect=lambda items: None), \
              patch("src.data_gen.generate_data.random.sample", side_effect=lambda items, k: items[:k]):

@@ -11,7 +11,7 @@ from ..rule.clinical import ALLOWED_ASSERTIONS, ALLOWED_TYPES, deterministic_cle
 from ..schemas import NerEntity
 
 LOGGER = logging.getLogger(__name__)
-_ACTIONS = {"KEEP", "DROP", "REPAIR_SPAN", "RETYPE"}
+_ACTIONS = {"KEEP", "DROP", "REPAIR_SPAN", "RETYPE", "UPDATE_ASSERTIONS"}
 
 
 def _span(value: Any) -> tuple[int, int] | None:
@@ -69,6 +69,16 @@ def _validate_response(request: dict, parsed: Any) -> tuple[dict | None, str | N
             for item in decisions
         ):
             return None, "action_not_allowed_for_target"
+        for item in decisions:
+            target = target_by_id[item["candidate_id"]]
+            if item["action"] == "RETYPE" and item.get("type") not in target.get(
+                "allowed_retype_types", []
+            ):
+                return None, "retype_not_supported_by_small_model"
+            if item["action"] == "REPAIR_SPAN" and item.get(
+                "type", target.get("type")
+            ) not in target.get("allowed_repair_types", []):
+                return None, "repair_type_not_allowed"
     else:
         if not isinstance(parsed.get("new_entities"), list):
             return None, "new_entities_not_list"
@@ -129,6 +139,19 @@ def _apply_review(raw_text: str, entities: list[NerEntity], request: dict,
         action = decision["action"]
         if action == "KEEP":
             logs.append({"status": "decision_applied", "candidate_id": candidate_id, "action": action})
+            continue
+        if action == "UPDATE_ASSERTIONS":
+            assertions = _assertions(decision.get("assertions"), original.assertions)
+            if assertions is None:
+                logs.append({"status": "decision_rejected", "candidate_id": candidate_id,
+                             "reason": "invalid_assertions"})
+                continue
+            result[candidate_id] = NerEntity(
+                original.text, original.type, assertions, original.position,
+                original.score, None, list(original.review_hints),
+            )
+            logs.append({"status": "decision_applied", "candidate_id": candidate_id,
+                         "action": action})
             continue
         if action == "DROP":
             result[candidate_id] = None

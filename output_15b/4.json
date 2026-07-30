@@ -240,7 +240,7 @@
     "text": "viêm dạ dày ruột do virus",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1406, 1431]
   },
   {

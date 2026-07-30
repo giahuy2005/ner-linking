@@ -149,9 +149,21 @@ Log validator mẫu:
 7b_ner {'status': 'fallback', 'request_id': '2-region-0-20-80', 'reason': 'retry_exhausted_keep_pre_7b'}
 ```
 
-Profile sinh V5 bo sung `btc_medication_lists` va
-`complete_occurrence_recall`. Du lieu sinh ra can qua QC va chuyen BIO bang
-`entity_spans`; can train lai checkpoint NER de cac thay doi data co hieu luc.
+Profile mặc định `mixed_v6` sinh dữ liệu theo các nhóm lỗi NER thường gặp,
+assertion có scope khó và contract danh sách thuốc BTC. Trong lúc chạy, script in
+kế hoạch focus, số ca lỗi NER, số ca assertion khó đã sinh và focus bị reject.
+Mỗi reject V6 có thêm `v6_focus`, `v6_error_family`, `v6_assertion_family` để audit.
+Gold thuốc BTC được
+khóa bằng text, boundary, candidate và assertion chính xác; generator vẫn xuất
+schema train NER bằng `text/type/assertions/entity_spans`.
+
+```bash
+python scripts/data_gen/generate_data.py --profile mixed_v6 --samples 600
+```
+
+Output mặc định là `data/synthetic/train_500_6.jsonl`, reject log là
+`data/synthetic/reject_500_6.jsonl`. Dữ liệu cần được chuyển BIO và dùng để train
+lại checkpoint NER thì thay đổi mới có hiệu lực.
 
 ### Chay tren Colab
 

@@ -220,7 +220,7 @@
     "text": "viêm dạ dày ruột do virus",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["A08.4"],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1406, 1431]
   },
   {
@@ -341,17 +341,10 @@
     "position": [1943, 1951]
   },
   {
-    "text": "abdominal",
+    "text": "abdominal pain",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1958, 1967]
-  },
-  {
-    "text": "pain",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": ["R52.9"],
-    "assertions": [],
-    "position": [1968, 1972]
+    "position": [1958, 1972]
   },
   {
     "text": "viêm dạ dày ruột do virus",
@@ -505,7 +498,7 @@
   {
     "text": "loét thực quản 6 mm có điểm sắc tố",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["K22.1", "M01.8"],
+    "candidates": ["K22.1"],
     "assertions": [],
     "position": [3557, 3591]
   },

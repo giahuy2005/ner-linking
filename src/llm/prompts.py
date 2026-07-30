@@ -20,10 +20,7 @@ hành động cho entity đó, KHÔNG tự bịa entity mới không có trong c
 xuất hiện y nguyên trong context (không thêm/bớt dấu câu ngoài phạm vi từ).
 
 CHỈ trả JSON, không giải thích thêm, đúng format:
-{{"text": "...", "type": "...", "action": "keep|drop|retype|retrim"}}
-
-Ví dụ: context "...Không có thiếu máu: HC...", entity nghi ngờ (CHẨN_ĐOÁN) "thiếu"
--> {{"text": "thiếu máu", "type": "CHẨN_ĐOÁN", "action": "retrim"}}"""
+{{"text": "...", "type": "...", "action": "keep|drop|retype|retrim"}}"""
 
 
 def build_ner_fixer_prompt(context: str, entity_text: str, entity_type: str, flag_reason: str) -> tuple[str, str]:
@@ -76,18 +73,20 @@ def build_ner_recall_audit_prompt(raw_text: str, existing_entities: list[dict]) 
 _CANDIDATE_SELECTOR_SYSTEM = """Bạn là trợ lý chọn mã chuẩn hoá y tế (RxNorm cho thuốc, ICD-10 cho \
 chẩn đoán) đúng nhất cho 1 mention trong hồ sơ bệnh án tiếng Việt. Bạn nhận mention gốc và danh sách \
 candidate (đã được hệ thống retrieval xếp hạng sẵn theo độ tương đồng), nhiệm vụ là chọn lại — có thể \
-giữ nguyên top candidate hoặc chọn candidate khác trong danh sách phù hợp hơn. THUỐC luôn đúng 1 code; \
-CHẨN_ĐOÁN chỉ được nhiều code khi mention biểu đạt nhiều chẩn đoán độc lập. CHỈ chọn code trong danh sách, \
+giữ top candidate, chọn candidate khác, hoặc trả [] nếu không candidate nào đúng nghĩa. THUỐC tối đa 1 code; \
+CHẨN_ĐOÁN chỉ được 2 code khi mention biểu đạt rõ nhiều chẩn đoán độc lập. CHỈ chọn code trong danh sách, \
 KHÔNG bịa code mới. Candidate score/rank chỉ là gợi ý, phải ưu tiên nghĩa của mention và context.
 
 RxNorm:
-- Bắt buộc đúng 1 code. So khớp ingredient trước, rồi strength, dose form và release type.
+- Chọn tối đa 1 code. Nếu mention không phải thuốc hoặc không candidate nào đúng ingredient, trả [].
+- So khớp ingredient trước, rồi strength, dose form và release type.
 - Route/frequency là cách dùng, không tự tạo ingredient khác. Mention thiếu strength/form thì ưu tiên
   concept không bịa thêm độ cụ thể; mention có đủ strength/form thì ưu tiên clinical drug phù hợp.
 - Không chọn nhiều code cho thuốc phối hợp; danh sách candidate đã chứa concept phối hợp nếu hợp lệ.
 
 ICD-10:
 - Mặc định chọn 1 code cụ thể nhất được mention/context trực tiếp hỗ trợ.
+- Nếu candidate sai bệnh, sai cơ quan/chương hoặc mention không phải chẩn đoán, trả [].
 - Không đồng thời chọn mã cha và mã con, không thêm sibling/biến chứng chỉ vì liên quan.
 - Chỉ chọn 2-3 code khi chính một entity thật sự biểu đạt nhiều chẩn đoán độc lập.
 
@@ -105,11 +104,11 @@ def build_candidate_selector_prompt(
     """candidates: list[(code, display_label)] theo đúng thứ tự retrieval trả về (top trước)."""
     candidate_lines = "\n".join(f"- code={code} | {label}" for code, label in candidates)
     selection_rule = (
-        "Bắt buộc chọn đúng 1 RxNorm code."
+        "Chọn tối đa 1 RxNorm code; trả [] nếu không có candidate đúng ingredient."
         if entity_type == "THUỐC"
         else (
-            "Ưu tiên chọn 1 ICD-10 code cụ thể nhất; chỉ chọn nhiều code khi mention "
-            "thực sự chứa nhiều chẩn đoán độc lập."
+            "Chọn tối đa 1 ICD-10 code, hoặc tối đa 2 chỉ khi mention phối hợp nhiều chẩn đoán; "
+            "trả [] nếu tất cả candidate sai nghĩa/chương."
         )
     )
     user_prompt = (
@@ -130,17 +129,15 @@ Quy tắc tuyệt đối:
 - Không suy diễn entity không được nhắc trực tiếp. Không sửa candidate ngoài target_candidate_ids.
 - small_llm_review_hints là gợi ý/decision bị Python guard chặn từ Qwen 1.5B. Chỉ dùng làm
   bằng chứng để review target tương ứng; tự xác minh bằng context, không áp dụng mù quáng.
+- Chỉ chọn action có trong allowed_actions của từng target. RETYPE chỉ được dùng với type có
+  trong allowed_retype_types; REPAIR_SPAN chỉ dùng type trong allowed_repair_types.
 - Assertion chỉ gồm isHistorical/isNegated/isFamily và chỉ khi cue cục bộ rõ ràng.
-- Danh sách thuốc trước nhập viện: thuốc có isHistorical; triệu chứng chỉ định sau "điều trị"
-  (ho, đau nhức, sốt đau, táo bón, lo âu, mất ngủ) không kế thừa isHistorical.
-- Sửa boundary thừa/thiếu: "sốt bn"→"sốt", "bn vàng da"→"vàng da",
-  "Thiếu men G6PD ("→"Thiếu men G6PD", "bệnh Kawasaki ở"→"bệnh Kawasaki",
-  "đau thắt ngực ổn địnhkhi"→"đau thắt ngực ổn định".
-- Loại false positive như ◦ 8, đứng dậy, đánh răng không, ăn ngủ, tĩnh mạch L giọt/phút,
-  cấp tính; không coi tên người Tomisaku Kawasaki là thuốc, giải phẫu trần là chẩn đoán,
-  hay G6PD trong mô tả enzyme là tên xét nghiệm.
-- Với token lặp, chọn span nguyên văn không lặp phù hợp. Phân biệt chẩn đoán, triệu chứng,
-  tên xét nghiệm và kết quả xét nghiệm theo đúng context.
+- UPDATE_ASSERTIONS chỉ thay assertion, tuyệt đối không đổi text/type/position.
+- Boundary phải trọn khái niệm trong chính câu hiện tại; không giữ mảnh từ nối, đơn vị, động tác,
+  giải phẫu hoặc phần đuôi bị cắt rời khỏi khái niệm đầy đủ.
+- Phân loại theo vai trò trong context, không theo từ khóa đơn lẻ: tên người, thực phẩm, thiết bị,
+  thao tác và số đo không tự động trở thành entity lâm sàng.
+- Không xóa một triệu chứng/chẩn đoán hợp lệ chỉ vì span ngắn. Nếu bằng chứng không đủ, KEEP.
 Chỉ trả một JSON object, không markdown và không giải thích ngoài JSON."""
 
 
@@ -150,8 +147,9 @@ def build_ner_7b_request_prompt(request: dict) -> tuple[str, str]:
     if task == "REVIEW_REGION":
         instruction = (
             "Trả đúng một decision cho từng candidate_id trong target_candidate_ids. "
-            "Action: KEEP, DROP, REPAIR_SPAN hoặc RETYPE. KEEP giữ nguyên; DROP xóa; "
-            "REPAIR_SPAN trả text/type/global_position; RETYPE chỉ đổi type. Schema: "
+            "Action phải thuộc allowed_actions: KEEP, DROP, REPAIR_SPAN, RETYPE hoặc "
+            "UPDATE_ASSERTIONS. KEEP giữ nguyên; DROP xóa; REPAIR_SPAN trả "
+            "text/type/global_position; RETYPE chỉ đổi type; UPDATE_ASSERTIONS chỉ trả assertions. Schema: "
             '{"request_id":"...","decisions":[{"candidate_id":0,"action":"KEEP"}]}.'
         )
     elif task == "RECOVER_MISSING_ENTITIES":

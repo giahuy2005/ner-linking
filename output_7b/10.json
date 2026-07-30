@@ -58,10 +58,10 @@
     "position": [688, 699]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [700, 707]
+    "position": [700, 706]
   },
   {
     "text": "cảm giác thắt chặt ngực vùng trước tim",
@@ -70,10 +70,10 @@
     "position": [714, 752]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [832, 839]
+    "position": [832, 838]
   },
   {
     "text": "mệt mỏi nhiều khi gắng sức",
@@ -94,16 +94,16 @@
     "position": [1053, 1068]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1121, 1128]
+    "position": [1121, 1127]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1180, 1187]
+    "position": [1180, 1186]
   },
   {
     "text": "cảm giác thắt chặt ngực",
@@ -118,10 +118,10 @@
     "position": [1301, 1319]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1339, 1346]
+    "position": [1339, 1345]
   },
   {
     "text": "đánh trống ngực",
@@ -246,6 +246,12 @@
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [2406, 2421]
+  },
+  {
+    "text": "VS",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2482, 2484]
   },
   {
     "text": "98.3 12987 56 18 99RA",

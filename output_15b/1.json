@@ -21,6 +21,13 @@
     "position": [55, 69]
   },
   {
+    "text": "Glucose-6-Phosphate Dehydrogenase",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [71, 104]
+  },
+  {
     "text": "thiếu hụt men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
@@ -51,7 +58,7 @@
     "text": "thiếu men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1371, 1385]
   },
   {
@@ -74,10 +81,10 @@
     "position": [1669, 1682]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1684, 1691]
+    "position": [1684, 1690]
   },
   {
     "text": "Vàng da",
@@ -144,8 +151,7 @@
   },
   {
     "text": "bại não",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": [],
+    "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [1995, 2002]
   },
@@ -168,6 +174,12 @@
     "candidates": [],
     "assertions": [],
     "position": [2276, 2290]
+  },
+  {
+    "text": "G6PD",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2316, 2320]
   },
   {
     "text": "thiếu máu tan huyết",
@@ -213,14 +225,21 @@
     "text": "thiếu máu tan huyết",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [2696, 2715]
   },
   {
-    "text": "vàng da sơ sinh",
+    "text": "vàng da",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [2728, 2743]
+    "position": [2728, 2735]
+  },
+  {
+    "text": "sơ sinh",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
+    "assertions": [],
+    "position": [2736, 2743]
   },
   {
     "text": "thiếu men G6PD",
@@ -233,7 +252,7 @@
     "text": "thiếu men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3079, 3093]
   },
   {

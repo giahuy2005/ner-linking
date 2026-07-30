@@ -40,14 +40,10 @@ class TwoPassResult:
     logs: list[dict] = field(default_factory=list)
 
 
-_BOUNDARY_SIGNAL_RE = re.compile(
-    r"(?i)\b(?:bn\s+(?:vàng|sốt|đau)|thiếu\s+men\s+g6pd\s*\(|"
-    r"bệnh\s+kawasaki(?:\s+ở|\s*\n)|\w+\s*địnhkhi|chụp\s+chụp|"
-    r"nhiễm\s+trùng\s+nhiễm\s+trùng)"
-)
-_MEDICAL_HINT_RE = re.compile(
-    r"(?i)\b(?:đau|sốt|ho|vàng|viêm|nhiễm|bệnh|thuốc|mg|ml|"
-    r"xét\s+nghiệm|ct|mri|huyết|cầu|rối\s+loạn)\b"
+_REPEATED_TOKEN_RE = re.compile(r"(?iu)\b([\wÀ-ỹ]{2,})\s+\1\b")
+_STRUCTURED_LINE_RE = re.compile(
+    r"(?iu)(?:^\s*[-•*]\s+|:\s*\S+|\b\d+(?:[.,]\d+)?\s*"
+    r"(?:mg|mcg|g|ml|mmhg|bpm|l/ph|%|°c)\b)"
 )
 
 
@@ -83,8 +79,18 @@ def detect_suspicious_regions(
         if reasons:
             hits.append((*entity.position, "+".join(reasons), 2.0 + (1.0 - entity.score)))
 
-    for match in _BOUNDARY_SIGNAL_RE.finditer(raw_text):
-        hits.append((match.start(), match.end(), "text_boundary_pattern", 3.0))
+    for match in _REPEATED_TOKEN_RE.finditer(raw_text):
+        hits.append((match.start(), match.end(), "repeated_token_boundary", 3.0))
+
+    # Adjacent predictions are often one split concept. Routing the context is
+    # safe because this detector does not merge or retype anything itself.
+    ordered_entities = sorted(entities, key=lambda item: item.position)
+    for left_entity, right_entity in zip(ordered_entities, ordered_entities[1:]):
+        gap_start, gap_end = left_entity.position[1], right_entity.position[0]
+        if gap_start <= gap_end and gap_end - gap_start <= 2 \
+                and raw_text[gap_start:gap_end].strip(" \t") == "":
+            hits.append((left_entity.position[0], right_entity.position[1],
+                         "adjacent_entity_boundary", 2.6))
 
     # If a trusted surface occurs more times than it was decoded, route each
     # uncovered occurrence for recovery instead of silently propagating it.
@@ -98,13 +104,14 @@ def detect_suspicious_regions(
                        for item in known):
                 hits.append((match.start(), match.end(), "repeated_surface_missing_occurrence", 2.8))
 
-    # A medically dense line with no entity is an omission candidate.
+    # A structured line with no entity is an omission candidate. No clinical
+    # vocabulary is used; all input documents are already in the medical task.
     cursor = 0
     occupied = [entity.position for entity in entities]
     for line in raw_text.splitlines(keepends=True):
         line_end = cursor + len(line)
         has_entity = any(cursor < end and line_end > start for start, end in occupied)
-        if not has_entity and len(_MEDICAL_HINT_RE.findall(line)) >= 2:
+        if not has_entity and _STRUCTURED_LINE_RE.search(line):
             hits.append((cursor, line_end, "suspicious_empty_region", 2.5))
         cursor = line_end
 
@@ -113,7 +120,7 @@ def detect_suspicious_regions(
     boundaries = sorted({0, len(raw_text), *(point for span in occupied for point in span)})
     for left, right in zip(boundaries, boundaries[1:]):
         gap = raw_text[left:right]
-        if right - left >= 220 and len(gap.split()) >= 22 and _MEDICAL_HINT_RE.search(gap):
+        if right - left >= 220 and len(gap.split()) >= 22:
             hits.append((left, right, "long_medical_gap", 2.2))
 
     windows = []

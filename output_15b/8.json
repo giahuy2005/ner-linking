@@ -114,6 +114,12 @@
     "position": [660, 668]
   },
   {
+    "text": "AH",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [670, 672]
+  },
+  {
     "text": "ảo giác thính giác",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
@@ -220,7 +226,7 @@
   {
     "text": "tự tử",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1626, 1631]
   },
   {
@@ -277,7 +283,7 @@
     "text": "bệnh lý chất trắng",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [2136, 2154]
   },
   {
@@ -409,7 +415,8 @@
   },
   {
     "text": "Tăng men gan",
-    "type": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
     "assertions": [],
     "position": [2801, 2813]
   },
@@ -434,16 +441,46 @@
     "position": [2921, 2950]
   },
   {
+    "text": "Môi",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2955, 2958]
+  },
+  {
     "text": "miệng",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [2961, 2966]
   },
   {
+    "text": "nứt",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2977, 2980]
+  },
+  {
+    "text": "đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [2982, 2984]
+  },
+  {
     "text": "lưỡi dâu tây",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [2986, 2998]
+  },
+  {
+    "text": "phù",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3024, 3027]
+  },
+  {
+    "text": "đỏ",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": [],
+    "position": [3029, 3031]
   },
   {
     "text": "bong da",

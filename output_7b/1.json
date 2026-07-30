@@ -21,6 +21,13 @@
     "position": [55, 69]
   },
   {
+    "text": "Glucose-6-Phosphate Dehydrogenase",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["E74.1"],
+    "assertions": [],
+    "position": [71, 104]
+  },
+  {
     "text": "thiếu hụt men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["D55.0"],
@@ -51,7 +58,7 @@
     "text": "thiếu men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["D55.0"],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1371, 1385]
   },
   {
@@ -74,10 +81,10 @@
     "position": [1669, 1682]
   },
   {
-    "text": "khó thở",
+    "text": "khó th",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [1684, 1691]
+    "position": [1684, 1690]
   },
   {
     "text": "Vàng da",
@@ -100,7 +107,7 @@
   {
     "text": "thiếu máu do tan huyết",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["D59.4"],
+    "candidates": ["D59.9"],
     "assertions": [],
     "position": [1758, 1780]
   },
@@ -113,7 +120,7 @@
   {
     "text": "thiếu máu",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["D56.1"],
+    "candidates": ["D64.9"],
     "assertions": [],
     "position": [1821, 1830]
   },
@@ -137,13 +144,6 @@
     "position": [1904, 1911]
   },
   {
-    "text": "bại não",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": ["G80"],
-    "assertions": [],
-    "position": [1995, 2002]
-  },
-  {
     "text": "chậm phát triển trí tuệ",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
@@ -152,7 +152,7 @@
   {
     "text": "thiếu máu",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["D56.1"],
+    "candidates": ["D64.9"],
     "assertions": [],
     "position": [2150, 2159]
   },
@@ -164,16 +164,22 @@
     "position": [2276, 2290]
   },
   {
+    "text": "G6PD",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["D55.0"],
+    "assertions": [],
+    "position": [2316, 2320]
+  },
+  {
     "text": "thiếu máu tan huyết",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["D59.4"],
+    "candidates": ["D59.9"],
     "assertions": [],
     "position": [2464, 2483]
   },
   {
     "text": "vàng da nặng",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": ["L55"],
+    "type": "TRIỆU_CHỨNG",
     "assertions": [],
     "position": [2501, 2513]
   },
@@ -206,15 +212,22 @@
   {
     "text": "thiếu máu tan huyết",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["D59.4"],
-    "assertions": [],
+    "candidates": ["D59.9"],
+    "assertions": ["isNegated"],
     "position": [2696, 2715]
   },
   {
-    "text": "vàng da sơ sinh",
+    "text": "vàng da",
     "type": "TRIỆU_CHỨNG",
     "assertions": [],
-    "position": [2728, 2743]
+    "position": [2728, 2735]
+  },
+  {
+    "text": "sơ sinh",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": ["P91.5"],
+    "assertions": [],
+    "position": [2736, 2743]
   },
   {
     "text": "thiếu men G6PD",
@@ -227,7 +240,7 @@
     "text": "thiếu men G6PD",
     "type": "CHẨN_ĐOÁN",
     "candidates": ["D55.0"],
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3079, 3093]
   },
   {
@@ -261,16 +274,9 @@
   {
     "text": "nhiễm khuẩn tiết niệu",
     "type": "CHẨN_ĐOÁN",
-    "candidates": ["A41.9"],
+    "candidates": ["N39.0"],
     "assertions": [],
     "position": [3613, 3634]
-  },
-  {
-    "text": "huyết",
-    "type": "CHẨN_ĐOÁN",
-    "candidates": ["N92.1"],
-    "assertions": [],
-    "position": [3823, 3828]
   },
   {
     "text": "thiếu men G6PD",

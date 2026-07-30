@@ -91,7 +91,7 @@ N_SAMPLES = 5
 MAX_RETRY_PER_SAMPLE = 3
 V4_MAX_RETRY_PER_SAMPLE = 2
 SLEEP_BETWEEN_CALLS = 1
-DEFAULT_PROFILE = "mixed_v5"  # bấm Run: augmentation chống overfit, ưu tiên NER boundary
+DEFAULT_PROFILE = "mixed_v6"  # V6: failure-driven NER + assertion khó + contract BTC
 V4_MAX_COMPLETION_TOKENS = 3200  # JSON của record 1.3k-4.5k ký tự cần dư chỗ cho entities
 
 V4_COMMON_DRUGS_BY_SPECIALTY = {
@@ -109,6 +109,68 @@ V4_COMMON_DRUGS_BY_SPECIALTY = {
     "Endocrinology": ["metformin 500 mg", "insulin glargine", "levothyroxine 50 mcg", "propylthiouracil 50 mg"],
     "General Medicine": ["paracetamol 500 mg", "amlodipine 5 mg", "metformin 500 mg", "omeprazole 20 mg"],
 }
+
+# Contract BTC bất biến. Generator NER chỉ ghi text/type/assertions/entity_spans;
+# candidates được dùng làm neo linking và test contract, không chèn vào schema train.
+BTC_MEDICATION_GOLD_TEXT = (
+    "Danh sách thuốc trước nhập viện chính xác và đầy đủ. \r\n"
+    "1. amlodipine 10 mg po daily \r\n2. aspirin 81 mg po daily \r\n"
+    "3. metoprolol succinate xl 50 mg po daily \r\n"
+    "4. guaifenesin ml po q6h:prn điều trị ho \r\n"
+    "5. nystatin oral suspension 5 ml po qid:prn điều trị đau nhức \r\n"
+    "6. acetaminophen 325-650 mg po q6h:prn điều trị sốt đau \r\n"
+    "7. pravastatin 40 mg po daily \r\n"
+    "8. docusate sodium 100 mg po bid điều trị táo bón \r\n"
+    "9. senna 8.6 mg po bid:prn điều trị táo bón \r\n"
+    "10. clonazepam 0.5 mg po qam:prn điều trị lo âu \r\n"
+    "11. clonazepam 1.5 mg po qhs điều trị lo âu mất ngủ"
+)
+BTC_MEDICATION_GOLD_OUTPUT = (
+    ("amlodipine 10 mg po daily", "THUỐC", "308135", (58, 83), ("isHistorical",)),
+    ("aspirin 81 mg po daily", "THUỐC", "243670", (89, 111), ("isHistorical",)),
+    ("metoprolol succinate xl 50 mg po daily", "THUỐC", "866436", (117, 155), ("isHistorical",)),
+    ("guaifenesin ml po q6h:prn", "THUỐC", "392085", (161, 186), ("isHistorical",)),
+    ("ho", "TRIỆU_CHỨNG", None, (196, 198), ()),
+    ("nystatin oral suspension 5 ml po qid:prn", "THUỐC", "7597", (204, 244), ("isHistorical",)),
+    ("đau nhức", "TRIỆU_CHỨNG", None, (254, 262), ()),
+    ("acetaminophen 325-650 mg po q6h:prn", "THUỐC", "313782", (268, 303), ("isHistorical",)),
+    ("sốt đau", "TRIỆU_CHỨNG", None, (313, 320), ()),
+    ("pravastatin 40 mg po daily", "THUỐC", "904475", (326, 352), ("isHistorical",)),
+    ("docusate sodium 100 mg po bid", "THUỐC", "1099279", (358, 387), ("isHistorical",)),
+    ("táo bón", "TRIỆU_CHỨNG", None, (397, 404), ()),
+    ("senna 8.6 mg po bid:prn", "THUỐC", "312935", (410, 433), ("isHistorical",)),
+    ("táo bón", "TRIỆU_CHỨNG", None, (443, 450), ()),
+    ("clonazepam 0.5 mg po qam:prn", "THUỐC", "197527", (457, 485), ("isHistorical",)),
+    ("lo âu", "TRIỆU_CHỨNG", None, (495, 500), ()),
+    ("clonazepam 1.5 mg po qhs", "THUỐC", "197528", (507, 531), ("isHistorical",)),
+    ("lo âu", "TRIỆU_CHỨNG", None, (541, 546), ()),
+    ("mất ngủ", "TRIỆU_CHỨNG", None, (547, 554), ()),
+)
+
+
+def build_btc_medication_gold_record(include_linking=True):
+    """Materialize the exact BTC anchor and fail fast if any offset drifts."""
+    entities = []
+    for text, entity_type, candidate, position, assertions in BTC_MEDICATION_GOLD_OUTPUT:
+        start, end = position
+        if BTC_MEDICATION_GOLD_TEXT[start:end] != text:
+            raise ValueError(f"BTC medication contract offset sai cho {text!r}: {position}")
+        entity = {
+            "text": text,
+            "type": entity_type,
+            "assertions": list(assertions),
+            "position": [start, end],
+        }
+        if include_linking and candidate is not None:
+            entity["candidates"] = [candidate]
+        entities.append(entity)
+    if len([entity for entity in entities if entity["type"] == "THUỐC"]) != 11:
+        raise ValueError("BTC medication contract phải có đúng 11 thuốc")
+    return {"input_text": BTC_MEDICATION_GOLD_TEXT, "entities": entities}
+
+
+# Validate at import time so prompt/test changes cannot silently corrupt gold.
+build_btc_medication_gold_record()
 
 
 def _percentile(values, percentile):
@@ -953,6 +1015,169 @@ NHÓM V5 — BAO PHỦ ĐỦ MỌI OCCURRENCE:
     },
 ]
 
+# V6 is failure-driven rather than surface-driven. ``error_family`` and
+# ``assertion_family`` are printed during generation so the batch can be
+# audited without inspecting every JSONL row.
+V6_FOCUS_AREAS = [
+    {
+        "key": "ner_truncated_and_short_spans",
+        "mode": "v6",
+        "format": "ner_fragment",
+        "quota_weight": 90,
+        "min_entities": 3,
+        "error_family": "truncated_or_short_span",
+        "instruction": """
+NHÓM V6 — SPAN CỤT VÀ ENTITY NGẮN TƯƠNG PHẢN:
+- Tạo khái niệm y tế nhiều từ có nguy cơ bị BIO cắt đầu/cuối, nhưng gold luôn lấy trọn cụm có nghĩa.
+- Xen 1-2 entity ngắn hợp lệ và các token ngắn ngoài ontology làm O; không dùng độ dài để quyết định nhãn.
+- Không annotate mảnh giải phẫu, từ nối, đơn vị, động tác hoặc một phần của khái niệm đầy đủ.
+- Có ít nhất một span dài >=20 ký tự và một entity ngắn <=4 ký tự nhưng hợp lệ theo context.
+""",
+    },
+    {
+        "key": "ner_adjacent_split_merge",
+        "mode": "v6",
+        "format": "ner_boundary_pair",
+        "quota_weight": 80,
+        "min_entities": 4,
+        "error_family": "split_merge_boundary",
+        "instruction": """
+NHÓM V6 — SPLIT/MERGE Ở ENTITY ĐỨNG SÁT NHAU:
+- Tạo cả hai tình huống: một khái niệm nhiều từ phải là một entity duy nhất, và hai khái niệm độc lập
+  đứng sát nhau nhưng phải là hai entity riêng.
+- Dùng dấu phẩy, dấu chấm dính chữ, liên từ hoặc xuống dòng để tạo boundary khó; entity phải luôn là
+  substring liên tục, không nuốt dấu phân cách hay context O.
+- Ít nhất một cặp entity có khoảng cách 0-2 ký tự và ít nhất một span dài dễ bị tách nhầm.
+""",
+    },
+    {
+        "key": "ner_hard_negative_ontology",
+        "mode": "v6",
+        "format": "ner_hard_negative",
+        "quota_weight": 75,
+        "min_entities": 2,
+        "error_family": "hard_negative_outside_ontology",
+        "instruction": """
+NHÓM V6 — HARD NEGATIVE NGOÀI NĂM TYPE:
+- Đưa vào văn bản các tên người, thiết bị, thực phẩm, thao tác, số đo, giải phẫu và từ chung;
+  tất cả giữ O nếu không nằm trong một khái niệm thuộc năm type.
+- Trong cùng record phải có 2-4 entity thật làm đối chứng để model không học rằng cả câu là O.
+- Không biến nhãn hiệu/thực phẩm thành THUỐC, thiết bị/thủ thuật thành CHẨN_ĐOÁN, hay số đo riêng lẻ
+  thành TRIỆU_CHỨNG. Không liệt kê lại ví dụ từ test; tự tạo ngữ cảnh mới.
+""",
+    },
+    {
+        "key": "ner_contextual_retyping",
+        "mode": "v6",
+        "format": "ner_retype",
+        "quota_weight": 70,
+        "min_entities": 4,
+        "error_family": "contextual_type_confusion",
+        "instruction": """
+NHÓM V6 — PHÂN TYPE THEO VAI TRÒ CONTEXT:
+- Tạo các cặp tương phản giữa triệu chứng/chẩn đoán, tên xét nghiệm/kết quả, và thuốc/chất ngoài ontology.
+- Type phải dựa vào vai trò trong câu, không dựa vào một token đơn lẻ. Tên kỹ thuật là TÊN_XÉT_NGHIỆM;
+  giá trị/finding là KẾT_QUẢ_XÉT_NGHIỆM; dấu hiệu chủ quan là TRIỆU_CHỨNG; bệnh xác lập là CHẨN_ĐOÁN.
+- Lab/finding luôn assertions=[]. Không dùng RETYPE để che boundary cụt.
+""",
+    },
+    {
+        "key": "assertion_negation_exception_scope",
+        "mode": "v6",
+        "format": "assertion_negation",
+        "quota_weight": 80,
+        "min_entities": 4,
+        "assertion_family": "negation_exception_and_false_cue",
+        "required_assertions": ["isNegated"],
+        "min_assertion_states": 2,
+        "instruction": """
+NHÓM V6 — PHỦ ĐỊNH, NGOẠI TRỪ VÀ CUE GIẢ:
+- Có phủ định thật, entity hiện tại dương tính và cấu trúc ngoại trừ/nhưng/vẫn còn trong cùng đoạn.
+- Cue phủ định chỉ tác động entity trong scope. Entity sau ngoại trừ hoặc mệnh đề đảo chiều có assertions=[].
+- Câu kiểu không nhớ thời điểm, không cải thiện, không dùng thuốc đều hoặc không đáp ứng điều trị
+  không tự phủ định bệnh/triệu chứng đang tồn tại.
+- Mỗi entity tối đa một assertion theo contract BTC; lab/finding luôn [].
+""",
+    },
+    {
+        "key": "assertion_history_current_scope",
+        "mode": "v6",
+        "format": "assertion_history",
+        "quota_weight": 65,
+        "min_entities": 4,
+        "assertion_family": "historical_vs_current_episode",
+        "required_assertions": ["isHistorical"],
+        "min_assertion_states": 2,
+        "instruction": """
+NHÓM V6 — TIỀN SỬ SO VỚI ĐỢT HIỆN TẠI:
+- Cùng một record có bệnh/triệu chứng cũ đã kết thúc (isHistorical) và biểu hiện/đánh giá hiện tại ([]).
+- Các từ đã khám, đã nhập viện, gần đây hoặc trước khi đến viện trong chính đợt đang kể không đủ để
+  gán isHistorical. Chỉ cue tiền sử/trước đây/đã từng/đợt cũ kết thúc mới là lịch sử.
+- Thuốc dùng trước nhập viện là isHistorical; thuốc đang bắt đầu/đang dùng hiện tại là [].
+""",
+    },
+    {
+        "key": "assertion_family_patient_scope",
+        "mode": "v6",
+        "format": "assertion_family",
+        "quota_weight": 45,
+        "min_entities": 3,
+        "assertion_family": "family_vs_patient",
+        "required_assertions": ["isFamily"],
+        "min_assertion_states": 2,
+        "instruction": """
+NHÓM V6 — NGƯỜI THÂN SO VỚI NGƯỜI BỆNH:
+- Đặt bệnh của người thân (isFamily) cạnh bệnh/triệu chứng của chính người bệnh ([] hoặc assertion cục bộ khác).
+- Cue cha/mẹ/anh/chị/gia đình không được lan qua dấu câu hoặc sang mệnh đề nói về người bệnh.
+- Không đưa chủ thể người thân vào span entity và không gán isFamily cho thuốc, lab hoặc finding.
+""",
+    },
+    {
+        "key": "btc_medication_contract_v6",
+        "mode": "v6",
+        "format": "btc_medication_contract",
+        "quota_weight": 60,
+        "min_entities": 8,
+        "min_drugs": 5,
+        "error_family": "drug_regimen_boundary",
+        "assertion_family": "medication_history_without_indication_leak",
+        "required_assertions": ["isHistorical"],
+        "min_assertion_states": 2,
+        "btc_medication_contract": True,
+        "instruction": """
+NHÓM V6 — CONTRACT DANH SÁCH THUỐC BTC:
+- Sinh một danh sách MỚI theo đúng contract anchor: mỗi THUỐC lấy trọn regimen liên tục và có isHistorical.
+- Không lấy số thứ tự; không tách strength/route/frequency; không gộp hai item; không bỏ item cuối.
+- Nội dung sau `điều trị` là entity riêng theo đúng type và assertions=[], tuyệt đối không kế thừa
+  isHistorical từ thuốc. Một chỉ định có hai mention liền nhau phải annotate đủ từng mention theo gold.
+- Chỉ dùng thuốc thật từ drug hint; không sao chép nguyên danh sách anchor vào record sinh mới.
+""",
+    },
+    {
+        "key": "assertion_repeated_occurrence_scope",
+        "mode": "v6",
+        "format": "assertion_repeated",
+        "quota_weight": 35,
+        "min_entities": 5,
+        "assertion_family": "same_surface_different_scope",
+        "min_assertion_states": 3,
+        "require_complete_occurrences": True,
+        "instruction": """
+NHÓM V6 — CÙNG SURFACE, KHÁC ASSERTION:
+- Nhắc lại cùng một entity ở ít nhất ba scope khác nhau trong record: hiện tại, phủ định, tiền sử hoặc gia đình.
+- Annotate đủ mọi occurrence theo thứ tự; mỗi occurrence nhận assertion cục bộ của chính nó.
+- Không gộp occurrence, không truyền cue và không tạo nhiều assertion trên cùng một entity.
+""",
+    },
+]
+
+V6_ERROR_TAXONOMY = tuple(
+    sorted({focus["error_family"] for focus in V6_FOCUS_AREAS if focus.get("error_family")})
+)
+V6_ASSERTION_TAXONOMY = tuple(
+    sorted({focus["assertion_family"] for focus in V6_FOCUS_AREAS if focus.get("assertion_family")})
+)
+
 V5_DIRTY_RECORD_PERCENT = 17.5
 # Một phần V5 mô phỏng cấu trúc hỏi bệnh - trả lời dài nhưng hoàn toàn tự sinh. Đây là
 # augmentation theo *kiểu văn bản*, không sao chép ViHealthQA hay input public/private.
@@ -1632,6 +1857,54 @@ Trả về DUY NHẤT JSON:
     ]
 
 
+def build_v6_generation_messages(
+    section_cfg,
+    drug_pool,
+    icd10_by_chapter,
+    specialty_pool,
+    focus_cfg,
+):
+    """Build failure-driven V6 prompts while preserving the V5 BTC schema."""
+    v5_compatible_focus = {**focus_cfg, "mode": "v5"}
+    messages = build_v5_generation_messages(
+        section_cfg,
+        drug_pool,
+        icd10_by_chapter,
+        specialty_pool,
+        v5_compatible_focus,
+    )
+    prompt = messages[-1]["content"].replace(" V5 ", " V6 ").replace("V5 —", "V6 —")
+    prompt = prompt.replace(
+        "Không tạo span cụt kiểu `độ`, `từ`, `nhịp`, `Thiếu`, `chảy`, `bên`, `đau ấn vùng` hay\n"
+        "   `phù hợp với`; phải lấy trọn khái niệm có nghĩa.",
+        "Không tạo span cụt hoặc từ chức năng đứng riêng; phải lấy trọn khái niệm có nghĩa."
+    )
+    v6_contract = """
+
+CONTRACT V6 BẮT BUỘC:
+- Dữ liệu phải huấn luyện model tránh đúng error_family/assertion_family của NHÓM CHÍNH; không cố tình
+  xuất gold sai để mô phỏng prediction sai. Lỗi NER chỉ xuất hiện như bẫy trong raw context, gold luôn đúng.
+- Mỗi entity tối đa một assertion theo contract BTC. TÊN_XÉT_NGHIỆM và KẾT_QUẢ_XÉT_NGHIỆM luôn [].
+- Không dùng danh sách surface của test làm rule. Tạo từ ngữ mới nhưng giữ cấu trúc lỗi tổng quát.
+"""
+    if focus_cfg.get("btc_medication_contract"):
+        anchor = build_btc_medication_gold_record(include_linking=True)
+        anchor_json = json.dumps(anchor, ensure_ascii=False, separators=(",", ":"))
+        v6_contract += f"""
+
+ANCHOR BTC BẤT BIẾN — chỉ học contract, KHÔNG sao chép nguyên văn vào record mới:
+{anchor_json}
+Trong anchor, candidates chỉ là neo linking. JSON train V6 vẫn chỉ xuất text/type/assertions;
+position/entity_spans do validator materialize từ substring nguyên văn.
+"""
+    messages[-1]["content"] = prompt + v6_contract
+    messages[0]["content"] = (
+        "Bạn sinh gold NER y tế tiếng Việt V6 theo failure mode tổng quát và contract BTC. "
+        "Gold phải đúng hoàn toàn; không học thuộc surface của test."
+    )
+    return messages
+
+
 def build_generation_messages(
     section_cfg,
     seed_examples,
@@ -1648,6 +1921,10 @@ def build_generation_messages(
         )
     if focus_cfg and focus_cfg.get("mode") == "v5":
         return build_v5_generation_messages(
+            section_cfg, drug_pool, icd10_by_chapter, specialty_pool, focus_cfg
+        )
+    if focus_cfg and focus_cfg.get("mode") == "v6":
+        return build_v6_generation_messages(
             section_cfg, drug_pool, icd10_by_chapter, specialty_pool, focus_cfg
         )
 
@@ -2379,6 +2656,18 @@ def build_v5_focus_schedule(n_samples):
     return schedule
 
 
+def build_v6_focus_schedule(n_samples):
+    """Scale the 600-weight failure curriculum to any requested batch size."""
+    if n_samples <= 0:
+        return []
+    counts = _scaled_focus_counts(V6_FOCUS_AREAS, n_samples)
+    schedule = []
+    for focus, count in zip(V6_FOCUS_AREAS, counts):
+        schedule.extend(dict(focus) for _ in range(count))
+    random.shuffle(schedule)
+    return schedule
+
+
 def choose_soft_focus(profile, section_cfg):
     """Chọn một gợi ý bù lỗi mềm; không biến nó thành quota hay điều kiện reject."""
     if profile == "baseline":
@@ -2438,6 +2727,12 @@ def choose_soft_focus(profile, section_cfg):
         ):
             selected["qa_style"] = True
         return selected
+    elif profile == "mixed_v6":
+        return dict(random.choices(
+            V6_FOCUS_AREAS,
+            weights=[item["quota_weight"] for item in V6_FOCUS_AREAS],
+            k=1,
+        )[0])
     else:
         raise ValueError(f"Profile không hợp lệ: {profile}")
 
@@ -2464,6 +2759,8 @@ def completion_tokens_for_focus(focus_cfg):
         return V4_MAX_COMPLETION_TOKENS
     if focus_cfg.get("mode") == "v5":
         return 2200 if focus_cfg.get("qa_style") else 1400
+    if focus_cfg.get("mode") == "v6":
+        return 2400 if focus_cfg.get("btc_medication_contract") else 1600
     return 1400
 
 
@@ -2517,9 +2814,9 @@ def validate_focus_quality(record, focus_cfg):
         if not noise_re.search(input_text):
             # V4 dùng boundary noise như augmentation mềm. Không có noise vẫn là gold hợp lệ,
             # không đáng gọi API lại. V5 có nhóm dirty riêng nên mới giữ yêu cầu bắt buộc.
-            if focus_cfg.get("mode") == "v5":
+            if focus_cfg.get("mode") in {"v5", "v6"}:
                 return "focus boundary-noise cần ít nhất một chỗ thiếu khoảng trắng sau dấu câu"
-    if focus_cfg.get("mode") == "v5":
+    if focus_cfg.get("mode") in {"v5", "v6"}:
         entities = record.get("entities", [])
         entity_types = {entity["type"] for entity in entities}
         assertion_states = {
@@ -2544,6 +2841,30 @@ def validate_focus_quality(record, focus_cfg):
         if focus_cfg.get("key") == "dense_ner_boundaries":
             if len(entities) < 3 or not any(len(entity["text"]) >= 24 for entity in entities):
                 return "dense_ner_boundaries cần >=3 entity và ít nhất một span dài"
+        if focus_cfg.get("mode") == "v6":
+            if any(len(entity.get("assertions") or []) > 1 for entity in entities):
+                return "V6/BTC cho phép tối đa một assertion trên mỗi entity"
+            required_assertions = set(focus_cfg.get("required_assertions", []))
+            observed_assertions = {
+                assertion
+                for entity in entities
+                for assertion in entity.get("assertions", [])
+            }
+            missing_assertions = sorted(required_assertions - observed_assertions)
+            if missing_assertions:
+                return f"V6 thiếu assertion bắt buộc: {missing_assertions}"
+            min_assertion_states = focus_cfg.get("min_assertion_states")
+            if min_assertion_states and len(assertion_states) < min_assertion_states:
+                return (
+                    f"V6 cần ít nhất {min_assertion_states} trạng thái assertion, "
+                    f"thực tế {len(assertion_states)}"
+                )
+            if focus_cfg.get("key") == "ner_truncated_and_short_spans":
+                has_long = any(len(entity["text"]) >= 20 for entity in entities)
+                has_short = any(len(re.sub(r"\s+", "", entity["text"])) <= 4
+                                for entity in entities)
+                if not (has_long and has_short):
+                    return "V6 fragment focus cần một span dài và một entity ngắn hợp lệ"
         min_drugs = focus_cfg.get("min_drugs")
         if min_drugs:
             drugs = [entity for entity in entities if entity["type"] == "THUỐC"]
@@ -2557,6 +2878,16 @@ def validate_focus_quality(record, focus_cfg):
                 for entity in entities
             ):
                 return "triệu chứng chỉ định sau thuốc không được kế thừa isHistorical"
+            if focus_cfg.get("btc_medication_contract"):
+                indication_entities = [
+                    entity for entity in entities
+                    if entity["type"] in {"TRIỆU_CHỨNG", "CHẨN_ĐOÁN"}
+                    and not entity.get("assertions")
+                ]
+                if not indication_entities or "điều trị" not in input_text.casefold():
+                    return (
+                        "V6 medication contract cần chỉ định sau 'điều trị' với assertions=[]"
+                    )
         incomplete = [
             entity["text"] for entity in entities
             if INCOMPLETE_ENTITY_END_RE.search(entity["text"])
@@ -2574,14 +2905,15 @@ def validate_focus_quality(record, focus_cfg):
             if any(entity_pairs[pair] == 0 for pair in expected):
                 return f"v5 thiếu cặp lab đầy đủ: {match.group(0)!r}"
 
-        # Cấm đúng các fragment đo lường từng xuất hiện trong output thật.
-        measurement_fragments = {"độ", "từ", "nhịp", "thiếu"}
-        bad_measurement_fragments = [
-            entity["text"] for entity in entities
-            if entity["text"].strip().lower() in measurement_fragments
-        ]
-        if bad_measurement_fragments:
-            return f"v5 còn fragment đo lường: {bad_measurement_fragments[:3]}"
+        if focus_cfg.get("mode") == "v5":
+            # Legacy V5 compatibility; V6 uses structural failure families.
+            measurement_fragments = {"độ", "từ", "nhịp", "thiếu"}
+            bad_measurement_fragments = [
+                entity["text"] for entity in entities
+                if entity["text"].strip().lower() in measurement_fragments
+            ]
+            if bad_measurement_fragments:
+                return f"v5 còn fragment đo lường: {bad_measurement_fragments[:3]}"
         if focus_cfg.get("require_complete_occurrences"):
             has_repeated_text = False
             for entity in entities:
@@ -2645,7 +2977,9 @@ def run_generation(
     reject_output=None,
 ):
     """Sinh dữ liệu bằng API; phần argparse/CLI nằm ở ``scripts/data_gen``."""
-    if profile not in {"baseline", "quota_v2", "mixed_v3", "mixed_v4", "mixed_v5"}:
+    if profile not in {
+        "baseline", "quota_v2", "mixed_v3", "mixed_v4", "mixed_v5", "mixed_v6"
+    }:
         raise ValueError(f"Profile không hợp lệ: {profile}")
     if n_samples <= 0:
         raise ValueError("Số mẫu phải lớn hơn 0.")
@@ -2656,6 +2990,7 @@ def run_generation(
         "mixed_v3": BASE_DIR / "data" / "synthetic" / "train_500_3.jsonl",
         "mixed_v4": BASE_DIR / "data" / "synthetic" / "train_500_4.jsonl",
         "mixed_v5": BASE_DIR / "data" / "synthetic" / "train_500_5.jsonl",
+        "mixed_v6": BASE_DIR / "data" / "synthetic" / "train_500_6.jsonl",
     }
     default_output = default_outputs[profile]
     default_rejects = {
@@ -2664,6 +2999,7 @@ def run_generation(
         "mixed_v3": BASE_DIR / "data" / "synthetic" / "reject_500_3.jsonl",
         "mixed_v4": BASE_DIR / "data" / "synthetic" / "reject_500_4.jsonl",
         "mixed_v5": BASE_DIR / "data" / "synthetic" / "reject_500_5.jsonl",
+        "mixed_v6": BASE_DIR / "data" / "synthetic" / "reject_500_6.jsonl",
     }
     default_reject = default_rejects[profile]
     output_path = resolve_output_path(Path(output)) if output else default_output
@@ -2698,10 +3034,21 @@ def run_generation(
     assertion_counter = Counter()
     entity_type_counter = Counter()
     format_counter = Counter()
+    v6_error_counter = Counter()
+    v6_assertion_case_counter = Counter()
+    v6_reject_focus_counter = Counter()
     guaranteed_long_index = forced_long_focus_index(profile, n_samples)
     v5_focus_schedule = (
         build_v5_focus_schedule(n_samples) if profile == "mixed_v5" else None
     )
+    v6_focus_schedule = (
+        build_v6_focus_schedule(n_samples) if profile == "mixed_v6" else None
+    )
+    if v6_focus_schedule is not None:
+        planned_focuses = Counter(focus["key"] for focus in v6_focus_schedule)
+        print(f"[*] Kế hoạch focus V6: {dict(planned_focuses)}")
+        print(f"[*] Nhóm lỗi NER V6: {list(V6_ERROR_TAXONOMY)}")
+        print(f"[*] Ca assertion khó V6: {list(V6_ASSERTION_TAXONOMY)}")
     suppressed_focus_indices = set()
     consecutive_failed_groups = 0
 
@@ -2716,6 +3063,8 @@ def run_generation(
                 focus_cfg = None
             elif v5_focus_schedule is not None:
                 focus_cfg = v5_focus_schedule[i]
+            elif v6_focus_schedule is not None:
+                focus_cfg = v6_focus_schedule[i]
             elif i == guaranteed_long_index:
                 focus_cfg = (
                     V3_VERY_LONG_FOCUS
@@ -2733,7 +3082,7 @@ def run_generation(
             # vào từng record chỉ để cân counter như các sample baseline ngắn.
             effective_force_assertion = (
                 None
-                if focus_cfg and focus_cfg.get("mode") in {"v4", "v5"}
+                if focus_cfg and focus_cfg.get("mode") in {"v4", "v5", "v6"}
                 else force_assertion
             )
 
@@ -2747,7 +3096,7 @@ def run_generation(
             success = False
             max_attempts = (
                 V4_MAX_RETRY_PER_SAMPLE
-                if focus_cfg and focus_cfg.get("mode") in {"v4", "v5"}
+                if focus_cfg and focus_cfg.get("mode") in {"v4", "v5", "v6"}
                 else MAX_RETRY_PER_SAMPLE
             )
             for attempt in range(1, max_attempts + 1):
@@ -2760,22 +3109,28 @@ def run_generation(
                     focus_mode = focus_cfg.get("mode") if focus_cfg else None
                     is_v4_record = focus_mode == "v4"
                     is_v5_record = focus_mode == "v5"
+                    is_v6_record = focus_mode == "v6"
                     # QA/lý thuyết không thừa hưởng section quay vòng của baseline. Truyền
                     # tien_su ở đây từng làm mọi bệnh trong bài kiến thức thành isHistorical.
                     parsed["_section_key_hint"] = (
-                        None if is_v4_record or is_v5_record else section_cfg["key"]
+                        None
+                        if is_v4_record or is_v5_record or is_v6_record
+                        else section_cfg["key"]
                     )
                     parsed["_knowledge_context"] = bool(
                         (is_v4_record and focus_cfg.get("format") in {"qa", "education"})
                         or (is_v5_record and focus_cfg.get("qa_style"))
+                        or (is_v6_record and focus_cfg.get("qa_style"))
                     )
                     # V4 là free-form QA/lý thuyết/bệnh án lai; heading "Đánh giá" không
                     # đồng nghĩa record bắt buộc phải chứa lab. Chỉ baseline giữ QC cũ này.
                     parsed["_require_lab_pair"] = not bool(
-                        focus_cfg and focus_cfg.get("mode") in {"v4", "v5"}
+                        focus_cfg and focus_cfg.get("mode") in {"v4", "v5", "v6"}
                     )
                     parsed["_min_entities"] = (
-                        focus_cfg.get("min_entities", 2) if is_v5_record else 2
+                        focus_cfg.get("min_entities", 2)
+                        if is_v5_record or is_v6_record
+                        else 2
                     )
 
                     status, *payload = process_record(
@@ -2787,6 +3142,13 @@ def run_generation(
 
                     if status == "reject":
                         reject_log = payload[0]
+                        if focus_mode == "v6":
+                            reject_log["v6_focus"] = focus_cfg["key"]
+                            reject_log["v6_error_family"] = focus_cfg.get("error_family")
+                            reject_log["v6_assertion_family"] = focus_cfg.get(
+                                "assertion_family"
+                            )
+                            v6_reject_focus_counter[focus_cfg["key"]] += 1
                         freject.write(json.dumps(reject_log, ensure_ascii=False) + "\n")
                         freject.flush()
                         raise ValueError(
@@ -2809,6 +3171,13 @@ def run_generation(
                             "attempt": attempt,
                             "model": MODEL,
                         }
+                        if focus_mode == "v6":
+                            reject_log.update({
+                                "v6_focus": focus_cfg["key"],
+                                "v6_error_family": focus_cfg.get("error_family"),
+                                "v6_assertion_family": focus_cfg.get("assertion_family"),
+                            })
+                            v6_reject_focus_counter[focus_cfg["key"]] += 1
                         freject.write(json.dumps(reject_log, ensure_ascii=False) + "\n")
                         freject.flush()
                         raise ValueError(
@@ -2842,6 +3211,11 @@ def run_generation(
                         )
                         if focus_cfg else "baseline"
                     ] += 1
+                    if focus_mode == "v6":
+                        if focus_cfg.get("error_family"):
+                            v6_error_counter[focus_cfg["error_family"]] += 1
+                        if focus_cfg.get("assertion_family"):
+                            v6_assertion_case_counter[focus_cfg["assertion_family"]] += 1
 
                     success = True
                     consecutive_failed_groups = 0
@@ -2858,6 +3232,12 @@ def run_generation(
                         f"[*] Đã sinh {i}/{n_samples} | format: {dict(format_counter)} | "
                         f"entity_type: {dict(entity_type_counter)} | assertion: {dict(assertion_counter)}"
                     )
+                    if profile == "mixed_v6":
+                        print(
+                            f"    lỗi NER đã sinh: {dict(v6_error_counter)} | "
+                            f"assertion khó đã sinh: {dict(v6_assertion_case_counter)} | "
+                            f"focus bị reject: {dict(v6_reject_focus_counter)}"
+                        )
             else:
                 # Không đếm một slot thất bại như record đã sinh. Nếu chính focus dài gây lỗi,
                 # thử lại cùng vị trí bằng baseline để vừa đủ số dòng mà không retry focus vô hạn.
@@ -2875,6 +3255,10 @@ def run_generation(
     print(f"Phân bố entity type cuối cùng: {dict(entity_type_counter)}")
     print(f"Phân bố assertion cuối cùng: {dict(assertion_counter)}")
     print(f"Phân bố format cuối cùng: {dict(format_counter)}")
+    if profile == "mixed_v6":
+        print(f"Phân bố nhóm lỗi NER V6: {dict(v6_error_counter)}")
+        print(f"Phân bố ca assertion khó V6: {dict(v6_assertion_case_counter)}")
+        print(f"Phân bố focus V6 bị reject: {dict(v6_reject_focus_counter)}")
     return {
         "generated": i,
         "output": str(output_path),
@@ -2882,4 +3266,7 @@ def run_generation(
         "entity_type": dict(entity_type_counter),
         "assertion": dict(assertion_counter),
         "format": dict(format_counter),
+        "v6_error_focus": dict(v6_error_counter),
+        "v6_assertion_focus": dict(v6_assertion_case_counter),
+        "v6_reject_focus": dict(v6_reject_focus_counter),
     }

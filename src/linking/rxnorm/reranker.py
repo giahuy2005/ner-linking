@@ -7,6 +7,7 @@ Khi felodipine chen vào amlodipine -> sửa ingredient_gate().
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from rapidfuzz import fuzz
@@ -68,10 +69,16 @@ class RxNormRuleReranker:
         for name in names:
             normalized_name = normalize_text(name)
 
-            if normalized_name and normalized_name in core:
+            # Token-boundary match only.  Plain substring matching promoted
+            # short unrelated names (e.g. a 3-letter ingredient hidden inside
+            # a Vietnamese adjective) to an exact drug match.
+            if normalized_name and re.search(
+                rf"(?<!\w){re.escape(normalized_name)}(?!\w)", core
+            ):
                 return "exact"
 
-            best = max(best, fuzz.partial_ratio(normalized_name, core) / 100.0)
+            if len(normalized_name) >= 4 and len(core) >= 4:
+                best = max(best, fuzz.partial_ratio(normalized_name, core) / 100.0)
 
         if best >= 0.9:
             return "exact"

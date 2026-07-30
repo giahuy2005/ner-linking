@@ -128,10 +128,21 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
             handoff.get("region_recovery_count", 0)
             for handoff in pipeline.last_handoffs.values()
         )
+        hint_counts: dict[str, int] = {}
+        for entities in entities_by_id.values():
+            for entity in entities:
+                for hint in entity.review_hints:
+                    if not isinstance(hint, dict):
+                        continue
+                    action = str(hint.get("requested_action", "UNKNOWN"))
+                    hint_counts[action] = hint_counts.get(action, 0) + 1
+        hint_summary = ", ".join(
+            f"{action}={count}" for action, count in sorted(hint_counts.items())
+        ) or "none"
         print(
             "[cli] 1.5B -> 7B danger handoff: "
             f"targets={handoff_targets}, regions={handoff_regions}, "
-            f"recoveries={handoff_recoveries}",
+            f"recoveries={handoff_recoveries}, hints=({hint_summary})",
             file=sys.stderr,
         )
         fixer_llm.unload()

@@ -9,6 +9,8 @@ from src.inference.ner.repair_gate import filter_entities
 from src.inference.schemas import NerEntity
 from src.inference.selection.candidate_selector import select_candidates, select_candidates_many
 from src.llm.config import NER_FIXER_CONFIG
+from src.linking.rxnorm.reranker import RxNormRuleReranker
+from src.linking.rxnorm.schemas import ParsedDrugMention, RxNormCandidate
 
 
 class _StaticLlm:
@@ -181,6 +183,18 @@ class InferenceRegressionTests(unittest.TestCase):
         self.assertEqual([], dropped)
         self.assertEqual("low_emission_confidence", kept[0]["flag"])
 
+    def test_short_span_is_reviewed_but_never_rule_dropped(self):
+        kept, dropped = filter_entities([{
+            "text": "ho",
+            "type": "TRIỆU_CHỨNG",
+            "assertions": [],
+            "position": [10, 12],
+            "score": 0.99,
+        }])
+
+        self.assertEqual([], dropped)
+        self.assertEqual("short_span_review", kept[0]["flag"])
+
     def test_recall_audit_adds_only_exact_uncovered_entity(self):
         raw = "Đang dùng aspirin 81 mg daily và không sốt."
         fever_start = raw.index("sốt")
@@ -235,28 +249,53 @@ class InferenceRegressionTests(unittest.TestCase):
                 "position": [0, 10],
             }])
 
-    def test_icd_selector_caps_at_two_and_uses_score_margin_for_top_one(self):
+    def test_icd_selector_defaults_to_one_and_needs_explicit_coordination_for_two(self):
         ambiguous = [
-            {"code": "A", "matched_term": "a", "score": 0.80},
-            {"code": "B", "matched_term": "b", "score": 0.77},
-            {"code": "C", "matched_term": "c", "score": 0.76},
+            {"code": "A", "matched_term": "bệnh x", "score": 0.80},
+            {"code": "B", "matched_term": "bệnh y", "score": 0.77},
+            {"code": "C", "matched_term": "bệnh z", "score": 0.76},
         ]
         selected = select_candidates(
             "bệnh x", "CHẨN_ĐOÁN", ambiguous,
             _StaticLlm('{"chosen_codes":["A","B","C"],"reason":"x"}'),
             max_choices=3,
         )
-        self.assertEqual(["A", "B"], selected)
+        self.assertEqual(["A"], selected)
+
+        coordinated = select_candidates(
+            "bệnh x và bệnh y", "CHẨN_ĐOÁN", ambiguous,
+            _StaticLlm('{"chosen_codes":["A","B","C"],"reason":"x"}'),
+            max_choices=3,
+        )
+        self.assertEqual(["A", "B"], coordinated)
 
         separated = [
-            {"code": "A", "matched_term": "a", "score": 0.90},
-            {"code": "B", "matched_term": "b", "score": 0.75},
+            {"code": "A", "matched_term": "bệnh x", "score": 0.90},
+            {"code": "B", "matched_term": "bệnh y", "score": 0.75},
         ]
         selected = select_candidates(
             "bệnh x", "CHẨN_ĐOÁN", separated,
             _StaticLlm('{"chosen_codes":["A","B"],"reason":"x"}'),
         )
         self.assertEqual(["A"], selected)
+
+    def test_ambiguous_selector_can_abstain_and_invalid_json_does_not_force_code(self):
+        candidates = [
+            {"code": "C51", "matched_term": "unrelated concept", "score": 0.70},
+            {"code": "R05", "matched_term": "another concept", "score": 0.68},
+        ]
+
+        abstained = select_candidates(
+            "khái niệm không tương ứng", "CHẨN_ĐOÁN", candidates,
+            _StaticLlm('{"chosen_codes":[],"reason":"không phù hợp"}'),
+        )
+        malformed = select_candidates(
+            "khái niệm không tương ứng", "CHẨN_ĐOÁN", candidates,
+            _StaticLlm('not-json'),
+        )
+
+        self.assertEqual([], abstained)
+        self.assertEqual([], malformed)
 
     def test_rule_only_pipeline_limits_output_candidates(self):
         class _RxLinker:
@@ -298,6 +337,68 @@ class InferenceRegressionTests(unittest.TestCase):
         selected = select_candidates("Drug", "THUỐC", candidates, llm)
 
         self.assertEqual(["2"], selected)
+
+    def test_candidate_selector_abstains_from_semantically_unsupported_icd(self):
+        candidates = [{
+            "code": "C51",
+            "matched_term": "U ác âm hộ",
+            "score": 0.79,
+            "language": "vi",
+        }]
+        llm = _StaticLlm('{"chosen_codes":["C51"],"reason":"top"}')
+
+        selected = select_candidates("HA", "CHẨN_ĐOÁN", candidates, llm)
+
+        self.assertEqual([], selected)
+
+    def test_candidate_selector_keeps_supported_nonexact_icd(self):
+        candidates = [{
+            "code": "J18.9",
+            "matched_term": "Viêm phổi, không xác định",
+            "score": 0.74,
+            "language": "vi",
+        }]
+        llm = _StaticLlm('{"chosen_codes":["J18.9"],"reason":"đúng nghĩa"}')
+
+        selected = select_candidates("viêm phổi", "CHẨN_ĐOÁN", candidates, llm)
+
+        self.assertEqual(["J18.9"], selected)
+
+    def test_pipeline_without_selector_still_abstains_from_bad_icd(self):
+        class _IcdLinker:
+            @staticmethod
+            def link(text, top_k_codes):
+                return [{
+                    "code": "C51",
+                    "matched_term": "U ác âm hộ",
+                    "score": 0.79,
+                    "language": "vi",
+                }]
+
+        pipeline = InferencePipeline(object(), icd10_linker=_IcdLinker())
+        entity = NerEntity(text="HA", type="CHẨN_ĐOÁN", position=(0, 2))
+
+        attached = pipeline.attach_candidates([entity])
+
+        self.assertEqual([], attached[0])
+
+    def test_rxnorm_short_substring_is_not_exact_ingredient(self):
+        parsed = ParsedDrugMention(
+            raw_text="cấp tính",
+            normalized_text="cap tinh",
+            ingredient_core="cap tinh",
+        )
+        candidate = RxNormCandidate(
+            rxcui="10603",
+            tty="IN",
+            tier="support",
+            name="tin",
+            structured={"ingredients": ["tin"]},
+        )
+
+        relation = RxNormRuleReranker().ingredient_gate(parsed, candidate)
+
+        self.assertEqual("mismatch", relation)
 
     def test_candidate_selector_batches_ambiguous_entities(self):
         items = [

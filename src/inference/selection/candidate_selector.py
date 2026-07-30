@@ -3,8 +3,8 @@ trong list mà RxNormLinker/Icd10Linker đã retrieval + rerank sẵn.
 
 LUÔN validate code LLM chọn PHẢI nằm trong list candidate gốc đưa vào —
 không tin LLM tự bịa code không có trong danh sách (hallucination). Nếu
-LLM lỗi hoặc chọn toàn code không hợp lệ, fallback về top candidate của
-linker (KHÔNG trả rỗng — rỗng tệ hơn dùng lại kết quả linker gốc).
+LLM lỗi hoặc chọn toàn code không hợp lệ thì trả rỗng, trừ exact match đã
+được kiểm chứng. Với metric phạt mã thừa/sai, abstain an toàn hơn ép mã rác.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import sys
 import unicodedata
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
 from ...llm.json_guard import extract_json
@@ -62,6 +63,111 @@ def _normalize_exact(text: str) -> str:
     return re.sub(r"\s+", " ", value).strip(" \t\r\n.,;:()[]{}")
 
 
+_NON_SEMANTIC_TOKENS = {
+    "benh", "hoi", "chung", "thuoc", "type", "typ", "khong", "xac", "dinh",
+    "va", "hoac", "kem",
+    "va", "hoac", "kem",
+    "mg", "mcg", "g", "ml", "po", "iv", "im", "bid", "tid", "qid", "daily",
+}
+
+
+def _fold_ascii(text: str) -> str:
+    value = unicodedata.normalize("NFD", _normalize_exact(text))
+    return "".join(char for char in value if unicodedata.category(char) != "Mn")
+
+
+def _meaningful_tokens(text: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[a-z0-9]+", _fold_ascii(text))
+        if token not in _NON_SEMANTIC_TOKENS and not token.isdigit()
+    }
+
+
+def _lexical_support(entity_text: str, label: str) -> tuple[float, float]:
+    mention = _fold_ascii(entity_text)
+    candidate = _fold_ascii(label)
+    mention_tokens = _meaningful_tokens(entity_text)
+    candidate_tokens = _meaningful_tokens(label)
+    coverage = (
+        len(mention_tokens & candidate_tokens) / len(mention_tokens)
+        if mention_tokens else 0.0
+    )
+    return coverage, SequenceMatcher(None, mention, candidate).ratio()
+
+
+def _candidate_supported(entity_text: str, entity_type: str, candidate) -> bool:
+    """Precision gate after 7B selection.
+
+    Retrieval rank alone is not evidence.  Production candidates carry score/
+    feature metadata; low-score candidates with no lexical or ingredient
+    agreement are rejected.  Metadata-free candidates remain accepted for
+    backwards-compatible custom linkers and unit-test doubles.
+    """
+    displayed = _display(candidate)
+    if displayed is None:
+        return False
+    _code, label = displayed
+
+    if entity_type == "CHẨN_ĐOÁN" and isinstance(candidate, dict):
+        matched_term = str(candidate.get("matched_term") or "")
+        score_value = candidate.get("score")
+        if score_value is None:
+            return True
+        if matched_term and _normalize_exact(matched_term) == _normalize_exact(entity_text):
+            return True
+        score = float(score_value or 0.0)
+        coverage, similarity = _lexical_support(entity_text, matched_term)
+        mention_tokens = _meaningful_tokens(entity_text)
+        candidate_tokens = _meaningful_tokens(matched_term)
+        compact = re.sub(r"\W+", "", entity_text, flags=re.UNICODE)
+        abbreviation = compact.isupper() and 2 <= len(compact) <= 8
+        if len(mention_tokens) == 1 and len(candidate_tokens) > 1 and not abbreviation:
+            # A generic one-word diagnosis matching one token of a longer ICD
+            # label is underspecified; do not manufacture the missing disease.
+            return score >= 0.84 and similarity >= 0.68
+        return bool(
+            (score >= 0.68 and (coverage >= 0.50 or similarity >= 0.72))
+            or (score >= 0.82 and (coverage > 0.0 or similarity >= 0.45))
+            or (abbreviation and score >= 0.92)
+        )
+
+    if entity_type == "THUỐC" and not isinstance(candidate, dict):
+        features = getattr(candidate, "features", {}) or {}
+        has_evidence = bool(features) or hasattr(candidate, "final_score")
+        if not has_evidence:
+            return True
+        ingredient = features.get("ingredient_relation")
+        if getattr(candidate, "exact_term_match", False) and ingredient == "exact":
+            return True
+        names = [str(getattr(candidate, "name", "") or "")]
+        names.extend(str(value) for value in getattr(candidate, "matched_terms", []) or [])
+        coverage, similarity = max(
+            (_lexical_support(entity_text, name) for name in names if name),
+            default=(0.0, 0.0),
+        )
+        final_score = float(getattr(candidate, "final_score", 0.0) or 0.0)
+        no_conflict = all(features.get(key) not in {"mismatch", "order_dose_mismatch"}
+                          for key in ("strength_relation", "form_relation", "release_relation"))
+        return bool(
+            ingredient == "exact" and no_conflict and final_score >= 0.42
+            or ingredient == "partial" and coverage >= 0.50 and final_score >= 0.50
+            or coverage >= 0.75 and similarity >= 0.55 and final_score >= 0.48
+        )
+
+    # Legacy/custom dictionary candidates without confidence metadata.
+    if isinstance(candidate, dict) and not any(
+        key in candidate for key in ("score", "features", "final_score")
+    ):
+        return True
+    return False
+
+
+def _explicitly_coordinated_diagnoses(text: str) -> bool:
+    """Allow two ICD codes only when the mention explicitly coordinates concepts."""
+    normalized = _normalize_exact(text)
+    return bool(re.search(r"(?:\b(?:và|hoặc|kèm)\b|[+;])", normalized))
+
+
 def _high_confidence_top(entity_text: str, entity_type: str, candidate) -> bool:
     """Skip 7B only for deterministic exact cases; ambiguous cases still use it."""
     if entity_type == "CHẨN_ĐOÁN" and isinstance(candidate, dict):
@@ -92,23 +198,26 @@ def _prepare_selection(
         return None
     display_pairs = []
     valid_codes = []
+    candidates_by_code = {}
     for candidate in candidates[:top_k_context]:
         pair = _display(candidate)
         if pair is not None:
             display_pairs.append(pair)
             valid_codes.append(pair[0])
+            candidates_by_code.setdefault(pair[0], candidate)
     if not display_pairs:
         return None
-    choice_limit = 1 if entity_type == "THUỐC" else min(max_choices, 2)
-    if entity_type == "CHẨN_ĐOÁN" and len(candidates) >= 2:
-        first_score = candidates[0].get("score") if isinstance(candidates[0], dict) else None
-        second_score = candidates[1].get("score") if isinstance(candidates[1], dict) else None
-        if first_score is not None and second_score is not None \
-                and float(first_score) - float(second_score) >= 0.08:
-            choice_limit = 1
-    fallback = valid_codes[:choice_limit]
+    choice_limit = 1
+    if entity_type == "CHẨN_ĐOÁN" and max_choices >= 2 \
+            and _explicitly_coordinated_diagnoses(entity_text):
+        choice_limit = 2
+    high_confidence = (
+        _high_confidence_top(entity_text, entity_type, candidates[0])
+        and _candidate_supported(entity_text, entity_type, candidates[0])
+    )
+    fallback = valid_codes[:1] if high_confidence else []
     prompt = None
-    if not _high_confidence_top(entity_text, entity_type, candidates[0]):
+    if not high_confidence:
         prompt = build_candidate_selector_prompt(
             entity_text,
             entity_type,
@@ -119,6 +228,8 @@ def _prepare_selection(
     return {
         "entity_text": entity_text,
         "valid_codes": valid_codes,
+        "candidates_by_code": candidates_by_code,
+        "entity_type": entity_type,
         "choice_limit": choice_limit,
         "fallback": fallback,
         "prompt": prompt,
@@ -138,7 +249,39 @@ def _finish_selection(raw_output: str, prepared: dict) -> list[str]:
         return prepared["fallback"]
     valid_set = set(prepared["valid_codes"])
     chosen = list(dict.fromkeys(code for code in selection.chosen_codes if code in valid_set))
-    return chosen[:prepared["choice_limit"]] if chosen else prepared["fallback"]
+    supported = [
+        code for code in chosen
+        if _candidate_supported(
+            prepared["entity_text"],
+            prepared["entity_type"],
+            prepared["candidates_by_code"][code],
+        )
+    ]
+    return supported[:prepared["choice_limit"]]
+
+
+def select_supported_top_candidates(
+    entity_text: str,
+    entity_type: str,
+    candidates: list,
+    *,
+    max_choices: int = 2,
+) -> list[str]:
+    """Conservative deterministic output for runs without the 7B selector."""
+    limit = 1
+    if entity_type == "CHẨN_ĐOÁN" and max_choices >= 2 \
+            and _explicitly_coordinated_diagnoses(entity_text):
+        limit = 2
+    selected = []
+    for candidate in candidates:
+        pair = _display(candidate)
+        if pair is None or not _candidate_supported(entity_text, entity_type, candidate):
+            continue
+        if pair[0] not in selected:
+            selected.append(pair[0])
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def select_candidates(

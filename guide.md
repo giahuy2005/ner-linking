@@ -555,3 +555,20 @@ Nếu chỉ test và không muốn tốn tiền nữa:
 - Xóa volume nếu không cần giữ dữ liệu để tránh phí storage.
 
 Trước khi terminate, nhớ tải `output.zip` về.
+
+
+## bash run 
+python -m src.inference.cli \
+  --input-dir data/input \
+  --output-dir output_15b \
+  --with-llm-fixer \
+  2>&1 | tee run_15b.log
+
+  python -m src.inference.cli \
+  --input-dir data/input \
+  --output-dir output_7b \
+  --with-llm-fixer \
+  --with-llm-7b \
+  --with-rxnorm \
+  --with-icd10 \
+  2>&1 | tee run_7b.log

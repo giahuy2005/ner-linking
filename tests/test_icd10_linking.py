@@ -16,6 +16,7 @@ from linking.icd10 import build_icd10_faiss_index as build_module
 from linking.icd10.build_icd10_faiss_index import load_embedding_terms, write_metadata
 from linking.icd10.icd10_linker import (
     Icd10Linker,
+    _build_metadata_alias_codes,
     _exact_alias_result,
     _finalize_term_results,
     aggregate_term_results,
@@ -153,6 +154,25 @@ class Icd10LinkingTests(unittest.TestCase):
                 result = _exact_alias_result(mention)
                 self.assertIsNotNone(result)
                 self.assertEqual([code], [row["code"] for row in result])
+
+    def test_metadata_builds_only_unambiguous_exact_aliases(self):
+        metadata = [
+            {"code": "A82", "text": "Bệnh dại", "language": "vi",
+             "term_type": "preferred"},
+            {"code": "X01", "text": "Cụm mơ hồ", "language": "vi",
+             "term_type": "preferred"},
+            {"code": "X02", "text": "Cụm mơ hồ", "language": "vi",
+             "term_type": "preferred"},
+            {"code": "Y01", "text": "English only", "language": "en",
+             "term_type": "preferred"},
+        ]
+
+        aliases = _build_metadata_alias_codes(metadata)
+
+        self.assertEqual("A82", aliases["bệnh dại"])
+        self.assertEqual("A82", aliases["dại"])
+        self.assertNotIn("cụm mơ hồ", aliases)
+        self.assertNotIn("english only", aliases)
 
     def test_icd_finalize_filters_threshold_chapter_and_caps_at_two(self):
         rows = [

@@ -35,6 +35,9 @@ data/input_/
 data/output/
 data/output_7b
 data/output_15b
+output_15b/
+output_7b/
+output_no_llm/
 *.csv
 *.tsv
 *.xlsx

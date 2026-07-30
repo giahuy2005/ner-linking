@@ -79,7 +79,7 @@
     "text": "Parkinson",
     "type": "CHẨN_ĐOÁN",
     "candidates": [],
-    "assertions": ["isHistorical"],
+    "assertions": ["isNegated", "isHistorical"],
     "position": [881, 890]
   },
   {
@@ -103,7 +103,7 @@
   {
     "text": "yếu sức chân phải",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1288, 1305]
   },
   {
@@ -115,13 +115,13 @@
   {
     "text": "liên tục",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1419, 1427]
   },
   {
     "text": "khuỵu chân khi được giúp đỡ đứng dậy",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [1428, 1464]
   },
   {
@@ -144,7 +144,8 @@
   },
   {
     "text": "cơn nhịp tim chậm nặng",
-    "type": "TRIỆU_CHỨNG",
+    "type": "CHẨN_ĐOÁN",
+    "candidates": [],
     "assertions": [],
     "position": [1581, 1603]
   },
@@ -161,6 +162,12 @@
     "candidates": [],
     "assertions": [],
     "position": [1675, 1693]
+  },
+  {
+    "text": "Chụp",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [1701, 1705]
   },
   {
     "text": "chụp ct sọ não",
@@ -296,6 +303,12 @@
     "position": [2872, 2890]
   },
   {
+    "text": "Chụp",
+    "type": "TÊN_XÉT_NGHIỆM",
+    "assertions": [],
+    "position": [2898, 2902]
+  },
+  {
     "text": "chụp ct sọ não",
     "type": "TÊN_XÉT_NGHIỆM",
     "assertions": [],
@@ -315,9 +328,15 @@
     "position": [2981, 3003]
   },
   {
+    "text": "đứng dậy",
+    "type": "TRIỆU_CHỨNG",
+    "assertions": ["isNegated"],
+    "position": [3096, 3104]
+  },
+  {
     "text": "yếu sức chân phải",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3108, 3125]
   },
   {
@@ -329,13 +348,13 @@
   {
     "text": "liên tục",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3165, 3173]
   },
   {
     "text": "khuỵu chân",
     "type": "TRIỆU_CHỨNG",
-    "assertions": [],
+    "assertions": ["isNegated"],
     "position": [3174, 3184]
   },
   {
