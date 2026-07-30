@@ -22,7 +22,7 @@ class NerEntity:
     assertions: list[str] = field(default_factory=list)
     position: tuple[int, int] = (0, 0)
     score: float = 1.0  # confidence proxy từ emission của nhãn CRF đã decode
-    flag: str | None = None  # lý do repair_gate nghi ngờ (vd "suspect_truncated_diagnosis"), None = không nghi ngờ
+    flag: str | None = None  # tín hiệu cấu trúc/confidence để route fixer; None = không nghi ngờ
     # Sidecar nội bộ từ Qwen 1.5B cho grouped handoff 7B; không xuất BTC JSON.
     review_hints: list[dict[str, Any]] = field(default_factory=list)
 

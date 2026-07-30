@@ -51,14 +51,25 @@ class NewNerPipelineTests(unittest.TestCase):
         return raw, cleaned, logs
 
     def test_gold_btc_medication_list(self):
-        entities, logs = apply_clinical_rules(GOLD_TEXT, [])
+        symptom_surfaces = ["ho", "đau nhức", "sốt đau", "táo bón", "táo bón",
+                            "lo âu", "lo âu", "mất ngủ"]
+        symptom_entities = []
+        cursor = 0
+        for surface in symptom_surfaces:
+            start = GOLD_TEXT.index(surface, cursor)
+            symptom_entities.append(NerEntity(
+                surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), score=0.9,
+            ))
+            cursor = start + len(surface)
+
+        entities, logs = apply_clinical_rules(GOLD_TEXT, symptom_entities)
         drugs = [entity for entity in entities if entity.type == "THUỐC"]
         symptoms = [entity for entity in entities if entity.type == "TRIỆU_CHỨNG"]
 
         self.assertEqual(11, len(drugs))
         self.assertTrue(all(entity.assertions == ["isHistorical"] for entity in drugs))
         self.assertEqual(
-            ["ho", "đau nhức", "sốt đau", "táo bón", "táo bón", "lo âu", "lo âu", "mất ngủ"],
+            symptom_surfaces,
             [entity.text for entity in symptoms],
         )
         self.assertTrue(all(not entity.assertions for entity in symptoms))
@@ -97,7 +108,7 @@ class NewNerPipelineTests(unittest.TestCase):
         self.assertTrue(all(not item.get("candidates", []) for item in output
                             if item["type"] != "THUỐC"))
 
-    def test_boundary_repeated_token_and_false_positive_rules(self):
+    def test_boundary_repairs_do_not_delete_by_memorized_surface(self):
         raw = "sốt bn; bn vàng da; Thiếu men G6PD (; chụp chụp ct sọ não; ăn ngủ"
         surfaces = ["sốt bn", "bn vàng da", "Thiếu men G6PD (",
                     "chụp chụp ct sọ não", "ăn ngủ"]
@@ -111,12 +122,12 @@ class NewNerPipelineTests(unittest.TestCase):
 
         cleaned, _ = deterministic_cleanup(raw, entities)
 
-        self.assertEqual(["sốt", "vàng da", "Thiếu men G6PD", "chụp ct sọ não"],
+        self.assertEqual(["sốt", "vàng da", "Thiếu men G6PD", "chụp ct sọ não", "ăn ngủ"],
                          [entity.text for entity in cleaned])
 
-    def test_additional_notebook_boundary_examples(self):
-        raw = "bệnh Kawasaki\nMặc; Cấy máu, dịch hầu họng; Chụp lại chụp ct sọ não"
-        surfaces = ["bệnh Kawasaki\nMặc", "hầu họng", "Chụp lại chụp ct sọ não"]
+    def test_structural_boundary_cleanup_does_not_expand_medical_vocabulary(self):
+        raw = "bệnh hiếm\nMặc; Cấy mẫu, dịch vị; làm làm xét nghiệm"
+        surfaces = ["bệnh hiếm\nMặc", "dịch vị", "làm làm xét nghiệm"]
         types = ["CHẨN_ĐOÁN", "TÊN_XÉT_NGHIỆM", "TÊN_XÉT_NGHIỆM"]
         entities = []
         for surface, entity_type in zip(surfaces, types):
@@ -126,7 +137,7 @@ class NewNerPipelineTests(unittest.TestCase):
 
         cleaned, _ = deterministic_cleanup(raw, entities)
 
-        self.assertEqual(["bệnh Kawasaki", "dịch hầu họng", "chụp ct sọ não"],
+        self.assertEqual(["bệnh hiếm", "dịch vị", "làm xét nghiệm"],
                          [entity.text for entity in cleaned])
 
     def test_7b_batches_requests_and_applies_valid_review_and_recovery(self):
@@ -215,10 +226,11 @@ class NewNerPipelineTests(unittest.TestCase):
             for log in logs
         ))
 
-    def test_7b_cannot_drop_protected_valid_short_symptom(self):
-        raw = "Bệnh nhân đau."
-        start = raw.index("đau")
-        entity = NerEntity("đau", "TRIỆU_CHỨNG", [], (start, start + 3), 0.5,
+    def test_7b_cannot_drop_without_independent_small_model_evidence(self):
+        raw = "Bệnh nhân có biểu hiện lạ."
+        surface = "biểu hiện lạ"
+        start = raw.index(surface)
+        entity = NerEntity(surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.5,
                            "low_emission_confidence")
         handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
         request = handoff["review_regions"][0]
@@ -235,84 +247,23 @@ class NewNerPipelineTests(unittest.TestCase):
             retry_rounds=0,
         )
 
-        self.assertEqual(["đau"], [item.text for item in result["doc"]])
+        self.assertEqual([surface], [item.text for item in result["doc"]])
         self.assertTrue(any(log.get("reason") == "action_not_allowed_for_target"
                             for log in logs))
 
-    def test_real_outputs_drop_fragments_and_hard_negatives_before_linking(self):
-        _raw, doc1, logs1 = self._cleanup_saved_output(1)
-        _raw, doc7, logs7 = self._cleanup_saved_output(7)
-        remaining = {entity.text.casefold() for entity in doc1 + doc7}
+    def test_7b_drop_is_enabled_only_when_1_5b_requested_it(self):
+        raw = "Bệnh nhân có biểu hiện lạ."
+        surface = "biểu hiện lạ"
+        start = raw.index(surface)
+        entity = NerEntity(
+            surface, "TRIỆU_CHỨNG", [], (start, start + len(surface)), 0.5,
+            "low_emission_confidence",
+            [{"requested_action": "DROP", "status": "blocked_unsafe_drop"}],
+        )
 
-        self.assertTrue({"pd", "g6", "glucose-6-phosphate dehydrogenase",
-                         "đột biến gen", "10kg", "yakult", "bụng"}.isdisjoint(remaining))
-        dropped = {log.get("text", "").casefold() for log in logs1 + logs7
-                   if log.get("status") == "drop"}
-        self.assertTrue({"pd", "g6", "glucose-6-phosphate dehydrogenase",
-                         "đột biến gen", "10kg", "yakult", "bụng"}.issubset(dropped))
+        handoff = build_handoff_requests(raw, [entity], [], request_prefix="doc")
 
-    def test_real_outputs_retype_recover_boundaries_and_fix_assertion_scope(self):
-        _raw, doc1, _logs = self._cleanup_saved_output(1)
-        _raw, doc3, _logs = self._cleanup_saved_output(3)
-        _raw, doc4, _logs = self._cleanup_saved_output(4)
-        _raw, doc8, _logs = self._cleanup_saved_output(8)
-        _raw, doc10, _logs = self._cleanup_saved_output(10)
-
-        self.assertTrue(any(entity.text.casefold() == "thiếu men g6pd"
-                            and entity.type == "CHẨN_ĐOÁN" for entity in doc1))
-        self.assertTrue(any(entity.text.casefold() == "hội chứng parkinson"
-                            and entity.type == "CHẨN_ĐOÁN" for entity in doc3))
-        self.assertTrue(any(entity.text.casefold() == "nhìn song thị"
-                            for entity in doc3))
-        infection = next(entity for entity in doc3
-                         if entity.text.casefold() == "nhiễm trùng răng miệng")
-        self.assertNotIn("isNegated", infection.assertions)
-        negated_history = [entity for entity in doc3
-                           if entity.text.casefold() in {"tai biến mạch máu não", "co giật"}
-                           and "isNegated" in entity.assertions]
-        self.assertTrue(negated_history)
-        self.assertTrue(all("isHistorical" in entity.assertions for entity in negated_history))
-
-        breath_test = next(entity for entity in doc4
-                           if entity.text.casefold() == "test hơi thở h. pylori")
-        self.assertEqual("TÊN_XÉT_NGHIỆM", breath_test.type)
-        nausea = next(entity for entity in doc4 if entity.text.casefold() == "nausea")
-        self.assertEqual("TRIỆU_CHỨNG", nausea.type)
-        history_symptoms = [entity for entity in doc4
-                            if entity.text.casefold() in {"buồn nôn", "tiêu chảy"}
-                            and entity.position[0] < 100]
-        self.assertTrue(history_symptoms)
-        self.assertTrue(all("isHistorical" in entity.assertions for entity in history_symptoms))
-
-        liver = next(entity for entity in doc8 if entity.text.casefold() == "tăng men gan")
-        self.assertEqual("KẾT_QUẢ_XÉT_NGHIỆM", liver.type)
-        hepatitis = next(entity for entity in doc10
-                         if entity.text.casefold().startswith("viêm gan cấp tính do virus b"))
-        self.assertNotIn("isHistorical", hepatitis.assertions)
-
-    def test_7b_output_recovers_valid_drops_and_removes_remaining_ner_noise(self):
-        _raw, doc1, _ = self._cleanup_saved_output(1, "output_7b")
-        _raw, doc4, _ = self._cleanup_saved_output(4, "output_7b")
-        _raw, doc5, _ = self._cleanup_saved_output(5, "output_7b")
-        _raw, doc7, _ = self._cleanup_saved_output(7, "output_7b")
-        _raw, doc8, _ = self._cleanup_saved_output(8, "output_7b")
-        _raw, doc10, _ = self._cleanup_saved_output(10, "output_7b")
-
-        self.assertTrue(any(e.text.casefold() == "vàng mắt" for e in doc1))
-        self.assertTrue(any(e.text.casefold() == "berlthyrox" and e.type == "THUỐC"
-                            for e in doc4))
-        self.assertTrue(any(e.text.casefold() == "pain" and e.type == "TRIỆU_CHỨNG"
-                            for e in doc4))
-        self.assertFalse(any(e.text.casefold() == "75 microgam/" for e in doc4))
-        leak = next(e for e in doc5 if e.text.casefold() == "dịch rò rỉ quanh ống thông")
-        self.assertIn("isNegated", leak.assertions)
-        self.assertTrue(any(e.text.casefold() == "ứ nước" for e in doc7))
-        self.assertTrue(any(e.text.casefold() == "ảo giác thính giác" for e in doc8))
-        self.assertTrue(any(e.text.casefold() == "tự tử" for e in doc8))
-        self.assertFalse(any(e.type == "CHẨN_ĐOÁN" and e.text.casefold() == "oligoclonal"
-                             for e in doc8))
-        self.assertTrue(any(e.text.casefold() == "đánh trống ngực" for e in doc10))
-        self.assertTrue(any(e.text.casefold() == "ngoại tâm thu thất" for e in doc10))
+        self.assertIn("DROP", handoff["review_regions"][0]["targets"][0]["allowed_actions"])
 
 
 if __name__ == "__main__":

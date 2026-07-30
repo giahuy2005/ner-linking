@@ -1,27 +1,8 @@
-"""Lọc sơ sơ (rule-based) output NER trước khi đưa qua linking.
+"""Surface-agnostic validation gate for raw NER output.
 
-Rule ở đây được rút trực tiếp từ noise thấy trong test case thật của bạn
-(paste trong lúc trao đổi), KHÔNG phải rule tổng quát đoán mò:
-
-  [TÊN_XÉT_NGHIỆM] ':' [469, 470]                -> entity chỉ có dấu câu
-  [KẾT_QUẢ_XÉT_NGHIỆM] ')' [639, 640]            -> entity chỉ có dấu câu
-  [TÊN_XÉT_NGHIỆM] 'Trụ niệu (–' [628, 639]       -> ngoặc mở không đóng,
-                                                      tràn sang entity kế
-  [TRIỆU_CHỨNG] 'chiều' [351, 356]                -> "giảm về chiều": chiều
-                                                      (buổi chiều) bị bắt
-                                                      nhầm thành triệu chứng
-  [TRIỆU_CHỨNG] 'lan' [267, 270]                  -> "đau không lan": từ
-                                                      đơn lẻ, không mang
-                                                      nghĩa lâm sàng
-  [CHẨN_ĐOÁN] 'thiếu' [813, 818]                  -> "Không có thiếu máu":
-                                                      bị cắt cụt, mất "máu"
-  [CHẨN_ĐOÁN] 'da' [978, 980]                     -> "viêm nhiễm ngoài da":
-                                                      bị cắt cụt, chỉ còn
-                                                      danh từ bộ phận cơ thể
-
-Mỗi rule dưới đây map thẳng 1-1 với 1 nhóm case ở trên. Rule KHÔNG tự
-đoán thêm case chưa thấy trong data thật — mở rộng danh sách khi bạn có
-thêm case cụ thể, tránh over-filter làm tụt recall.
+The gate only rejects structurally impossible candidates and flags low model
+confidence. It intentionally contains no symptom, diagnosis, anatomy, or
+private-output vocabulary; contextual decisions belong to the 1.5B/7B stages.
 """
 
 from __future__ import annotations
@@ -60,42 +41,7 @@ def _trim_unbalanced_trailing(text: str, char_start: int, char_end: int):
     return new_text, char_start, char_end - trimmed_len
 
 
-# ---------------------------------------------------------------------------
-# Rule 3: entity 1 từ, thuộc loại TRIỆU_CHỨNG/CHẨN_ĐOÁN, trùng danh sách
-# từ đã QUAN SÁT THẤY là false positive (từ nối/thời gian, không phải
-# thuật ngữ lâm sàng khi đứng một mình).
-# ---------------------------------------------------------------------------
-_SINGLE_WORD_NOISE = {
-    "TRIỆU_CHỨNG": {"chiều", "sáng", "lan", "và", "mà", "đã", "đang", "rồi",
-                     "thì", "này", "đó", "nên", "còn", "cũng", "khi", "sau", "trước"},
-    "CHẨN_ĐOÁN": {"chiều", "sáng", "và", "mà", "đã", "đang", "rồi",
-                  "thì", "này", "đó", "nên", "còn", "cũng", "khi", "sau", "trước"},
-}
-
-
-def _is_single_word_noise(text: str, ent_type: str) -> bool:
-    stripped = text.strip().lower()
-    if " " in stripped or "_" in stripped:
-        return False
-    return stripped in _SINGLE_WORD_NOISE.get(ent_type, set())
-
-
-# ---------------------------------------------------------------------------
-# Rule 4: entity 1 từ CHẨN_ĐOÁN chỉ còn lại danh từ bộ phận cơ thể trần
-# (không kèm bệnh danh) — dấu hiệu bị BIO cắt cụt như 'da' từ "ngoài da",
-# 'thiếu' từ "thiếu máu". Đây là rule NGỜ VỰC (flag), không tự drop, vì
-# 1 từ bộ phận cơ thể đứng riêng đôi khi vẫn hợp lệ tùy văn cảnh — trả về
-# để bạn tự quyết định log/drop khi review.
-# ---------------------------------------------------------------------------
-_SUSPECT_TRUNCATED_DIAGNOSIS = {"da", "gan", "thận", "phổi", "tim", "thiếu", "suy"}
 LOW_CONFIDENCE_THRESHOLD = 0.80
-
-
-def _is_suspect_truncated(text: str, ent_type: str) -> bool:
-    stripped = text.strip().lower()
-    if ent_type != "CHẨN_ĐOÁN":
-        return False
-    return stripped in _SUSPECT_TRUNCATED_DIAGNOSIS
 
 
 def filter_entities(entities: list[dict], *, drop_suspect_truncated: bool = False):
@@ -110,7 +56,6 @@ def filter_entities(entities: list[dict], *, drop_suspect_truncated: bool = Fals
 
     for ent in entities:
         text = ent["text"]
-        ent_type = ent["type"]
         start, end = ent["position"]
 
         # Rule 1
@@ -127,18 +72,10 @@ def filter_entities(entities: list[dict], *, drop_suspect_truncated: bool = Fals
             ent = {**ent, "text": new_text, "position": [new_start, new_end]}
             text = new_text
 
-        # Rule 3
-        if _is_single_word_noise(text, ent_type):
-            dropped.append({**ent, "reason": "single_word_stopword"})
-            continue
-
-        # Rule 4 (tùy chọn, mặc định chỉ log không drop)
-        if _is_suspect_truncated(text, ent_type):
-            if drop_suspect_truncated:
-                dropped.append({**ent, "reason": "suspect_truncated_diagnosis"})
-                continue
-            ent = {**ent, "flag": "suspect_truncated_diagnosis"}
-        elif float(ent.get("score", 1.0)) < LOW_CONFIDENCE_THRESHOLD:
+        # Confidence comes from the model and generalizes to unseen surfaces.
+        # ``drop_suspect_truncated`` remains in the signature for CLI/API
+        # compatibility but no vocabulary-based "suspect" class is created.
+        if float(ent.get("score", 1.0)) < LOW_CONFIDENCE_THRESHOLD:
             ent = {**ent, "flag": "low_emission_confidence"}
 
         kept.append(ent)

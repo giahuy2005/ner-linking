@@ -9,11 +9,16 @@ from ..ner.two_pass import SuspiciousRegion
 
 
 def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) -> dict:
-    from .clinical import is_protected_from_7b_drop
-
     start, end = entity.position
     allowed_actions = ["KEEP", "REPAIR_SPAN", "RETYPE"]
-    if not is_protected_from_7b_drop(entity):
+    # DROP requires independent evidence from the notebook's 1.5B stage.  It
+    # must never depend on a vocabulary/whitelist learned from local outputs.
+    small_model_requested_drop = any(
+        hint.get("requested_action") == "DROP"
+        for hint in entity.review_hints
+        if isinstance(hint, dict)
+    )
+    if small_model_requested_drop:
         allowed_actions.insert(1, "DROP")
     return {
         "candidate_id": candidate_id,

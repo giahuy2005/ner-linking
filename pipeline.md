@@ -8,7 +8,7 @@ NER Pass 1 (global BIO centrality merge, overlap 50)
   -> rule audit + suspicious regions
   -> NER Pass 2 trên các region
   -> exact dedup + conflict resolution
-  -> deterministic cleanup/rule recovery
+  -> surface-agnostic validation + mechanical boundary cleanup
   -> Qwen2.5-1.5B guarded batch + danger hints
   -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
   -> Qwen2.5-7B NER batch (retry riêng request/batch lỗi)
@@ -34,7 +34,7 @@ Nhiều file .txt
   -> rule audit + phát hiện suspicious regions
   -> NER Pass 2 chỉ trên các region
   -> exact dedup + merge + conflict resolution
-  -> deterministic cleanup/rule recovery
+  -> surface-agnostic validation + mechanical boundary cleanup
   -> Qwen2.5-1.5B guarded fixer theo batch
   -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
   -> Qwen2.5-7B review/recover NER theo batch
@@ -99,16 +99,18 @@ không làm mất candidate Pass 1.
 
 Candidate Pass 1 và Pass 2 được exact-dedup theo `(start, end, type)`, hợp
 assertions, rồi resolve overlap deterministic theo score, độ dài và vị trí.
-Rule production nằm trong `src/inference/rule/clinical.py`, gồm:
+Validation production nằm trong `src/inference/rule/clinical.py`, gồm:
 
 - Boundary thừa/thiếu như `sốt bn`, `bn vàng da`, ngoặc/newline/connector thừa.
 - Repeated token/cụm như `chụp chụp...`, `Chụp lại chụp...`.
 - Specimen boundary `hầu họng` -> `dịch hầu họng` khi context hỗ trợ.
-- Hard negatives: `◦ 8`, `đứng dậy`, `đánh răng không`, `ăn ngủ`,
-  `tĩnh mạch L giọt/phút`, `cấp tính`, `Tomisaku Kawasaki`.
-- Giải phẫu trần bị gán chẩn đoán và `G6PD` bị gán sai thành xét nghiệm.
-- Danh sách thuốc trước nhập viện: recover regimen; chỉ thuốc nhận
-  `isHistorical`, triệu chứng chỉ định không kế thừa assertion của thuốc.
+- Loại span sai cấu trúc như chỉ có dấu câu, offset/text không khớp, số hoặc
+  số đo đứng riêng; trim dấu ngoặc/connector thừa và xử lý overlap.
+- Không dùng whitelist/blacklist tên triệu chứng, bệnh, thuốc hay các surface
+  lấy từ output local; retype/recover lâm sàng do NER, 1.5B và 7B xử lý theo context.
+- Danh sách thuốc trước nhập viện: recover riêng regimen thuốc và gán
+  `isHistorical`; phần sau `điều trị` được giữ cho NER/LLM phân loại, không có
+  rule cứng cho tên triệu chứng/chẩn đoán.
 
 ## 3. Qwen2.5-1.5B và handoff 7B giới hạn
 
@@ -120,7 +122,9 @@ Handoff được dựng lại sau stage 1.5B.
 
 7B chỉ được quyết định trên `target_candidate_ids`; entity sạch ngoài target
 không được sửa. Raw hint 1.5B là bằng chứng tham khảo, 7B phải kiểm tra lại bằng
-context và validator vẫn kiểm tra schema/offset/overlap.
+context và validator vẫn kiểm tra schema/offset/overlap. Action `DROP` chỉ xuất
+hiện trong `allowed_actions` khi 1.5B đã độc lập đề nghị `DROP`; không entity nào
+được bảo vệ hay bị xóa dựa trên danh sách surface hard-code.
 
 `build_handoff_requests()` trong `src/inference/rule/routing.py` tạo schema
 `7b_handoff_v2_grouped` với hai task.
@@ -301,7 +305,7 @@ Cờ LLM:
 | `src/inference/pipeline.py` | Điều phối stage và dữ liệu batch |
 | `src/inference/ner/engine.py` | ViHealthBERT + CRF + assertion inference |
 | `src/inference/ner/two_pass.py` | Suspicious region, Pass 2, merge |
-| `src/inference/rule/clinical.py` | Cleanup, boundary, hard-negative, medication rules |
+| `src/inference/rule/clinical.py` | Offset/boundary/assertion validation và cấu trúc danh sách thuốc |
 | `src/inference/rule/routing.py` | Tạo grouped 7B NER requests |
 | `src/inference/ner/reviewer_7b.py` | Batch/retry/validate/apply NER response |
 | `src/inference/selection/candidate_selector.py` | 7B linking rerank và code validation |
