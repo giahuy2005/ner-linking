@@ -101,7 +101,17 @@ Rule production nằm trong `src/inference/rule/clinical.py`, gồm:
 - Danh sách thuốc trước nhập viện: recover regimen; chỉ thuốc nhận
   `isHistorical`, triệu chứng chỉ định không kế thừa assertion của thuốc.
 
-## 3. Handoff và 7B NER
+## 3. Qwen2.5-1.5B và handoff 7B giới hạn
+
+Sau two-pass NER, 1.5B chỉ review candidate đã bị flag theo batch. Chính sách
+V9/V11 của notebook được giữ: `RETYPE` và đề nghị boundary chỉ là suggestion;
+`DROP` chỉ được áp dụng khi Python guarded-drop cho phép. Quyết định bị chặn
+được lưu trong `small_llm_review_hints`, entity gốc được giữ và route cho 7B.
+Handoff được dựng lại sau stage 1.5B.
+
+7B chỉ được quyết định trên `target_candidate_ids`; entity sạch ngoài target
+không được sửa. Raw hint 1.5B là bằng chứng tham khảo, 7B phải kiểm tra lại bằng
+context và validator vẫn kiểm tra schema/offset/overlap.
 
 `build_handoff_requests()` trong `src/inference/rule/routing.py` tạo schema
 `7b_handoff_v2_grouped` với hai task.
@@ -124,6 +134,10 @@ Nhiều target gần nhau được gom trong cùng context. Request giữ `reque
     "global_position": [100, 106],
     "relative_position": [80, 86],
     "assertions": [],
+    "small_llm_review_hints": [{
+      "requested_action": "DROP",
+      "status": "blocked_unsafe_drop"
+    }],
     "allowed_actions": ["KEEP", "DROP", "REPAIR_SPAN", "RETYPE"]
   }]
 }

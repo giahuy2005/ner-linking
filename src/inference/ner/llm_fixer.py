@@ -39,6 +39,18 @@ def _guarded_drop_allowed(entity: NerEntity) -> bool:
     )
 
 
+def _with_review_hint(entity: NerEntity, hint: dict, *, clear_flag: bool = False) -> NerEntity:
+    return NerEntity(
+        text=entity.text,
+        type=entity.type,
+        assertions=list(entity.assertions),
+        position=entity.position,
+        score=entity.score,
+        flag=None if clear_flag else entity.flag,
+        review_hints=[*entity.review_hints, hint],
+    )
+
+
 def _get_context(raw_text: str, position: tuple[int, int], radius: int = CONTEXT_RADIUS) -> str:
     start, end = position
     ctx_start = max(0, start - radius)
@@ -285,38 +297,37 @@ def fix_flagged_entities(
                 f"[llm_fixer] chặn DROP không đủ bằng chứng cho '{ent.text}', chuyển tiếp 7B",
                 file=sys.stderr,
             )
-            fixed.append(ent)
+            fixed.append(_with_review_hint(ent, {
+                "requested_action": "DROP",
+                "status": "blocked_unsafe_drop",
+                "guard_reason": ent.flag,
+            }))
             continue
 
         if suggestion.action == "keep":
             fixed.append(NerEntity(text=ent.text, type=ent.type, assertions=ent.assertions,
-                                    position=ent.position, score=ent.score, flag=None))
+                                    position=ent.position, score=ent.score, flag=None,
+                                    review_hints=list(ent.review_hints)))
             continue
 
         if suggestion.action == "retype":
-            assertions = [] if suggestion.type in LAB_TYPES else ent.assertions
-            fixed.append(NerEntity(text=ent.text, type=suggestion.type, assertions=assertions,
-                                    position=ent.position, score=ent.score, flag=None))
+            fixed.append(_with_review_hint(ent, {
+                "requested_action": "RETYPE_SUGGEST",
+                "status": "suggestion_only",
+                "original_type": ent.type,
+                "suggested_type": suggestion.type,
+            }))
             continue
 
         if suggestion.action == "retrim":
-            span = _locate_span(raw_text, ent.position, suggestion.text, context_radius)
-            if span is None:
-                print(f"[llm_fixer] retrim '{suggestion.text}' không tìm thấy quanh vị trí gốc "
-                      f"'{ent.text}' -> giữ nguyên entity", file=sys.stderr)
-                fixed.append(ent)
-                continue
-            other_spans = [other.position for other in entities if other is not ent]
-            if _overlaps(span, other_spans):
-                print(
-                    f"[llm_fixer] retrim '{suggestion.text}' overlap entity khác -> giữ nguyên",
-                    file=sys.stderr,
-                )
-                fixed.append(ent)
-                continue
-            assertions = [] if suggestion.type in LAB_TYPES else ent.assertions
-            fixed.append(NerEntity(text=suggestion.text, type=suggestion.type, assertions=assertions,
-                                    position=span, score=ent.score, flag=None))
+            # Notebook V9+: small LLM never mutates boundaries; it only routes
+            # the proposed repair to the constrained 7B target batch.
+            fixed.append(_with_review_hint(ent, {
+                "requested_action": "BOUNDARY_REVIEW_SUGGESTED",
+                "status": "suggestion_only",
+                "suggested_text": suggestion.text,
+                "suggested_type": suggestion.type,
+            }))
             continue
 
         # action lạ (không thuộc 4 giá trị) đã bị NerFixSuggestion.from_dict chặn ở trên -> không tới đây
@@ -387,29 +398,30 @@ def fix_flagged_entities_batch(
                 replacement = None
             else:
                 # Preserve the flag so the rebuilt handoff routes it to 7B.
-                replacement = entity
+                replacement = _with_review_hint(entity, {
+                    "requested_action": "DROP",
+                    "status": "blocked_unsafe_drop",
+                    "guard_reason": entity.flag,
+                })
         elif suggestion.action == "keep":
             replacement = NerEntity(
                 entity.text, entity.type, list(entity.assertions),
-                entity.position, entity.score, None,
+                entity.position, entity.score, None, list(entity.review_hints),
             )
         elif suggestion.action == "retype":
-            assertions = [] if suggestion.type in LAB_TYPES else list(entity.assertions)
-            replacement = NerEntity(
-                entity.text, suggestion.type, assertions,
-                entity.position, entity.score, None,
-            )
+            replacement = _with_review_hint(entity, {
+                "requested_action": "RETYPE_SUGGEST",
+                "status": "suggestion_only",
+                "original_type": entity.type,
+                "suggested_type": suggestion.type,
+            })
         elif suggestion.action == "retrim":
-            raw_text = raw_texts_by_id[record_id]
-            span = _locate_span(raw_text, entity.position, suggestion.text, context_radius)
-            occupied = [other.position for other_index, other in enumerate(results[record_id])
-                        if other_index != index]
-            if span is not None and not _overlaps(span, occupied):
-                assertions = [] if suggestion.type in LAB_TYPES else list(entity.assertions)
-                replacement = NerEntity(
-                    suggestion.text, suggestion.type, assertions,
-                    span, entity.score, None,
-                )
+            replacement = _with_review_hint(entity, {
+                "requested_action": "BOUNDARY_REVIEW_SUGGESTED",
+                "status": "suggestion_only",
+                "suggested_text": suggestion.text,
+                "suggested_type": suggestion.type,
+            })
         replacements.setdefault(record_id, {})[index] = replacement
 
     for record_id, by_index in replacements.items():

@@ -18,6 +18,7 @@ def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) ->
         "relative_position": [start - context_start, end - context_start],
         "assertions": list(entity.assertions),
         "score": round(float(entity.score), 6),
+        "small_llm_review_hints": list(entity.review_hints),
         "allowed_actions": ["KEEP", "DROP", "REPAIR_SPAN", "RETYPE"],
     }
 
@@ -36,7 +37,13 @@ def build_handoff_requests(
 ) -> dict:
     prefix = f"{request_prefix}-" if request_prefix else ""
     indexed = list(enumerate(entities))
-    targets = [(i, e) for i, e in indexed if e.flag or e.score < score_threshold]
+    # 7B may only edit this constrained set. Small-model blocked/suggestion
+    # decisions are always targets even if a deterministic boundary cleanup
+    # subsequently cleared the generic confidence flag.
+    targets = [
+        (i, e) for i, e in indexed
+        if e.flag or e.review_hints or e.score < score_threshold
+    ]
     groups: list[list[tuple[int, NerEntity]]] = []
     for item in targets:
         if not groups or item[1].position[0] - groups[-1][-1][1].position[1] > 120 \

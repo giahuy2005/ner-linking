@@ -116,6 +116,24 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
             audit_missing=not args.no_llm_recall_audit,
             batch_size=NER_FIXER_CONFIG.batch_size,
         )
+        handoff_targets = sum(
+            handoff.get("review_target_count", 0)
+            for handoff in pipeline.last_handoffs.values()
+        )
+        handoff_regions = sum(
+            handoff.get("review_region_count", 0)
+            for handoff in pipeline.last_handoffs.values()
+        )
+        handoff_recoveries = sum(
+            handoff.get("region_recovery_count", 0)
+            for handoff in pipeline.last_handoffs.values()
+        )
+        print(
+            "[cli] 1.5B -> 7B danger handoff: "
+            f"targets={handoff_targets}, regions={handoff_regions}, "
+            f"recoveries={handoff_recoveries}",
+            file=sys.stderr,
+        )
         fixer_llm.unload()
         print("[cli] 1.5B fixer xong, đã unload trước khi load 7B.", file=sys.stderr)
 

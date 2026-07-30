@@ -128,6 +128,8 @@ NER hoàn tất. Chỉ dùng năm type: {ENTITY_TYPES}.
 Quy tắc tuyệt đối:
 - Mọi text trả về phải là substring liên tục, nguyên văn trong context; offset là [start,end).
 - Không suy diễn entity không được nhắc trực tiếp. Không sửa candidate ngoài target_candidate_ids.
+- small_llm_review_hints là gợi ý/decision bị Python guard chặn từ Qwen 1.5B. Chỉ dùng làm
+  bằng chứng để review target tương ứng; tự xác minh bằng context, không áp dụng mù quáng.
 - Assertion chỉ gồm isHistorical/isNegated/isFamily và chỉ khi cue cục bộ rõ ràng.
 - Danh sách thuốc trước nhập viện: thuốc có isHistorical; triệu chứng chỉ định sau "điều trị"
   (ho, đau nhức, sốt đau, táo bón, lo âu, mất ngủ) không kế thừa isHistorical.

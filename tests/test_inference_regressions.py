@@ -80,6 +80,33 @@ class InferenceRegressionTests(unittest.TestCase):
         self.assertEqual(["đau đầu"], [item.text for item in result["doc"]])
         self.assertEqual("low_emission_confidence", result["doc"][0].flag)
         self.assertIn("doc", pipeline.last_handoffs)
+        target = pipeline.last_handoffs["doc"]["review_regions"][0]["targets"][0]
+        self.assertEqual("blocked_unsafe_drop",
+                         target["small_llm_review_hints"][0]["status"])
+
+    def test_small_fixer_retype_is_only_a_hint_for_constrained_7b_target(self):
+        raw = "Bệnh nhân có hội chứng lạ."
+        start = raw.index("hội chứng lạ")
+        entity = NerEntity(
+            "hội chứng lạ", "CHẨN_ĐOÁN", [], (start, start + len("hội chứng lạ")),
+            score=0.50, flag="low_emission_confidence",
+        )
+        llm = _BatchLlm([
+            '{"action":"retype","text":"hội chứng lạ","type":"TRIỆU_CHỨNG"}',
+        ])
+        pipeline = InferencePipeline(object())
+
+        result = pipeline.run_fixer_stage(
+            {"doc": raw}, {"doc": [entity]}, llm,
+            audit_missing=False,
+        )
+
+        # 1.5B cannot mutate the type; 7B receives the suggestion as evidence.
+        self.assertEqual("CHẨN_ĐOÁN", result["doc"][0].type)
+        target = pipeline.last_handoffs["doc"]["review_regions"][0]["targets"][0]
+        hint = target["small_llm_review_hints"][0]
+        self.assertEqual("RETYPE_SUGGEST", hint["requested_action"])
+        self.assertEqual("TRIỆU_CHỨNG", hint["suggested_type"])
 
     def test_low_confidence_entity_is_flagged_for_1_5b(self):
         kept, dropped = filter_entities([{

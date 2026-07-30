@@ -88,6 +88,7 @@ def _copy(entity: NerEntity, *, start: int | None = None, end: int | None = None
                   entity.position[1] if end is None else end),
         score=entity.score,
         flag=flag,
+        review_hints=list(entity.review_hints),
     )
 
 
@@ -279,6 +280,7 @@ def _recover_known_surfaces(raw_text: str, entities: list[NerEntity], logs: list
                 if span[0] < entity.position[1] and span[1] > entity.position[0]
             ]
             assertions = sorted({item for entity in overlaps for item in entity.assertions})
+            review_hints = [hint for entity in overlaps for hint in entity.review_hints]
             score = max((entity.score for entity in overlaps), default=0.9)
             result = [entity for entity in result if entity not in overlaps]
             recovered = NerEntity(
@@ -288,6 +290,7 @@ def _recover_known_surfaces(raw_text: str, entities: list[NerEntity], logs: list
                 position=span,
                 score=score,
                 flag=None,
+                review_hints=review_hints,
             )
             recovered = _repair_assertion_scope(raw_text, recovered)
             result.append(recovered)
