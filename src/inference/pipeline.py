@@ -1,10 +1,12 @@
-"""Điều phối end-to-end: two-pass NER -> 7B NER review -> linking -> BTC JSON.
+"""Điều phối: two-pass NER -> 1.5B fixer -> 7B review -> linking -> BTC JSON.
 
-THIẾT KẾ TÁCH STAGE để 7B được load đúng một lần cho cả batch: model review
-NER trước, sau đó tiếp tục rerank candidate linking rồi mới unload.
+Hai LLM được load tuần tự: Qwen2.5-1.5B sửa batch rồi unload; Qwen 7B review
+NER, rerank candidate linking, rồi mới unload.
 
 Luồng dùng đúng cho batch (xem cli.py):
     entities_by_id = pipeline.run_ner_stage(raw_texts_by_id)
+    fixer_1_5b.load(); entities_by_id = pipeline.run_fixer_stage(...)
+    fixer_1_5b.unload()
     reviewer_7b.load(); entities_by_id = pipeline.run_7b_ner_stage(...)
     candidates_by_id = pipeline.run_linking_stage(entities_by_id, selector_llm=reviewer_7b)
     reviewer_7b.unload()
@@ -81,6 +83,7 @@ class InferencePipeline:
         self.top_k_candidates = top_k_candidates
         self.last_two_pass_results = {}
         self.last_handoffs = {}
+        self.last_fixer_logs = []
         self.last_7b_logs = []
 
     @classmethod
@@ -175,12 +178,51 @@ class InferencePipeline:
         fixer_llm,
         *,
         audit_missing: bool = True,
+        batch_size: int = 4,
     ) -> dict[str, list[NerEntity]]:
-        """Backward-compatible alias for :meth:`run_7b_ner_stage`."""
-        return self.run_7b_ner_stage(
-            raw_texts_by_id, entities_by_id, fixer_llm,
-            include_recovery=audit_missing,
+        """Run the notebook small-model stage before the separate 7B stage.
+
+        Qwen2.5-1.5B reviews candidates flagged by the deterministic gates in
+        batches.  Its output is schema/offset checked, then the optional recall
+        audit is also batched.  Final deterministic cleanup prevents an unsafe
+        small-model suggestion from reaching 7B/linking unchecked.
+        """
+        from .ner.llm_fixer import (
+            audit_missing_entities_batch,
+            fix_flagged_entities_batch,
         )
+        from .rule.clinical import deterministic_cleanup
+        from .rule.routing import build_handoff_requests
+
+        fixed = fix_flagged_entities_batch(
+            raw_texts_by_id,
+            entities_by_id,
+            fixer_llm,
+            batch_size=batch_size,
+        )
+        if audit_missing:
+            fixed = audit_missing_entities_batch(
+                raw_texts_by_id,
+                fixed,
+                fixer_llm,
+                batch_size=batch_size,
+            )
+
+        cleaned = {}
+        logs = []
+        for record_id, entities in fixed.items():
+            cleaned[record_id], record_logs = deterministic_cleanup(
+                raw_texts_by_id[record_id], entities
+            )
+            logs.extend({"record_id": record_id, **item} for item in record_logs)
+            previous = self.last_two_pass_results.get(record_id)
+            regions = previous.regions if previous is not None else []
+            self.last_handoffs[record_id] = build_handoff_requests(
+                raw_texts_by_id[record_id], cleaned[record_id], regions,
+                request_prefix=record_id,
+            )
+        self.last_fixer_logs = logs
+        return cleaned
 
     def run_7b_ner_stage(
         self,

@@ -1,4 +1,4 @@
-"""CLI chạy two-pass NER, 7B NER review và 7B-assisted linking.
+"""CLI chạy two-pass NER, 1.5B fixer, 7B review và 7B-assisted linking.
 
 Qwen 7B được load một lần cho toàn bộ batch: trước tiên review/recover NER,
 sau đó chọn trong candidate do RxNorm/ICD-10 retriever trả về, rồi mới unload.
@@ -12,9 +12,9 @@ Ví dụ dùng:
     python -m src.inference.cli --input-dir data/public_test --output-dir output \\
         --with-rxnorm --with-icd10
 
-    # batch full pipeline + 7B NER review
+    # pipeline notebook + 1.5B fixer + 7B review/linking
     python -m src.inference.cli --input-dir data/public_test --output-dir output \\
-        --with-rxnorm --with-icd10 --with-llm-7b
+        --with-llm-fixer --with-llm-7b --with-rxnorm --with-icd10
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-llm-7b", action="store_true",
                         help="bật Qwen 7B cho NER review/recovery và linking rerank")
     parser.add_argument("--with-llm-fixer", action="store_true",
-                        help="alias cũ của --with-llm-7b")
+                        help="bật Qwen2.5-1.5B fixer sau NER, trước reviewer 7B")
     parser.add_argument("--with-llm-selector", action="store_true",
-                        help="alias cũ của --with-llm-7b")
+                        help="bật riêng Qwen 7B rerank candidate linking")
     parser.add_argument(
         "--no-llm-recall-audit",
         action="store_true",
@@ -101,16 +101,37 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
     # ---- Stage 1: NER cho toàn bộ batch (không LLM) ----
     entities_by_id = pipeline.run_ner_stage(raw_texts_by_id, **predict_kwargs)
 
-    # ---- Stage 2 (optional): grouped 7B NER review/recovery ----
-    use_7b = args.with_llm_7b or args.with_llm_fixer or args.with_llm_selector
+    # ---- Stage 2 (optional): notebook Qwen2.5-1.5B guarded fixer ----
+    if args.with_llm_fixer:
+        from ..llm.backend import LocalLLM
+        from ..llm.config import NER_FIXER_CONFIG
+
+        print("[cli] Đang load Qwen2.5-1.5B NER fixer...", file=sys.stderr)
+        fixer_llm = LocalLLM(NER_FIXER_CONFIG)
+        fixer_llm.load()
+        entities_by_id = pipeline.run_fixer_stage(
+            raw_texts_by_id,
+            entities_by_id,
+            fixer_llm,
+            audit_missing=not args.no_llm_recall_audit,
+            batch_size=NER_FIXER_CONFIG.batch_size,
+        )
+        fixer_llm.unload()
+        print("[cli] 1.5B fixer xong, đã unload trước khi load 7B.", file=sys.stderr)
+
+    # ---- Stage 3 (optional): grouped 7B NER review/recovery ----
+    use_7b_reviewer = args.with_llm_7b
+    use_7b_selector = args.with_llm_7b or args.with_llm_selector
     reviewer_llm = None
-    if use_7b:
+    if use_7b_reviewer or use_7b_selector:
         from ..llm.backend import LocalLLM
         from ..llm.config import NER_REVIEWER_7B_CONFIG
 
-        print("[cli] Đang load 7B NER reviewer...", file=sys.stderr)
+        print("[cli] Đang load Qwen 7B...", file=sys.stderr)
         reviewer_llm = LocalLLM(NER_REVIEWER_7B_CONFIG)
         reviewer_llm.load()
+
+    if use_7b_reviewer:
         entities_by_id = pipeline.run_7b_ner_stage(
             raw_texts_by_id,
             entities_by_id,
@@ -121,16 +142,16 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
         )
         print("[cli] 7B NER reviewer xong; giữ model để rerank linking.", file=sys.stderr)
 
-    # ---- Stage 3: retriever hiện tại -> optional 7B chọn trong candidate ----
+    # ---- Stage 4: retriever hiện tại -> optional 7B chọn trong candidate ----
     candidates_by_id = pipeline.run_linking_stage(
         entities_by_id,
-        selector_llm=reviewer_llm,
+        selector_llm=reviewer_llm if use_7b_selector else None,
         raw_texts_by_id=raw_texts_by_id,
     )
 
     if reviewer_llm is not None:
         reviewer_llm.unload()
-        print("[cli] 7B linking rerank xong, đã unload.", file=sys.stderr)
+        print("[cli] 7B xong, đã unload.", file=sys.stderr)
 
     return pipeline.build_outputs(entities_by_id, candidates_by_id)
 

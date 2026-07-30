@@ -253,20 +253,22 @@ python -m src.inference.cli \
   --with-rxnorm --with-icd10
 ```
 
-Pipeline đầy đủ, gồm 7B NER và 7B linking:
+Pipeline đầy đủ đúng thứ tự notebook, gồm 1.5B fixer, 7B NER và 7B linking:
 
 ```bash
 python -m src.inference.cli \
   --input-dir data/public_test \
   --output-dir output \
-  --with-rxnorm --with-icd10 --with-llm-7b
+  --with-llm-fixer --with-llm-7b \
+  --with-rxnorm --with-icd10
 ```
 
-Cờ tương thích:
+Cờ LLM:
 
-- `--with-llm-fixer`: alias của `--with-llm-7b`.
-- `--with-llm-selector`: alias của `--with-llm-7b`.
-- `--no-llm-recall-audit`: tắt recovery NER, vẫn review NER và rerank linking.
+- `--with-llm-fixer`: chạy riêng `Qwen2.5-1.5B-Instruct` sau two-pass NER.
+- `--with-llm-7b`: chạy reviewer/recovery 7B rồi dùng cùng model rerank linking.
+- `--with-llm-selector`: chỉ dùng 7B rerank linking, không chạy 7B NER review.
+- `--no-llm-recall-audit`: tắt recovery NER của các stage LLM được bật.
 - `--no-repair-gate`: tắt repair gate để A/B test.
 
 ## 8. Module chịu trách nhiệm

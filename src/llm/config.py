@@ -1,6 +1,6 @@
 """Config cho model local dùng để sửa NER và chọn candidate linking.
 
-RÀNG BUỘC VÒNG 1: model self-host tối đa 9B tham số — Qwen3-1.7B và
+RÀNG BUỘC VÒNG 1: model self-host tối đa 9B tham số — Qwen2.5-1.5B và
 Qwen2.5-7B-Instruct đều nằm trong giới hạn khi chạy TÁCH BIỆT (không
 load đồng thời 2 model lên cùng 1 GPU, xem backend.py: load() ->
 dùng -> unload() trước khi load model kia).
@@ -35,14 +35,19 @@ class LocalModelConfig:
 #     huggingface-cli download). KHÔNG cần sửa gì khác ở backend.py.
 
 NER_FIXER_CONFIG = LocalModelConfig(
-    model_id="Qwen/Qwen3-1.7B",
+    # Giữ đúng small-model stage của notebook V11.
+    model_id="Qwen/Qwen2.5-1.5B-Instruct",
     revision=None,
     cache_dir=None,
-    load_in_4bit=True,
+    load_in_4bit=False,
     local_files_only=False,
-    max_new_tokens=512,
-    supports_thinking=True,
-    enable_thinking=False,  # tắt thinking: chỉ cần chọn boundary/type, không cần suy luận dài
+    max_new_tokens=240,
+    supports_thinking=False,
+    enable_thinking=False,
+    batch_size=4,
+    temperature=0.0,
+    max_context_length=8192,
+    retry_rounds=1,
 )
 
 NER_REVIEWER_7B_CONFIG = LocalModelConfig(

@@ -6,6 +6,7 @@ from src.inference.ner.llm_fixer import _locate_span, audit_missing_entities
 from src.inference.ner.repair_gate import filter_entities
 from src.inference.schemas import NerEntity
 from src.inference.selection.candidate_selector import select_candidates, select_candidates_many
+from src.llm.config import NER_FIXER_CONFIG
 
 
 class _StaticLlm:
@@ -34,7 +35,53 @@ class _BatchLlm:
 
 
 class InferenceRegressionTests(unittest.TestCase):
-    def test_low_confidence_entity_is_flagged_for_1_7b(self):
+    def test_small_fixer_uses_notebook_qwen25_15b_model(self):
+        self.assertEqual("Qwen/Qwen2.5-1.5B-Instruct", NER_FIXER_CONFIG.model_id)
+        self.assertFalse(NER_FIXER_CONFIG.supports_thinking)
+
+    def test_small_fixer_stage_is_distinct_from_7b_reviewer(self):
+        raw = "Bệnh nhân sốt."
+        start = raw.index("sốt")
+        entity = NerEntity(
+            "sốt", "TRIỆU_CHỨNG", [], (start, start + 3),
+            score=0.4, flag="low_emission_confidence",
+        )
+        llm = _BatchLlm([
+            '{"action":"keep","text":"sốt","type":"TRIỆU_CHỨNG"}',
+        ])
+        pipeline = InferencePipeline(object())
+
+        result = pipeline.run_fixer_stage(
+            {"doc": raw}, {"doc": [entity]}, llm,
+            audit_missing=False, batch_size=4,
+        )
+
+        self.assertEqual(["sốt"], [item.text for item in result["doc"]])
+        self.assertIsNone(result["doc"][0].flag)
+        self.assertEqual(1, llm.calls)
+
+    def test_small_fixer_blocks_unsafe_drop_for_7b_handoff(self):
+        raw = "Bệnh nhân đau đầu."
+        start = raw.index("đau đầu")
+        entity = NerEntity(
+            "đau đầu", "TRIỆU_CHỨNG", [], (start, start + len("đau đầu")),
+            score=0.60, flag="low_emission_confidence",
+        )
+        llm = _BatchLlm([
+            '{"action":"drop","text":"đau đầu","type":"TRIỆU_CHỨNG"}',
+        ])
+        pipeline = InferencePipeline(object())
+
+        result = pipeline.run_fixer_stage(
+            {"doc": raw}, {"doc": [entity]}, llm,
+            audit_missing=False,
+        )
+
+        self.assertEqual(["đau đầu"], [item.text for item in result["doc"]])
+        self.assertEqual("low_emission_confidence", result["doc"][0].flag)
+        self.assertIn("doc", pipeline.last_handoffs)
+
+    def test_low_confidence_entity_is_flagged_for_1_5b(self):
         kept, dropped = filter_entities([{
             "text": "lazer (tbm)",
             "type": "TÊN_XÉT_NGHIỆM",

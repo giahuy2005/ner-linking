@@ -1,4 +1,4 @@
-"""Dùng LocalLLM 1.7B để sửa entity bị repair_gate flag và audit omissions.
+"""Dùng Qwen2.5-1.5B để sửa entity bị repair_gate flag và audit omissions.
 
 Repair chỉ gọi theo entity nghi ngờ; recall audit gọi một lần/document rồi
 lọc đề xuất bằng exact substring, offset, overlap và schema deterministic.
@@ -26,6 +26,17 @@ CONTEXT_RADIUS = 60  # số ký tự lấy thêm mỗi bên entity làm context 
 MAX_AUDIT_DOCUMENT_CHARS = 12000
 MAX_AUDIT_ADDITIONS = 12
 LAB_TYPES = {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}
+
+
+def _guarded_drop_allowed(entity: NerEntity) -> bool:
+    """Recall-first DROP gate matching the notebook's small-model policy."""
+    compact_length = len("".join(entity.text.split()))
+    return bool(
+        (entity.flag == "suspect_truncated_diagnosis"
+         and entity.score < 0.35 and compact_length < 6)
+        or (entity.flag == "low_emission_confidence"
+            and entity.score < 0.10 and compact_length < 4)
+    )
 
 
 def _get_context(raw_text: str, position: tuple[int, int], radius: int = CONTEXT_RADIUS) -> str:
@@ -127,7 +138,7 @@ def audit_missing_entities(
     *,
     max_document_chars: int = MAX_AUDIT_DOCUMENT_CHARS,
 ) -> list[NerEntity]:
-    """Ask 1.7B for high-precision omissions, then validate deterministically."""
+    """Ask 1.5B for high-precision omissions, then validate deterministically."""
     if len(raw_text) > max_document_chars:
         print(
             f"[llm_audit] bỏ audit document dài {len(raw_text)} > {max_document_chars} ký tự",
@@ -268,6 +279,13 @@ def fix_flagged_entities(
             continue
 
         if suggestion.action == "drop":
+            if _guarded_drop_allowed(ent):
+                continue
+            print(
+                f"[llm_fixer] chặn DROP không đủ bằng chứng cho '{ent.text}', chuyển tiếp 7B",
+                file=sys.stderr,
+            )
+            fixed.append(ent)
             continue
 
         if suggestion.action == "keep":
@@ -305,3 +323,99 @@ def fix_flagged_entities(
         fixed.append(ent)
 
     return fixed
+
+
+def fix_flagged_entities_batch(
+    raw_texts_by_id: dict[str, str],
+    entities_by_id: dict[str, list[NerEntity]],
+    llm: LocalLLM,
+    *,
+    batch_size: int = 4,
+    context_radius: int = CONTEXT_RADIUS,
+) -> dict[str, list[NerEntity]]:
+    """Batch the guarded Qwen2.5-1.5B fixer across the complete input set.
+
+    Only candidates already marked suspicious are sent to the small model.
+    Invalid JSON/schema, inexact retrims and overlapping repairs all fall back
+    to the original entity, preserving the notebook's recall-first policy.
+    """
+    results = {record_id: list(entities) for record_id, entities in entities_by_id.items()}
+    jobs: list[tuple[str, int, NerEntity]] = []
+    prompts = []
+    for record_id, entities in results.items():
+        raw_text = raw_texts_by_id[record_id]
+        for index, entity in enumerate(entities):
+            if entity.flag is None:
+                continue
+            context = _get_context(raw_text, entity.position, context_radius)
+            prompts.append(build_ner_fixer_prompt(
+                context, entity.text, entity.type, entity.flag
+            ))
+            jobs.append((record_id, index, entity))
+
+    if not prompts:
+        return results
+    try:
+        if hasattr(llm, "generate_batch"):
+            raw_outputs = llm.generate_batch(prompts, batch_size=batch_size)
+        else:
+            raw_outputs = [llm.generate(system, user) for system, user in prompts]
+        if len(raw_outputs) != len(prompts):
+            raise ValueError(
+                f"batch returned {len(raw_outputs)} outputs for {len(prompts)} prompts"
+            )
+    except Exception as exc:
+        print(f"[llm_fixer] batch generation lỗi: {exc} -> giữ nguyên batch", file=sys.stderr)
+        return results
+
+    replacements: dict[str, dict[int, NerEntity | None]] = {}
+    for (record_id, index, entity), raw_output in zip(jobs, raw_outputs):
+        try:
+            suggestion = NerFixSuggestion.from_dict(extract_json(raw_output))
+        except Exception as exc:
+            print(
+                f"[llm_fixer] lỗi parse '{entity.text}': {exc} -> giữ nguyên",
+                file=sys.stderr,
+            )
+            continue
+        if suggestion is None:
+            continue
+
+        replacement: NerEntity | None = entity
+        if suggestion.action == "drop":
+            if _guarded_drop_allowed(entity):
+                replacement = None
+            else:
+                # Preserve the flag so the rebuilt handoff routes it to 7B.
+                replacement = entity
+        elif suggestion.action == "keep":
+            replacement = NerEntity(
+                entity.text, entity.type, list(entity.assertions),
+                entity.position, entity.score, None,
+            )
+        elif suggestion.action == "retype":
+            assertions = [] if suggestion.type in LAB_TYPES else list(entity.assertions)
+            replacement = NerEntity(
+                entity.text, suggestion.type, assertions,
+                entity.position, entity.score, None,
+            )
+        elif suggestion.action == "retrim":
+            raw_text = raw_texts_by_id[record_id]
+            span = _locate_span(raw_text, entity.position, suggestion.text, context_radius)
+            occupied = [other.position for other_index, other in enumerate(results[record_id])
+                        if other_index != index]
+            if span is not None and not _overlaps(span, occupied):
+                assertions = [] if suggestion.type in LAB_TYPES else list(entity.assertions)
+                replacement = NerEntity(
+                    suggestion.text, suggestion.type, assertions,
+                    span, entity.score, None,
+                )
+        replacements.setdefault(record_id, {})[index] = replacement
+
+    for record_id, by_index in replacements.items():
+        results[record_id] = [
+            by_index.get(index, entity)
+            for index, entity in enumerate(results[record_id])
+            if by_index.get(index, entity) is not None
+        ]
+    return results
