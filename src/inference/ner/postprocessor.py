@@ -1,13 +1,4 @@
-"""Làm sạch text đầu vào + convert word-tag BIO -> entity + dedup/merge
-kết quả giữa các chunk overlap.
-
-LƯU Ý: bản `clean_text_for_inference` dưới đây là bản ĐẦY ĐỦ (từ cell 7
-của predict_ner_crf_final.ipynb). Notebook gốc có 1 bản rút gọn định
-nghĩa SAU đó (cell 15) vô tình ghi đè bản này — nghĩa là lúc chạy
-predict() thật sự trong notebook, các rule xử lý case bẩn (VS98.3,
-dấu câu dính chữ, v.v.) KHÔNG được áp dụng. Ở đây dùng lại bản đầy đủ
-vì rõ ràng đó mới là bản có chủ đích (xem markdown mô tả ở đầu notebook).
-"""
+"""Offset-safe BIO helpers synchronized with the final notebook predictor."""
 
 from __future__ import annotations
 
@@ -16,44 +7,15 @@ import re
 ASSERTION_PRIORITY = ["isNegated", "isFamily", "isHistorical"]
 
 
+def get_assertion_threshold(threshold, label: str) -> float:
+    """Support one global threshold or notebook-style per-label thresholds."""
+    if isinstance(threshold, dict):
+        return float(threshold.get(label, 0.5))
+    return float(threshold)
+
+
 def clean_text_for_inference(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Thêm space sau dấu câu khi bị dính chữ, không phá số thập phân
-    text = re.sub(r'(?<!\d)\.(?=[^\s\d])', '. ', text)
-    text = re.sub(r'(?<!\d),(?=[^\s\d])', ', ', text)
-    text = re.sub(r'([:;])(?=\S)', r'\1 ', text)
-
-    # Sửa lại decimal lỡ bị tách ở bước trên
-    text = re.sub(r'(?<=\d)\.\s+(?=\d)', '.', text)
-    text = re.sub(r'(?<=\d),\s+(?=\d)', ',', text)
-
-    # Tách chữ-số dính liền kiểu chỉ số sinh tồn viết tắt
-    # ("VS98.3 12987 56 18 99RA" -> "VS 98.3 12987 56 18 99 RA")
-    # Chỉ trigger khi >=2 chữ HOA liên tiếp cạnh số, để không đụng B12, T2, O2.
-    text = re.sub(r'([A-ZĐ]{2,})(?=\d)', r'\1 ', text)
-    text = re.sub(r'(?<=\d)([A-ZĐ]{2,})', r' \1', text)
-
-    # Tách 1 số ranh giới mất khoảng trắng làm BIO word-level bất khả thi.
-    text = re.sub(
-        r'(?i)\b(bị|đang|không|chưa|có)(?=(?:chảy|đau|sốt|ho|khó|phù|nôn|tiểu|vàng|ban)\b)',
-        r'\1 ',
-        text,
-    )
-    text = re.sub(r'(?i)(cảm\s+giác)(?=(?:khó|đau|nóng|tê|rợn)\b)', r'\1 ', text)
-    text = re.sub(r'(?i)\b(CT|MRI|ECG)(?=(?:chưa|không|ghi|cho|phát)\b)', r'\1 ', text)
-    text = re.sub(
-        r'(?i)(?<=\d)(?=(?:bạch\s*cầu|hồng\s*cầu|tiểu\s*cầu|kali|natri|clo)\b)',
-        ' ',
-        text,
-    )
-
-    # Xóa bullet chỉ ở đầu dòng, không đụng gạch trong từ (x-quang, 88-92)
-    text = re.sub(r'(?m)^\s*[-•]\s+', '', text)
-
-    lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in text.split("\n")]
-    text = "\n".join(line for line in lines if line)
-
+    """Do not mutate input; every returned position remains a raw-text offset."""
     return text
 
 

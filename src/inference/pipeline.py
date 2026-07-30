@@ -134,14 +134,44 @@ class InferencePipeline:
         **predict_kwargs,
     ) -> dict[str, list[NerEntity]]:
         from .ner.two_pass import run_two_pass_ner
+        from .ner.sectioner import split_sections_by_header
         from .rule.clinical import apply_clinical_rules
         from .rule.routing import build_handoff_requests
 
         entities_by_id: dict[str, list[NerEntity]] = {}
         for rid, raw_text in raw_texts_by_id.items():
-            cleaned = clean_text_for_inference(raw_text)
-            entities = self.ner_engine.predict_text(cleaned, **predict_kwargs)
-            pass1 = inference_io.remap_entities_to_raw(raw_text, cleaned, entities)
+            pass1 = []
+            for block in split_sections_by_header(raw_text).values():
+                block_text = block["body"]
+                if not block_text.strip():
+                    continue
+                cleaned = clean_text_for_inference(block_text)
+                if len(cleaned) != len(block_text):
+                    raise ValueError("clean_text_for_inference changed block length")
+                local_entities = self.ner_engine.predict_text(cleaned, **predict_kwargs)
+                block_start = int(block["start"])
+                for entity in local_entities:
+                    local_start, local_end = entity.position
+                    global_start = block_start + local_start
+                    global_end = block_start + local_end
+                    if not (0 <= local_start < local_end <= len(block_text)):
+                        continue
+                    if block_text[local_start:local_end] != entity.text:
+                        continue
+                    if raw_text[global_start:global_end] != entity.text:
+                        continue
+                    pass1.append(NerEntity(
+                        text=entity.text,
+                        type=entity.type,
+                        assertions=list(entity.assertions),
+                        position=(global_start, global_end),
+                        score=entity.score,
+                        flag=entity.flag,
+                        review_hints=list(entity.review_hints),
+                    ))
+            pass1.sort(key=lambda entity: (
+                entity.position[0], entity.position[1], entity.type,
+            ))
             if two_pass:
                 def predict_region(region_text: str) -> list[NerEntity]:
                     cleaned_region = clean_text_for_inference(region_text)

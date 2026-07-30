@@ -183,8 +183,14 @@ def make_word_chunks(tokens: list[str], tokenizer, max_len: int = 256, overlap_w
 
 
 def is_valid_char_span(offsets, ws: int, we: int) -> bool:
+    """Require every word offset in the entity to be valid and monotonic."""
     if ws < 0 or we <= ws or we > len(offsets):
         return False
-    if offsets[ws][0] is None or offsets[we - 1][1] is None:
-        return False
+    spans = offsets[ws:we]
+    for start, end in spans:
+        if start is None or end is None or start < 0 or end <= start:
+            return False
+    for previous, current in zip(spans, spans[1:]):
+        if current[0] < previous[1]:
+            return False
     return True

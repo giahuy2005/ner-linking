@@ -44,7 +44,7 @@ DEFAULT_VNCORENLP_JAR = Path("vncorenlp/VnCoreNLP-1.1.1.jar")
 # Suy luận / chunking
 # ---------------------------------------------------------------------------
 MAX_LEN = 256
-OVERLAP_WORDS = 32
+OVERLAP_WORDS = 50
 ASSERTION_THRESHOLD = 0.5
 SINGLE_ASSERTION = False  # True nếu submit yêu cầu ép 1 assertion/entity
 

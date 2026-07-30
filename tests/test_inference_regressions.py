@@ -3,6 +3,8 @@ import unittest
 from src.inference import io as inference_io
 from src.inference.pipeline import InferencePipeline
 from src.inference.ner.llm_fixer import _locate_span, audit_missing_entities
+from src.inference.ner import offset_mapper, postprocessor
+from src.inference.ner.sectioner import split_sections_by_header
 from src.inference.ner.repair_gate import filter_entities
 from src.inference.schemas import NerEntity
 from src.inference.selection.candidate_selector import select_candidates, select_candidates_many
@@ -35,6 +37,66 @@ class _BatchLlm:
 
 
 class InferenceRegressionTests(unittest.TestCase):
+    def test_notebook_offset_validation_checks_every_internal_word(self):
+        self.assertFalse(offset_mapper.is_valid_char_span(
+            [(0, 3), (None, None), (7, 10)], 0, 3,
+        ))
+        self.assertFalse(offset_mapper.is_valid_char_span(
+            [(0, 5), (4, 8)], 0, 2,
+        ))
+        self.assertTrue(offset_mapper.is_valid_char_span(
+            [(0, 3), (4, 8)], 0, 2,
+        ))
+
+    def test_notebook_assertion_threshold_can_be_per_label(self):
+        thresholds = {"isHistorical": 0.55, "isNegated": 0.65}
+        self.assertEqual(0.55, postprocessor.get_assertion_threshold(
+            thresholds, "isHistorical",
+        ))
+        self.assertEqual(0.5, postprocessor.get_assertion_threshold(
+            thresholds, "isFamily",
+        ))
+
+    def test_notebook_qa_is_one_offset_preserving_block(self):
+        raw = "Hỏi: Tôi bị sốt.\r\nTrả lời: Bạn nên đi khám."
+        blocks = split_sections_by_header(raw)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual(raw, blocks[0]["body"])
+        self.assertEqual((0, len(raw)), (blocks[0]["start"], blocks[0]["end"]))
+
+    def test_notebook_repeated_emr_sections_remain_separate_and_keep_heading(self):
+        raw = "1. Tiền sử bệnh\nsốt\n1. Tiền sử bệnh\nđau"
+        blocks = split_sections_by_header(raw)
+        self.assertEqual(2, len(blocks))
+        self.assertTrue(all(block["body"].lstrip().startswith("1. Tiền sử bệnh")
+                            for block in blocks.values()))
+        self.assertEqual(raw, "".join(block["body"] for block in blocks.values()))
+
+    def test_pipeline_predicts_emr_blocks_and_maps_offsets_to_raw(self):
+        raw = "1. Tiền sử bệnh\nsốt\n2. Tiền sử bệnh hiện tại\nđau"
+
+        class _BlockEngine:
+            def __init__(self):
+                self.calls = []
+
+            def predict_text(self, text, **_kwargs):
+                self.calls.append(text)
+                for surface in ("sốt", "đau"):
+                    if surface in text:
+                        start = text.index(surface)
+                        return [NerEntity(surface, "TRIỆU_CHỨNG", [],
+                                          (start, start + len(surface)), 0.9)]
+                return []
+
+        engine = _BlockEngine()
+        pipeline = InferencePipeline(engine)
+        result = pipeline.run_ner_stage({"doc": raw}, two_pass=False)["doc"]
+
+        self.assertEqual(2, len(engine.calls))
+        self.assertEqual(["sốt", "đau"], [entity.text for entity in result])
+        self.assertTrue(all(raw[start:end] == entity.text for entity in result
+                            for start, end in [entity.position]))
+
     def test_small_fixer_uses_notebook_qwen25_15b_model(self):
         self.assertEqual("Qwen/Qwen2.5-1.5B-Instruct", NER_FIXER_CONFIG.model_id)
         self.assertFalse(NER_FIXER_CONFIG.supports_thinking)

@@ -4,11 +4,12 @@
 > là nguồn chuẩn cho phần NER. Luồng production hiện tại là:
 
 ```text
-NER Pass 1
+NER Pass 1 (global BIO centrality merge, overlap 50)
   -> rule audit + suspicious regions
   -> NER Pass 2 trên các region
   -> exact dedup + conflict resolution
   -> deterministic cleanup/rule recovery
+  -> Qwen2.5-1.5B guarded batch + danger hints
   -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
   -> Qwen2.5-7B NER batch (retry riêng request/batch lỗi)
   -> exact-span/type/assertion/overlap validation
@@ -28,12 +29,13 @@ và linking fallback theo thứ tự retriever. Các rule deterministic nằm tr
 
 ```text
 Nhiều file .txt
-  -> clean text + ánh xạ offset về raw text
+  -> giữ nguyên raw text; QA chạy nguyên file, EMR tách block và giữ heading
   -> NER Pass 1: ViHealthBERT + CRF + assertion
   -> rule audit + phát hiện suspicious regions
   -> NER Pass 2 chỉ trên các region
   -> exact dedup + merge + conflict resolution
   -> deterministic cleanup/rule recovery
+  -> Qwen2.5-1.5B guarded fixer theo batch
   -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
   -> Qwen2.5-7B review/recover NER theo batch
   -> validator exact span/type/assertion/overlap
@@ -64,6 +66,13 @@ Ba type `TRIỆU_CHỨNG`, `TÊN_XÉT_NGHIỆM` và
 `NerEngine` dùng VnCoreNLP để word-segment, ViHealthBERT làm encoder, linear
 head tạo BIO emission và CRF để decode chuỗi tag. Assertion head pool entity
 cùng context xung quanh để dự đoán `isHistorical`, `isNegated`, `isFamily`.
+
+Với document dài, mỗi global word lấy BIO tag từ chunk nơi word nằm xa biên
+nhất; sau đó entity mới được extract đúng một lần trên chuỗi BIO toàn document.
+Không còn extract riêng từng chunk rồi bỏ entity ở đầu chunk. Assertion của một
+entity được weighted-average từ mọi chunk chứa trọn entity theo centrality.
+Overlap mặc định là 50 word, khớp notebook. `clean_text_for_inference()` không
+thay đổi ký tự nên offset luôn trỏ trực tiếp vào raw text.
 
 Năm type hợp lệ:
 

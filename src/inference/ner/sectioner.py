@@ -1,92 +1,117 @@
-"""Tách raw_text .txt thành các section (EMR 3 header + QA 2 marker).
-
-Header nhận diện theo NỘI DUNG (không dựa số thứ tự đầu dòng) vì data
-thật lẫn cả mục lục QA không liên quan (vd "1. Bệnh dại có lây không?").
-"""
+"""Offset-preserving EMR/QA sectioning from the final prediction notebook."""
 
 from __future__ import annotations
 
 import re
-
-# Section 2 chấp nhận cả "Bệnh sử" trần (không có "hiện tại").
-_SECTION_PATTERNS = [
-    (1, re.compile(r'^\s*tiền\s*sử\s*bệnh(?:\s*lý)?\s*$', re.IGNORECASE)),
-    (2, re.compile(r'^\s*(?:tiền\s*sử\s*bệnh\s*hiện\s*tại|bệnh\s*sử(?:\s*hiện\s*tại)?)\s*$', re.IGNORECASE)),
-    (3, re.compile(r'^\s*(?:đánh\s*giá|khám)\s*tại\s*bệnh\s*viện\s*$', re.IGNORECASE)),
-]
+from typing import Any
 
 SECTION_TITLES = {
     0: "KHÔNG_XÁC_ĐỊNH",
     1: "Tiền sử bệnh",
     2: "Tiền sử bệnh hiện tại",
     3: "Đánh giá tại bệnh viện",
-    4: "Hỏi (QA)",
-    5: "Trả lời (QA)",
+    4: "Hỏi đáp (QA)",
 }
 
-# Dòng ứng viên header EMR phải NGẮN (<=40 ký tự) và không chứa dấu câu
-# của câu hỏi/liệt kê ('?', '!', ':', '•') -> tự loại mục lục kiểu
-# "1. Bệnh dại có lây không?" và dòng nhiễm bẩn kiểu
-# "3. Đánh giá tại bệnh viện • Tim đập nhanh..." mà không tạo split sai.
-_CANDIDATE_LINE_RE = re.compile(
-    r'(?m)^[ \t]*(?:[0-9]{1,2}[.)]|[-•])?[ \t]*([^\n?!:•]{1,40}?)[ \t]*$'
-)
-
-# Marker QA match ngay đầu dòng + bắt buộc có ':' theo sau, KHÔNG yêu cầu
-# cả dòng chỉ có mỗi nhãn (nội dung câu hỏi thường dính ngay sau ':').
-_QA_PATTERNS = [
-    (4, re.compile(r'(?m)^[ \t]*(?:câu\s*hỏi\s*từ\s*người\s*dùng|hỏi)[ \t]*:', re.IGNORECASE)),
-    (5, re.compile(r'(?m)^[ \t]*(?:câu\s*trả\s*lời\s*của\s*bác\s*s[iĩ]|trả\s*lời)[ \t]*:', re.IGNORECASE)),
+_HEADER_PREFIX = r"^[ \t]*(?:(?:[0-9]{1,2}[.)])|[-•])?[ \t]*"
+_HEADER_BOUNDARY = r"(?=[ \t]*(?::|\.|•|[-–—]|\r?\n|\Z))"
+_SECTION_PATTERNS = [
+    (1, re.compile(
+        rf"{_HEADER_PREFIX}(?:tiền\s+sử\s+bệnh(?:\s+lý)?|tiền\s+sử\s+y\s+khoa|"
+        rf"bệnh\s+sử\s+trước\s+đây){_HEADER_BOUNDARY}",
+        re.IGNORECASE | re.MULTILINE,
+    )),
+    (2, re.compile(
+        rf"{_HEADER_PREFIX}(?:tiền\s+sử\s+bệnh\s+hiện\s+tại|"
+        rf"bệnh\s+sử(?:\s+hiện\s+tại)?|diễn\s+biến\s+bệnh\s+hiện\s+tại|"
+        rf"quá\s+trình\s+bệnh\s+lý\s+hiện\s+tại){_HEADER_BOUNDARY}",
+        re.IGNORECASE | re.MULTILINE,
+    )),
+    (3, re.compile(
+        rf"{_HEADER_PREFIX}(?:đánh\s+giá\s+tại\s+bệnh\s+viện|"
+        rf"khám\s+tại\s+bệnh\s+viện|thăm\s+khám\s+tại\s+bệnh\s+viện|"
+        rf"kết\s+quả\s+đánh\s+giá\s+ban\s+đầu|đánh\s+giá\s+ban\s+đầu)"
+        rf"{_HEADER_BOUNDARY}",
+        re.IGNORECASE | re.MULTILINE,
+    )),
 ]
 
+_QA_QUESTION_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:câu\s+hỏi(?:\s+(?:từ|của)\s+người\s+dùng)?"
+    r"(?:\s+gửi\s+đến\s+hệ\s+thống)?)[ \t]*(?::|\r?$)|hỏi[ \t]*:)"
+)
+_QA_ANSWER_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:câu\s+trả\s+lời\s+của\s+bác\s+s[iĩ]|"
+    r"bác\s+s[iĩ]\s+trả\s+lời)[ \t]*(?::|\r?$)|trả\s+lời[ \t]*:)"
+)
 
-def _drop_nested_matches(matches):
-    """Loại match có span nằm hoàn toàn trong 1 match khác đã giữ lại."""
-    ordered = sorted(matches, key=lambda t: (t[1], -(t[2] - t[1])))
+
+def is_qa_document(raw_text: str) -> bool:
+    """QA is predicted as one complete document, never split question/answer."""
+    return bool(_QA_QUESTION_RE.search(raw_text) and _QA_ANSWER_RE.search(raw_text))
+
+
+def _deduplicate_header_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(matches, key=lambda item: (
+        item["start"], -(item["end"] - item["start"]), item["section_no"],
+    ))
     kept = []
-    for sec_no, start, end in ordered:
-        if kept and start >= kept[-1][1] and end <= kept[-1][2]:
+    for item in ordered:
+        if any(item["start"] >= old["start"] and item["end"] <= old["end"] for old in kept):
             continue
-        kept.append((sec_no, start, end))
-    return kept
+        kept.append(item)
+    return sorted(kept, key=lambda item: item["start"])
 
 
-def split_sections_by_header(raw_text: str) -> dict[int, dict[str, str]]:
-    """Trả về {section_no: {"title":..., "body":...}}."""
+def split_sections_by_header(raw_text: str) -> dict[int, dict[str, Any]]:
+    """Return ordered blocks; body is always exactly raw_text[start:end]."""
+    if is_qa_document(raw_text):
+        return {0: {
+            "section_no": 4, "title": SECTION_TITLES[4],
+            "start": 0, "end": len(raw_text),
+            "header_start": None, "header_end": None,
+            "matched_heading": None, "body": raw_text,
+        }}
+
     matches = []
-    for m in _CANDIDATE_LINE_RE.finditer(raw_text):
-        line = m.group(1).strip()
-        if not line:
-            continue
-        for sec_no, pat in _SECTION_PATTERNS:
-            if pat.match(line):
-                matches.append((sec_no, m.start(), m.end()))
-                break
-
-    for sec_no, pat in _QA_PATTERNS:
-        for m in pat.finditer(raw_text):
-            matches.append((sec_no, m.start(), m.end()))
-
+    for section_no, pattern in _SECTION_PATTERNS:
+        for match in pattern.finditer(raw_text):
+            matches.append({
+                "section_no": section_no,
+                "start": match.start(),
+                "end": match.end(),
+                "matched_heading": raw_text[match.start():match.end()],
+            })
+    matches = _deduplicate_header_matches(matches)
     if not matches:
-        return {0: {"title": SECTION_TITLES[0] + " (trước header đầu tiên)", "body": raw_text.strip()}}
+        return {0: {
+            "section_no": 0, "title": SECTION_TITLES[0],
+            "start": 0, "end": len(raw_text),
+            "header_start": None, "header_end": None,
+            "matched_heading": None, "body": raw_text,
+        }}
 
-    matches = _drop_nested_matches(matches)
-    matches.sort(key=lambda t: t[1])
-
-    sections: dict[int, dict[str, str]] = {}
-    for i, (sec_no, header_start, header_end) in enumerate(matches):
-        body_start = header_end
-        body_end = matches[i + 1][1] if i + 1 < len(matches) else len(raw_text)
-        body = raw_text[body_start:body_end].strip()
-        if not body:
+    blocks = []
+    if raw_text[:matches[0]["start"]].strip():
+        end = matches[0]["start"]
+        blocks.append({
+            "section_no": 0,
+            "title": "KHÔNG_XÁC_ĐỊNH (trước header đầu tiên)",
+            "start": 0, "end": end,
+            "header_start": None, "header_end": None,
+            "matched_heading": None, "body": raw_text[:end],
+        })
+    for index, match in enumerate(matches):
+        start = match["start"]
+        end = matches[index + 1]["start"] if index + 1 < len(matches) else len(raw_text)
+        if not raw_text[start:end].strip():
             continue
-        if sec_no in sections:
-            sections[sec_no]["body"] += "\n" + body
-        else:
-            sections[sec_no] = {"title": SECTION_TITLES[sec_no], "body": body}
-
-    preamble = raw_text[:matches[0][1]].strip()
-    if preamble:
-        sections[0] = {"title": SECTION_TITLES[0] + " (trước header đầu tiên)", "body": preamble}
-
-    return sections
+        section_no = match["section_no"]
+        blocks.append({
+            "section_no": section_no, "title": SECTION_TITLES[section_no],
+            "start": start, "end": end,
+            "header_start": match["start"], "header_end": match["end"],
+            "matched_heading": match["matched_heading"],
+            "body": raw_text[start:end],
+        })
+    return {block_id: block for block_id, block in enumerate(blocks)}

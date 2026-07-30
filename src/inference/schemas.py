@@ -13,9 +13,8 @@ from typing import Any
 class NerEntity:
     """1 entity NER + assertion, TRƯỚC khi qua linking (chưa có candidates).
 
-    position là char offset [start, end) trên text ĐÃ ĐƯỢC LÀM SẠCH
-    (clean_text_for_inference), không phải raw_text gốc — nếu cần offset
-    trên raw_text, phải tự map lại ở tầng io/ (không thuộc phạm vi ner/).
+    position là char offset [start, end) trên raw text. Predictor notebook mới
+    không mutate input trước tokenization để bảo toàn offset tuyệt đối.
     """
 
     text: str
