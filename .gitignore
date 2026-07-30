@@ -33,6 +33,8 @@ data/synthetic/
 data/input/
 data/input_/
 data/output/
+data/output_7b
+data/output_15b
 *.csv
 *.tsv
 *.xlsx
