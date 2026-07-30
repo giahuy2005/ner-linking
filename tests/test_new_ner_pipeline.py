@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 
 from src.inference.ner.reviewer_7b import review_entities_batch
 from src.inference.ner.two_pass import SuspiciousRegion
@@ -33,6 +34,22 @@ class _BatchLlm:
 
 
 class NewNerPipelineTests(unittest.TestCase):
+    @staticmethod
+    def _cleanup_saved_output(record_id: int):
+        root = Path(__file__).resolve().parents[1]
+        raw = (root / "data" / "input" / f"{record_id}.txt").read_text(encoding="utf-8")
+        rows = json.loads(
+            (root / "output" / f"{record_id}.json").read_text(encoding="utf-8")
+        )
+        entities = [NerEntity(
+            text=row["text"],
+            type=row["type"],
+            assertions=row.get("assertions", []),
+            position=tuple(row["position"]),
+        ) for row in rows]
+        cleaned, logs = deterministic_cleanup(raw, entities)
+        return raw, cleaned, logs
+
     def test_gold_btc_medication_list(self):
         entities, logs = apply_clinical_rules(GOLD_TEXT, [])
         drugs = [entity for entity in entities if entity.type == "THUỐC"]
@@ -197,6 +214,57 @@ class NewNerPipelineTests(unittest.TestCase):
             and log.get("reason") == "invalid_schema"
             for log in logs
         ))
+
+    def test_real_outputs_drop_fragments_and_hard_negatives_before_linking(self):
+        _raw, doc1, logs1 = self._cleanup_saved_output(1)
+        _raw, doc7, logs7 = self._cleanup_saved_output(7)
+        remaining = {entity.text.casefold() for entity in doc1 + doc7}
+
+        self.assertTrue({"pd", "g6", "glucose-6-phosphate dehydrogenase",
+                         "đột biến gen", "10kg", "yakult", "bụng"}.isdisjoint(remaining))
+        dropped = {log.get("text", "").casefold() for log in logs1 + logs7
+                   if log.get("status") == "drop"}
+        self.assertTrue({"pd", "g6", "glucose-6-phosphate dehydrogenase",
+                         "đột biến gen", "10kg", "yakult", "bụng"}.issubset(dropped))
+
+    def test_real_outputs_retype_recover_boundaries_and_fix_assertion_scope(self):
+        _raw, doc1, _logs = self._cleanup_saved_output(1)
+        _raw, doc3, _logs = self._cleanup_saved_output(3)
+        _raw, doc4, _logs = self._cleanup_saved_output(4)
+        _raw, doc8, _logs = self._cleanup_saved_output(8)
+        _raw, doc10, _logs = self._cleanup_saved_output(10)
+
+        self.assertTrue(any(entity.text.casefold() == "thiếu men g6pd"
+                            and entity.type == "CHẨN_ĐOÁN" for entity in doc1))
+        self.assertTrue(any(entity.text.casefold() == "hội chứng parkinson"
+                            and entity.type == "CHẨN_ĐOÁN" for entity in doc3))
+        self.assertTrue(any(entity.text.casefold() == "nhìn song thị"
+                            for entity in doc3))
+        infection = next(entity for entity in doc3
+                         if entity.text.casefold() == "nhiễm trùng răng miệng")
+        self.assertNotIn("isNegated", infection.assertions)
+        negated_history = [entity for entity in doc3
+                           if entity.text.casefold() in {"tai biến mạch máu não", "co giật"}
+                           and "isNegated" in entity.assertions]
+        self.assertTrue(negated_history)
+        self.assertTrue(all("isHistorical" in entity.assertions for entity in negated_history))
+
+        breath_test = next(entity for entity in doc4
+                           if entity.text.casefold() == "test hơi thở h. pylori")
+        self.assertEqual("TÊN_XÉT_NGHIỆM", breath_test.type)
+        nausea = next(entity for entity in doc4 if entity.text.casefold() == "nausea")
+        self.assertEqual("TRIỆU_CHỨNG", nausea.type)
+        history_symptoms = [entity for entity in doc4
+                            if entity.text.casefold() in {"buồn nôn", "tiêu chảy"}
+                            and entity.position[0] < 100]
+        self.assertTrue(history_symptoms)
+        self.assertTrue(all("isHistorical" in entity.assertions for entity in history_symptoms))
+
+        liver = next(entity for entity in doc8 if entity.text.casefold() == "tăng men gan")
+        self.assertEqual("KẾT_QUẢ_XÉT_NGHIỆM", liver.type)
+        hepatitis = next(entity for entity in doc10
+                         if entity.text.casefold().startswith("viêm gan cấp tính do virus b"))
+        self.assertNotIn("isHistorical", hepatitis.assertions)
 
 
 if __name__ == "__main__":

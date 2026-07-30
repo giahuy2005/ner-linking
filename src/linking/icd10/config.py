@@ -18,4 +18,36 @@ DEFAULT_QUERY_BATCH_SIZE = 32
 
 DEFAULT_TOP_K_TERMS = 10
 DEFAULT_TOP_K_CODES = 2
-DEFAULT_MIN_SCORE: float | None = None
+DEFAULT_MIN_SCORE: float | None = 0.55
+MAX_FINAL_CODES = 2
+
+# High-precision Vietnamese aliases are resolved before FAISS.  These entries
+# intentionally return one code only and prevent semantically unrelated dense
+# neighbors from being appended.
+EXACT_ALIAS_CODES = {
+    "ăng huyết áp": "I10",
+    "tăng huyết áp": "I10",
+    "tăng huyết áp nguyên phát": "I10",
+    "ổ loét trong bao tử": "K25",
+    "loét dạ dày": "K25",
+    "viêm bao tử": "K29",
+    "viêm dạ dày": "K29",
+    "bệnh đa xơ cứng": "G35",
+    "đa xơ cứng": "G35",
+    "bại não": "G80",
+    "hội chứng parkinson": "G20",
+    "bệnh parkinson": "G20",
+    "thiếu men g6pd": "D55.0",
+    "thiếu hụt men g6pd": "D55.0",
+    "bệnh kawasaki": "M30.3",
+    "trào ngược dạ dày thực quản": "K21",
+    "viêm dạ dày ruột do virus": "A08.4",
+}
+
+# Conservative chapter constraints for frequent Vietnamese concepts.  If none
+# of the retrieved codes belong to the expected chapter, return no candidate.
+CHAPTER_HINTS = (
+    (("tăng huyết áp", "ăng huyết áp", "hạ huyết áp", "mạch vành", "nhồi máu cơ tim"), ("I",)),
+    (("ổ loét", "bao tử", "viêm dạ dày", "trào ngược dạ dày"), ("K",)),
+    (("đa xơ cứng", "bại não", "parkinson"), ("G",)),
+)

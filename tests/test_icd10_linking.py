@@ -14,7 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from linking.icd10 import build_icd10_faiss_index as build_module
 from linking.icd10.build_icd10_faiss_index import load_embedding_terms, write_metadata
-from linking.icd10.icd10_linker import Icd10Linker, aggregate_term_results
+from linking.icd10.icd10_linker import (
+    Icd10Linker,
+    _exact_alias_result,
+    _finalize_term_results,
+    aggregate_term_results,
+)
 from linking.sapbert_encoder import clean_query_text, l2_normalize, resolve_model_source
 
 
@@ -127,6 +132,40 @@ class Icd10LinkingTests(unittest.TestCase):
                 for row in aggregate_term_results(rows, top_k_codes=1, min_score=0.8)
             ],
         )
+
+    def test_exact_vietnamese_aliases_prevent_unrelated_icd_candidates(self):
+        expected = {
+            "ăng huyết áp": "I10",
+            "ổ loét trong bao tử": "K25",
+            "viêm bao tử": "K29",
+            "Bệnh đa xơ cứng": "G35",
+            "thiếu men G6PD": "D55.0",
+        }
+        for mention, code in expected.items():
+            with self.subTest(mention=mention):
+                result = _exact_alias_result(mention)
+                self.assertIsNotNone(result)
+                self.assertEqual([code], [row["code"] for row in result])
+
+    def test_icd_finalize_filters_threshold_chapter_and_caps_at_two(self):
+        rows = [
+            {"score": 0.93, "term_id": "K25|vi|preferred|0", "code": "K25",
+             "text": "Loét dạ dày", "language": "vi", "term_type": "preferred"},
+            {"score": 0.90, "term_id": "C90|vi|preferred|0", "code": "C90.0",
+             "text": "Đa u tủy", "language": "vi", "term_type": "preferred"},
+            {"score": 0.88, "term_id": "K26|vi|preferred|0", "code": "K26",
+             "text": "Loét tá tràng", "language": "vi", "term_type": "preferred"},
+            {"score": 0.80, "term_id": "K27|vi|preferred|0", "code": "K27",
+             "text": "Loét tiêu hóa", "language": "vi", "term_type": "preferred"},
+            {"score": 0.40, "term_id": "K28|vi|preferred|0", "code": "K28",
+             "text": "Loét hỗng tràng", "language": "vi", "term_type": "preferred"},
+        ]
+
+        result = _finalize_term_results(
+            "ổ loét trong bao tử", rows, top_k_codes=10, min_score=0.55,
+        )
+
+        self.assertEqual(["K25", "K26"], [row["code"] for row in result])
 
     def test_term_loading_and_metadata_preserve_vector_order(self):
         terms = [

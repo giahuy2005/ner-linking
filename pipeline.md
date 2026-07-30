@@ -183,7 +183,8 @@ metadata/ranking feature. 7B có quyền chọn/rerank candidate, với các gi�
 - Chỉ được chọn code có trong candidate do retriever trả về.
 - Không được bịa code mới.
 - THUỐC luôn tối đa 1 RxNorm code.
-- CHẨN_ĐOÁN tối đa 3 ICD-10 code.
+- CHẨN_ĐOÁN tối đa 2 ICD-10 code; exact alias trả 1 mã, semantic candidate
+  dưới ngưỡng bị loại, và khi top-1 cách top-2 đủ xa chỉ giữ top-1.
 - JSON lỗi, code không hợp lệ hoặc lỗi generation sẽ fallback về top candidate
   của linker.
 

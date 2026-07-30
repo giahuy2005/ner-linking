@@ -99,7 +99,13 @@ def _prepare_selection(
             valid_codes.append(pair[0])
     if not display_pairs:
         return None
-    choice_limit = 1 if entity_type == "THUỐC" else max_choices
+    choice_limit = 1 if entity_type == "THUỐC" else min(max_choices, 2)
+    if entity_type == "CHẨN_ĐOÁN" and len(candidates) >= 2:
+        first_score = candidates[0].get("score") if isinstance(candidates[0], dict) else None
+        second_score = candidates[1].get("score") if isinstance(candidates[1], dict) else None
+        if first_score is not None and second_score is not None \
+                and float(first_score) - float(second_score) >= 0.08:
+            choice_limit = 1
     fallback = valid_codes[:choice_limit]
     prompt = None
     if not _high_confidence_top(entity_text, entity_type, candidates[0]):
@@ -142,7 +148,7 @@ def select_candidates(
     llm: LocalLLM,
     *,
     top_k_context: int = 10,
-    max_choices: int = 3,
+    max_choices: int = 2,
     context: str = "",
 ) -> list[str]:
     """candidates: list gốc trả về từ linker (RxNormCandidate hoặc dict
@@ -174,7 +180,7 @@ def select_candidates_many(
     llm: LocalLLM,
     *,
     top_k_context: int = 10,
-    max_choices: int = 3,
+    max_choices: int = 2,
     batch_size: int = 4,
 ) -> list[list[str]]:
     """Batch only ambiguous selections; exact matches return without 7B."""

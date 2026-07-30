@@ -20,9 +20,50 @@ ALLOWED_ASSERTIONS = {"isHistorical", "isNegated", "isFamily"}
 
 _HARD_NEGATIVES = {
     "◦ 8", "đứng dậy", "đánh răng không", "ăn ngủ", "cấp tính",
-    "tĩnh mạch l giọt/phút", "tomisaku kawasaki",
+    "tĩnh mạch l giọt/phút", "tomisaku kawasaki", "yakult", "uống thuốc",
+    "tinh bột nghệ tách tinh dầu", "mẫu", "vs", "đột biến gen",
+    "glucose-6-phosphate dehydrogenase", "mang thai lần 2 được 20 tuần",
 }
-_ANATOMY_ONLY = {"mạch máu", "động mạch vành"}
+_ANATOMY_ONLY = {
+    "mạch máu", "động mạch vành", "bụng", "mắt", "tim", "xoang", "tuyến",
+}
+_FUNCTIONAL_FRAGMENTS = {
+    "pd", "g6", "dậy", "thị", "hạ", "hồi", "ra", "ở", "ngày", "học",
+    "nhìn", "chụp", "biểu", "cơn", "phải", "máu",
+}
+_SHORT_MEDICAL_WHITELIST = {
+    "ct", "mri", "ecg", "crp", "wbc", "inr", "hgb", "pt", "o2", "spo2",
+    "ho", "nôn", "sốt", "đau",
+}
+_DEVICE_PREFIXES = (
+    "stent", "catheter", "picc", "foley", "ống dẫn mật", "ống dẫn lưu",
+)
+_GENERIC_NON_ENTITIES = {
+    "kết quả", "xét nghiệm", "thuốc", "mẫu", "dấu hiệu", "triệu chứng",
+}
+_MEASUREMENT_ONLY_RE = re.compile(
+    r"^\d+(?:[.,]\d+)?\s*(?:kg|fr|tuần|week|weeks|w)$", re.I
+)
+_RETYPE_EXACT = {
+    "hội chứng parkinson": "CHẨN_ĐOÁN",
+    "bại não": "CHẨN_ĐOÁN",
+    "nausea": "TRIỆU_CHỨNG",
+    "diarrhea": "TRIỆU_CHỨNG",
+    "tăng men gan": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "cơn nhịp tim chậm nặng": "TRIỆU_CHỨNG",
+    "nhịp tim chậm nặng và hạ huyết áp": "TRIỆU_CHỨNG",
+    "test hơi thở h. pylori": "TÊN_XÉT_NGHIỆM",
+}
+_KNOWN_SURFACES = {
+    "thiếu men g6pd": "CHẨN_ĐOÁN",
+    "vàng da sơ sinh": "TRIỆU_CHỨNG",
+    "trào ngược dạ dày thực quản": "CHẨN_ĐOÁN",
+    "nhịp xoang": "KẾT_QUẢ_XÉT_NGHIỆM",
+    "test hơi thở h. pylori": "TÊN_XÉT_NGHIỆM",
+    "khó thở": "TRIỆU_CHỨNG",
+    "nhìn song thị": "TRIỆU_CHỨNG",
+    "viêm dạ dày ruột do virus": "CHẨN_ĐOÁN",
+}
 _DRUG_HEADER_RE = re.compile(r"danh\s+sách\s+thuốc\s+trước\s+nhập\s+viện", re.I)
 _NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\.\s+", re.M)
 
@@ -48,6 +89,88 @@ def _copy(entity: NerEntity, *, start: int | None = None, end: int | None = None
         score=entity.score,
         flag=flag,
     )
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.casefold().split()).strip(" \t\r\n.,;:()[]{}")
+
+
+def _is_hard_negative(entity: NerEntity) -> str | None:
+    normalized = _normalize(entity.text)
+    lexical_length = len(re.sub(r"\s+", "", normalized))
+    if normalized in _HARD_NEGATIVES:
+        return "known_hard_negative"
+    if normalized in _FUNCTIONAL_FRAGMENTS:
+        return "isolated_function_or_fragment"
+    if normalized in _GENERIC_NON_ENTITIES:
+        return "generic_non_entity"
+    if normalized in _ANATOMY_ONLY:
+        return "isolated_anatomy"
+    if normalized.isdigit():
+        return "isolated_number"
+    if _MEASUREMENT_ONLY_RE.fullmatch(normalized):
+        return "isolated_measurement"
+    if lexical_length < 4 and normalized not in _SHORT_MEDICAL_WHITELIST:
+        return "short_non_whitelisted_span"
+    if entity.type in {"THUỐC", "CHẨN_ĐOÁN"} and normalized.startswith(_DEVICE_PREFIXES):
+        return "device_or_procedure"
+    if entity.type == "THUỐC" and (
+        normalized.startswith("tinh bột nghệ") or normalized == "yakult"
+    ):
+        return "food_or_supplement"
+    if entity.type == "CHẨN_ĐOÁN" and (
+        "dehydrogenase" in normalized or normalized == "đột biến gen"
+    ):
+        return "enzyme_or_generic_gene_phrase"
+    return None
+
+
+def is_linkable_entity(entity: NerEntity) -> bool:
+    """Defense-in-depth gate used immediately before RxNorm/ICD retrieval."""
+    return entity.type in {"THUỐC", "CHẨN_ĐOÁN"} and _is_hard_negative(entity) is None
+
+
+def _numbered_section_heading(raw_text: str, position: int) -> str:
+    headings = list(re.finditer(r"(?im)^\s*\d+\.\s+([^\n]+)$", raw_text[:position]))
+    return _normalize(headings[-1].group(1)) if headings else ""
+
+
+def _repair_assertion_scope(raw_text: str, entity: NerEntity) -> NerEntity:
+    assertions = [item for item in entity.assertions if item in ALLOWED_ASSERTIONS]
+    start, _end = entity.position
+    heading = _numbered_section_heading(raw_text, start)
+    local_start = max(raw_text.rfind("\n", 0, start), raw_text.rfind(".", 0, start)) + 1
+    local_prefix = _normalize(raw_text[local_start:start])
+    negated_history = "phủ nhận tiền sử" in local_prefix
+    exception_scope = "ngoại trừ" in local_prefix
+
+    if exception_scope and "isNegated" in assertions:
+        assertions = [item for item in assertions if item != "isNegated"]
+    elif negated_history:
+        # "phủ nhận tiền sử X" carries both assertion dimensions.  An
+        # exception later in the same clause is handled above and is positive.
+        if "isNegated" not in assertions:
+            assertions.append("isNegated")
+        if "isHistorical" not in assertions:
+            assertions.append("isHistorical")
+
+    current_cue = re.search(
+        r"(?i)\b(?:hiện\s+đang|nay\s+.*?đang|hiện\s+tại|đang\s+có)\b",
+        raw_text[max(0, start - 100):start],
+    )
+    current_section = any(marker in heading for marker in (
+        "hiện tại", "đánh giá tại bệnh viện", "tình trạng hiện tại",
+    ))
+    if (current_cue or current_section) and not negated_history:
+        assertions = [item for item in assertions if item != "isHistorical"]
+    elif heading == "tiền sử bệnh" and entity.type not in {
+        "TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM",
+    } and "isHistorical" not in assertions:
+        assertions.append("isHistorical")
+
+    if entity.type in {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}:
+        assertions = []
+    return _copy(entity, assertions=assertions, flag=entity.flag)
 
 
 def _repair_boundary(raw_text: str, entity: NerEntity) -> NerEntity:
@@ -90,6 +213,14 @@ def _repair_boundary(raw_text: str, entity: NerEntity) -> NerEntity:
         if material:
             candidates.append((max(0, start - 6) + material.start(), end))
 
+    # Recover the complete breath-test name from the drug-like fragment.
+    if _normalize(text) == "thở h. pylori":
+        window_start = max(0, start - 12)
+        window = raw_text[window_start:end]
+        full_test = re.search(r"(?i)test\s+hơi\s+thở\s+h\.\s*pylori$", window)
+        if full_test:
+            candidates.append((window_start + full_test.start(), end))
+
     # Fused trailing connector: "ổn địnhkhi" -> "ổn định".
     fused = re.sub(r"(?i)(?<=\w)(?:khi|ở)$", "", text).rstrip()
     if fused and fused != text:
@@ -131,6 +262,46 @@ def _resolve_overlaps(entities: list[NerEntity]) -> list[NerEntity]:
     return sorted(kept, key=lambda e: (e.position[0], e.position[1], e.type))
 
 
+def _recover_known_surfaces(raw_text: str, entities: list[NerEntity], logs: list[dict]) -> list[NerEntity]:
+    """Merge/recover a conservative lexicon of observed complete concepts."""
+    result = list(entities)
+    for surface, entity_type in _KNOWN_SURFACES.items():
+        for match in re.finditer(re.escape(surface), raw_text, flags=re.I):
+            span = (match.start(), match.end())
+            covering = [
+                entity for entity in result
+                if entity.position[0] <= span[0] and entity.position[1] >= span[1]
+            ]
+            if covering:
+                continue
+            overlaps = [
+                entity for entity in result
+                if span[0] < entity.position[1] and span[1] > entity.position[0]
+            ]
+            assertions = sorted({item for entity in overlaps for item in entity.assertions})
+            score = max((entity.score for entity in overlaps), default=0.9)
+            result = [entity for entity in result if entity not in overlaps]
+            recovered = NerEntity(
+                text=raw_text[span[0]:span[1]],
+                type=entity_type,
+                assertions=assertions,
+                position=span,
+                score=score,
+                flag=None,
+            )
+            recovered = _repair_assertion_scope(raw_text, recovered)
+            result.append(recovered)
+            logs.append({
+                "status": "recover",
+                "reason": "known_complete_surface",
+                "text": recovered.text,
+                "type": recovered.type,
+                "position": list(span),
+                "replaced": [entity.text for entity in overlaps],
+            })
+    return result
+
+
 def deterministic_cleanup(raw_text: str, entities: list[NerEntity]) -> tuple[list[NerEntity], list[dict]]:
     logs: list[dict] = []
     cleaned: list[NerEntity] = []
@@ -138,12 +309,10 @@ def deterministic_cleanup(raw_text: str, entities: list[NerEntity]) -> tuple[lis
         if not _exact(raw_text, entity):
             logs.append({"status": "drop", "reason": "invalid_exact_span", "text": entity.text})
             continue
-        normalized = " ".join(entity.text.casefold().split())
-        if normalized in _HARD_NEGATIVES:
-            logs.append({"status": "drop", "reason": "known_hard_negative", "text": entity.text})
-            continue
-        if normalized in _ANATOMY_ONLY and entity.type == "CHẨN_ĐOÁN":
-            logs.append({"status": "drop", "reason": "anatomy_without_disease_context", "text": entity.text})
+        normalized = _normalize(entity.text)
+        drop_reason = _is_hard_negative(entity)
+        if drop_reason:
+            logs.append({"status": "drop", "reason": drop_reason, "text": entity.text})
             continue
         if normalized == "g6pd" and entity.type == "TÊN_XÉT_NGHIỆM":
             logs.append({"status": "drop", "reason": "gene_or_enzyme_context", "text": entity.text})
@@ -152,10 +321,17 @@ def deterministic_cleanup(raw_text: str, entities: list[NerEntity]) -> tuple[lis
         if repaired.position != entity.position:
             logs.append({"status": "repair", "reason": "deterministic_boundary", "before": entity.text,
                          "after": repaired.text, "position": list(repaired.position)})
-        repaired.assertions = [a for a in repaired.assertions if a in ALLOWED_ASSERTIONS]
-        if repaired.type in {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}:
-            repaired.assertions = []
+        new_type = _RETYPE_EXACT.get(_normalize(repaired.text), repaired.type)
+        if new_type != repaired.type:
+            logs.append({"status": "retype", "reason": "deterministic_surface_type",
+                         "text": repaired.text, "before": repaired.type, "after": new_type})
+            repaired = _copy(repaired, entity_type=new_type, flag=None)
+        repaired = _repair_assertion_scope(raw_text, repaired)
         cleaned.append(repaired)
+    cleaned = _recover_known_surfaces(raw_text, cleaned, logs)
+    # Re-check injected/retyped candidates before overlap resolution.
+    cleaned = [entity for entity in cleaned if _exact(raw_text, entity)
+               and _is_hard_negative(entity) is None]
     return _resolve_overlaps(cleaned), logs
 
 

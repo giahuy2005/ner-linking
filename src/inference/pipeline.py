@@ -40,7 +40,7 @@ TYPE_TO_LINKER = {
 
 MAX_OUTPUT_CANDIDATES = {
     "THUỐC": 1,
-    "CHẨN_ĐOÁN": 3,
+    "CHẨN_ĐOÁN": 2,
 }
 
 
@@ -217,6 +217,10 @@ class InferencePipeline:
     def _get_raw_candidates(self, ent: NerEntity):
         """Trả candidate RAW (list[RxNormCandidate] hoặc list[dict]) CHƯA
         cắt xuống code — dùng chung cho cả nhánh có/không LLM selector."""
+        from .rule.clinical import is_linkable_entity
+
+        if not is_linkable_entity(ent):
+            return None
         linker_name = TYPE_TO_LINKER.get(ent.type)
         if linker_name is None:
             return None

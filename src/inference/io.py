@@ -545,7 +545,7 @@ def validate_record_output(
                     f"Entity {entity_index}: mọi candidate phải là str."
                 )
 
-            max_candidates = 1 if entity_type == "THUỐC" else 3
+            max_candidates = 1 if entity_type == "THUỐC" else 2
             if len(candidates) > max_candidates:
                 raise ValueError(
                     f"Entity {entity_index} loại {entity_type!r} chỉ được có "

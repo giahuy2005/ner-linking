@@ -89,6 +89,39 @@ class InferenceRegressionTests(unittest.TestCase):
                 "position": [0, 7],
             }])
 
+    def test_validator_rejects_more_than_two_icd_codes(self):
+        with self.assertRaisesRegex(ValueError, "tối đa 2 candidate"):
+            inference_io.validate_record_output([{
+                "text": "viêm phổi",
+                "type": "CHẨN_ĐOÁN",
+                "candidates": ["J18.9", "J15.9", "J12.9"],
+                "assertions": [],
+                "position": [0, 10],
+            }])
+
+    def test_icd_selector_caps_at_two_and_uses_score_margin_for_top_one(self):
+        ambiguous = [
+            {"code": "A", "matched_term": "a", "score": 0.80},
+            {"code": "B", "matched_term": "b", "score": 0.77},
+            {"code": "C", "matched_term": "c", "score": 0.76},
+        ]
+        selected = select_candidates(
+            "bệnh x", "CHẨN_ĐOÁN", ambiguous,
+            _StaticLlm('{"chosen_codes":["A","B","C"],"reason":"x"}'),
+            max_choices=3,
+        )
+        self.assertEqual(["A", "B"], selected)
+
+        separated = [
+            {"code": "A", "matched_term": "a", "score": 0.90},
+            {"code": "B", "matched_term": "b", "score": 0.75},
+        ]
+        selected = select_candidates(
+            "bệnh x", "CHẨN_ĐOÁN", separated,
+            _StaticLlm('{"chosen_codes":["A","B"],"reason":"x"}'),
+        )
+        self.assertEqual(["A"], selected)
+
     def test_rule_only_pipeline_limits_output_candidates(self):
         class _RxLinker:
             @staticmethod

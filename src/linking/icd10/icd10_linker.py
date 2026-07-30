@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -48,6 +50,52 @@ def aggregate_term_results(
 
     ranked = sorted(by_code.values(), key=lambda item: (-item["score"], item["code"]))
     return ranked[:top_k_codes]
+
+
+def _normalize_alias(text: str) -> str:
+    value = unicodedata.normalize("NFC", clean_query_text(text)).casefold()
+    return re.sub(r"\s+", " ", value).strip(" \t\r\n.,;:()[]{}")
+
+
+def _exact_alias_result(mention: str) -> list[dict[str, Any]] | None:
+    normalized = _normalize_alias(mention)
+    code = config.EXACT_ALIAS_CODES.get(normalized)
+    if code is None:
+        return None
+    return [{
+        "code": code,
+        "score": 1.0,
+        "matched_term": mention,
+        "language": "vi",
+        "term_type": "exact_alias",
+        "term_id": f"exact-alias:{normalized}",
+    }]
+
+
+def _expected_chapters(mention: str) -> tuple[str, ...] | None:
+    normalized = _normalize_alias(mention)
+    for phrases, chapters in config.CHAPTER_HINTS:
+        if any(phrase in normalized for phrase in phrases):
+            return tuple(chapters)
+    return None
+
+
+def _finalize_term_results(
+    mention: str,
+    term_results: list[dict[str, Any]],
+    *,
+    top_k_codes: int,
+    min_score: float | None,
+) -> list[dict[str, Any]]:
+    ranked = aggregate_term_results(
+        term_results,
+        top_k_codes=max(top_k_codes, 10),
+        min_score=min_score,
+    )
+    chapters = _expected_chapters(mention)
+    if chapters is not None:
+        ranked = [item for item in ranked if item["code"].startswith(chapters)]
+    return ranked[:min(top_k_codes, config.MAX_FINAL_CODES)]
 
 
 class Icd10Linker:
@@ -186,8 +234,12 @@ class Icd10Linker:
         min_score: float | None = config.DEFAULT_MIN_SCORE,
     ) -> list[dict[str, Any]]:
         """Link one NER mention and return ICD codes ranked by maximum term score."""
+        exact = _exact_alias_result(mention)
+        if exact is not None:
+            return exact
         term_results = self.search_terms(mention, top_k_terms=top_k_terms)
-        return aggregate_term_results(
+        return _finalize_term_results(
+            mention,
             term_results,
             top_k_codes=top_k_codes,
             min_score=min_score,
@@ -216,10 +268,15 @@ class Icd10Linker:
         count = min(top_k_terms, int(self.index.ntotal))
         scores, indices = self.index.search(queries, count)
         output = []
-        for row_scores, row_indices in zip(scores, indices):
+        for mention, row_scores, row_indices in zip(cleaned, scores, indices):
+            exact = _exact_alias_result(mention)
+            if exact is not None:
+                output.append(exact)
+                continue
             term_results = self._term_results_from_search(row_scores, row_indices)
             output.append(
-                aggregate_term_results(
+                _finalize_term_results(
+                    mention,
                     term_results,
                     top_k_codes=top_k_codes,
                     min_score=min_score,
