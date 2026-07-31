@@ -7,12 +7,16 @@ from typing import Iterable
 from ..schemas import NerEntity
 from ..ner.two_pass import SuspiciousRegion
 
+ASSERTION_ENTITY_TYPES = {"TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "THUỐC"}
+
 
 def _entity_payload(entity: NerEntity, candidate_id: int, context_start: int) -> dict:
     start, end = entity.position
     hints = [hint for hint in entity.review_hints if isinstance(hint, dict)]
     requested_actions = {hint.get("requested_action") for hint in hints}
-    allowed_actions = ["KEEP", "UPDATE_ASSERTIONS"]
+    allowed_actions = ["KEEP"]
+    if entity.type in ASSERTION_ENTITY_TYPES:
+        allowed_actions.append("UPDATE_ASSERTIONS")
 
     # Mutating actions require evidence produced before 7B. This avoids giving
     # one model unrestricted DROP/RETYPE authority over low-confidence spans.

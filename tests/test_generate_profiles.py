@@ -81,15 +81,19 @@ class GenerateProfileTests(unittest.TestCase):
         record = build_btc_medication_gold_record(include_linking=False)
         self.assertIsNone(validate_focus_quality(record, focus))
 
-    def test_v6_assertion_quality_rejects_missing_or_multiple_assertions(self):
+    def test_v6_assertion_quality_accepts_multiple_assertions(self):
         focus = next(
             f for f in V6_FOCUS_AREAS
             if f["key"] == "assertion_negation_exception_scope"
         )
         valid = {
-            "input_text": "Không đau ngực, nhưng vẫn ho và sốt kèm khó thở.",
+            "input_text": "Phủ nhận tiền sử đau ngực, nhưng vẫn ho và sốt kèm khó thở.",
             "entities": [
-                {"text": "đau ngực", "type": "TRIỆU_CHỨNG", "assertions": ["isNegated"]},
+                {
+                    "text": "đau ngực",
+                    "type": "TRIỆU_CHỨNG",
+                    "assertions": ["isNegated", "isHistorical"],
+                },
                 {"text": "ho", "type": "TRIỆU_CHỨNG", "assertions": []},
                 {"text": "sốt", "type": "TRIỆU_CHỨNG", "assertions": []},
                 {"text": "khó thở", "type": "TRIỆU_CHỨNG", "assertions": []},
@@ -101,9 +105,33 @@ class GenerateProfileTests(unittest.TestCase):
         missing["entities"][0]["assertions"] = []
         self.assertIn("thiếu assertion", validate_focus_quality(missing, focus))
 
-        multiple = {**valid, "entities": [dict(e) for e in valid["entities"]]}
-        multiple["entities"][0]["assertions"] = ["isNegated", "isHistorical"]
-        self.assertIn("tối đa một assertion", validate_focus_quality(multiple, focus))
+    def test_v6_repeated_scope_requires_a_multi_assertion_case(self):
+        focus = next(
+            f for f in V6_FOCUS_AREAS
+            if f["key"] == "assertion_repeated_occurrence_scope"
+        )
+        valid = {
+            "input_text": "Hiện có đau ngực; trước đây không có đau ngực; mẹ từng đau ngực.",
+            "entities": [
+                {"text": "đau ngực", "type": "TRIỆU_CHỨNG", "assertions": []},
+                {
+                    "text": "đau ngực",
+                    "type": "TRIỆU_CHỨNG",
+                    "assertions": ["isNegated", "isHistorical"],
+                },
+                {
+                    "text": "đau ngực",
+                    "type": "TRIỆU_CHỨNG",
+                    "assertions": ["isFamily", "isHistorical"],
+                },
+            ],
+        }
+        self.assertIsNone(validate_focus_quality(valid, focus))
+
+        without_multi = {**valid, "entities": [dict(e) for e in valid["entities"]]}
+        without_multi["entities"][1]["assertions"] = ["isNegated"]
+        without_multi["entities"][2]["assertions"] = ["isFamily"]
+        self.assertIn("multi-assertion", validate_focus_quality(without_multi, focus))
 
     def test_v6_fragment_focus_requires_long_and_short_valid_entities(self):
         focus = next(

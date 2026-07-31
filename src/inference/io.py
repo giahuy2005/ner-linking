@@ -9,18 +9,19 @@ import sys
 from pathlib import Path
 from typing import Callable, Sequence, TypeAlias
 
-from .schemas import NerEntity
+from .schemas import (
+    ASSERTION_ENTITY_TYPES,
+    LINKING_TYPES,
+    MAX_CANDIDATES_BY_TYPE,
+    VALID_ASSERTIONS,
+    VALID_ENTITY_TYPES,
+    NerEntity,
+)
 
 
 # Opcode của difflib:
 # (tag, raw_start, raw_end, cleaned_start, cleaned_end)
 Opcode: TypeAlias = tuple[str, int, int, int, int]
-
-# Chỉ các loại này cần ontology linking.
-LINKING_TYPES = frozenset({
-    "THUỐC",
-    "CHẨN_ĐOÁN",
-})
 
 # Thứ tự trường giống output mẫu của BTC.
 BTC_FIELD_ORDER = (
@@ -386,41 +387,33 @@ def build_record_output(
     entities: list[NerEntity],
     candidates_by_entity: dict[int, list[str]] | None = None,
 ) -> list[dict]:
-    """Chuyển list[NerEntity] thành output đúng cấu trúc BTC.
+    """Chuyển ``NerEntity`` thành đủ năm field output BTC.
 
-    candidates_by_entity có dạng:
-
-        {
-            0: ["308135"],
-            1: ["243670"],
-        }
-
-    Chỉ THUỐC và CHẨN_ĐOÁN có trường candidates.
+    ``candidates`` luôn tồn tại. Với entity không phải THUỐC/CHẨN_ĐOÁN,
+    field này bắt buộc là ``[]``. Hàm không trim, retype, sửa assertion hay
+    thay đổi position.
     """
     candidates_by_entity = candidates_by_entity or {}
-
     output: list[dict] = []
 
     for entity_index, entity in enumerate(entities):
         start = int(entity.position[0])
         end = int(entity.position[1])
-
-        item: dict = {
-            "text": str(entity.text),
-            "type": str(entity.type),
-        }
-
-        if entity.type in LINKING_TYPES:
-            item["candidates"] = _normalize_string_list(
+        candidates = (
+            _normalize_string_list(
                 candidates_by_entity.get(entity_index, [])
             )
-
-        item["assertions"] = _normalize_string_list(
-            entity.assertions
+            if entity.type in LINKING_TYPES
+            else []
         )
-        item["position"] = [start, end]
 
-        output.append(item)
+        output.append({
+            "text": str(entity.text),
+            "type": str(entity.type),
+            "candidates": candidates,
+            "assertions": _normalize_string_list(entity.assertions),
+            "position": [start, end],
+        })
 
     return output
 
@@ -429,33 +422,28 @@ def validate_record_output(
     record_output: list[dict],
     *,
     raw_text: str | None = None,
+    require_sorted: bool = True,
 ) -> None:
-    """Kiểm tra output trước khi ghi file.
+    """Fail-fast nếu output vi phạm schema/invariant BTC.
 
-    Khi truyền raw_text, hàm còn kiểm tra:
-
-        item["text"] == raw_text[start:end]
-
-    Nhờ đó có thể phát hiện ngay lỗi offset do CRLF/LF.
+    Hàm này chỉ kiểm tra và ném lỗi; tuyệt đối không tự trim text, sửa offset,
+    retype, thay assertion hay xóa entity. Khi có ``raw_text``, invariant bắt
+    buộc là ``raw_text[start:end] == text`` với ``end`` exclusive.
     """
     if not isinstance(record_output, list):
-        raise TypeError(
-            "record_output phải là list[dict]."
-        )
+        raise TypeError("record_output phải là list[dict].")
+    if raw_text is not None and not isinstance(raw_text, str):
+        raise TypeError("raw_text phải là str hoặc None.")
 
     required_fields = {
-        "text",
-        "type",
-        "assertions",
-        "position",
-    }
-    allowed_fields = {
         "text",
         "type",
         "candidates",
         "assertions",
         "position",
     }
+    seen_entity_keys: set[tuple[int, int, str]] = set()
+    previous_sort_key: tuple[int, int, str] | None = None
 
     for entity_index, item in enumerate(record_output):
         if not isinstance(item, dict):
@@ -464,14 +452,14 @@ def validate_record_output(
                 f"nhận được {type(item).__name__}."
             )
 
-        missing_fields = required_fields - item.keys()
+        item_fields = set(item.keys())
+        missing_fields = required_fields - item_fields
         if missing_fields:
             raise ValueError(
                 f"Entity {entity_index} thiếu trường: "
                 f"{sorted(missing_fields)}"
             )
-
-        extra_fields = item.keys() - allowed_fields
+        extra_fields = item_fields - required_fields
         if extra_fields:
             raise ValueError(
                 f"Entity {entity_index} có trường không hợp lệ: "
@@ -480,88 +468,109 @@ def validate_record_output(
 
         entity_text = item["text"]
         entity_type = item["type"]
+        candidates = item["candidates"]
         assertions = item["assertions"]
         position = item["position"]
 
         if not isinstance(entity_text, str):
-            raise TypeError(
-                f"Entity {entity_index}: text phải là str."
-            )
+            raise TypeError(f"Entity {entity_index}: text phải là str.")
+        if not entity_text:
+            raise ValueError(f"Entity {entity_index}: text không được rỗng.")
 
         if not isinstance(entity_type, str):
+            raise TypeError(f"Entity {entity_index}: type phải là str.")
+        if entity_type not in VALID_ENTITY_TYPES:
+            raise ValueError(
+                f"Entity {entity_index}: type không hợp lệ {entity_type!r}; "
+                f"chỉ chấp nhận {sorted(VALID_ENTITY_TYPES)}."
+            )
+
+        if not isinstance(candidates, list):
             raise TypeError(
-                f"Entity {entity_index}: type phải là str."
+                f"Entity {entity_index}: candidates phải là list."
+            )
+        if not all(isinstance(candidate, str) for candidate in candidates):
+            raise TypeError(
+                f"Entity {entity_index}: mọi candidate phải là str."
+            )
+        if any(not candidate.strip() for candidate in candidates):
+            raise ValueError(
+                f"Entity {entity_index}: candidate không được là chuỗi rỗng."
+            )
+        if len(candidates) != len(set(candidates)):
+            raise ValueError(
+                f"Entity {entity_index}: candidates không được trùng nhau."
+            )
+
+        if entity_type in LINKING_TYPES:
+            max_candidates = MAX_CANDIDATES_BY_TYPE[entity_type]
+            if len(candidates) > max_candidates:
+                raise ValueError(
+                    f"Entity {entity_index} loại {entity_type!r} chỉ được có "
+                    f"tối đa {max_candidates} candidate."
+                )
+        elif candidates:
+            raise ValueError(
+                f"Entity {entity_index} loại {entity_type!r} phải có "
+                "candidates=[]."
             )
 
         if not isinstance(assertions, list):
             raise TypeError(
                 f"Entity {entity_index}: assertions phải là list."
             )
-
-        if not all(
-            isinstance(assertion, str)
-            for assertion in assertions
-        ):
+        if not all(isinstance(assertion, str) for assertion in assertions):
             raise TypeError(
                 f"Entity {entity_index}: mọi assertion phải là str."
+            )
+        if len(assertions) != len(set(assertions)):
+            raise ValueError(
+                f"Entity {entity_index}: assertions không được trùng nhau."
+            )
+
+        invalid_assertions = set(assertions) - VALID_ASSERTIONS
+        if invalid_assertions:
+            raise ValueError(
+                f"Entity {entity_index}: assertion không hợp lệ "
+                f"{sorted(invalid_assertions)}."
+            )
+        if entity_type not in ASSERTION_ENTITY_TYPES and assertions:
+            raise ValueError(
+                f"Entity {entity_index} loại {entity_type!r} phải có "
+                "assertions=[]."
             )
 
         if not isinstance(position, list) or len(position) != 2:
             raise ValueError(
                 f"Entity {entity_index}: position phải có dạng [start, end]."
             )
-
         start, end = position
-
         if type(start) is not int or type(end) is not int:
             raise TypeError(
-                f"Entity {entity_index}: start/end phải là int."
+                f"Entity {entity_index}: start/end phải là int, không nhận bool."
             )
-
-        if start < 0 or end < start:
+        if not (0 <= start < end):
             raise ValueError(
-                f"Entity {entity_index}: offset không hợp lệ "
-                f"{position}."
+                f"Entity {entity_index}: offset phải thỏa 0 <= start < end, "
+                f"nhận {position}."
             )
 
-        if entity_type in LINKING_TYPES:
-            if "candidates" not in item:
-                raise ValueError(
-                    f"Entity {entity_index} loại {entity_type!r} "
-                    "phải có trường candidates."
-                )
-
-            candidates = item["candidates"]
-
-            if not isinstance(candidates, list):
-                raise TypeError(
-                    f"Entity {entity_index}: candidates phải là list."
-                )
-
-            if not all(
-                isinstance(candidate, str)
-                for candidate in candidates
-            ):
-                raise TypeError(
-                    f"Entity {entity_index}: mọi candidate phải là str."
-                )
-
-            max_candidates = 1 if entity_type == "THUỐC" else 2
-            if len(candidates) > max_candidates:
-                raise ValueError(
-                    f"Entity {entity_index} loại {entity_type!r} chỉ được có "
-                    f"tối đa {max_candidates} candidate."
-                )
-            if len(candidates) != len(set(candidates)):
-                raise ValueError(
-                    f"Entity {entity_index}: candidates không được trùng nhau."
-                )
-
-        elif "candidates" in item:
+        entity_key = (start, end, entity_type)
+        if entity_key in seen_entity_keys:
             raise ValueError(
-                f"Entity {entity_index} loại {entity_type!r} "
-                "không được có trường candidates."
+                f"Entity {entity_index}: exact duplicate theo "
+                f"(start, end, type)={entity_key}."
             )
+        seen_entity_keys.add(entity_key)
+
+        sort_key = (start, end, entity_type)
+        if require_sorted and previous_sort_key is not None and sort_key < previous_sort_key:
+            raise ValueError(
+                f"Entity {entity_index}: output chưa được sort theo "
+                "(start, end, type); "
+                f"key trước={previous_sort_key}, key hiện tại={sort_key}."
+            )
+        previous_sort_key = sort_key
 
         if raw_text is not None:
             if end > len(raw_text):
@@ -569,15 +578,13 @@ def validate_record_output(
                     f"Entity {entity_index}: end={end} vượt quá "
                     f"độ dài raw_text={len(raw_text)}."
                 )
-
             raw_slice = raw_text[start:end]
-
             if entity_text != raw_slice:
                 raise ValueError(
                     f"Entity {entity_index} sai text hoặc offset:\n"
-                    f"  text output : {entity_text!r}\n"
-                    f"  raw[{start}:{end}]: {raw_slice!r}\n"
-                    f"  position    : {position}"
+                    f"  text output      : {entity_text!r}\n"
+                    f"  raw[{start}:{end}] : {raw_slice!r}\n"
+                    f"  position         : {position}"
                 )
 
 

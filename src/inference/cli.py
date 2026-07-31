@@ -82,7 +82,12 @@ def _load_raw_texts(paths: list[Path]) -> dict[str, str]:
     return {p.stem: inference_io.read_text_file(p) for p in paths}
 
 
-def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dict]]:
+def run(
+    args: argparse.Namespace,
+    input_paths: list[Path],
+    *,
+    raw_texts_by_id: dict[str, str] | None = None,
+) -> dict[str, list[dict]]:
     print("[cli] Đang load NER engine...", file=sys.stderr)
     pipeline = InferencePipeline.load(
         with_rxnorm=args.with_rxnorm,
@@ -96,7 +101,8 @@ def run(args: argparse.Namespace, input_paths: list[Path]) -> dict[str, list[dic
     print("[cli] Load NER engine xong.", file=sys.stderr)
 
     predict_kwargs = {"apply_repair_gate": not args.no_repair_gate}
-    raw_texts_by_id = _load_raw_texts(input_paths)
+    if raw_texts_by_id is None:
+        raw_texts_by_id = _load_raw_texts(input_paths)
 
     # ---- Stage 1: NER cho toàn bộ batch (không LLM) ----
     entities_by_id = pipeline.run_ner_stage(raw_texts_by_id, **predict_kwargs)
@@ -198,12 +204,45 @@ def main() -> None:
         print("Không tìm thấy file .txt nào để chạy.", file=sys.stderr)
         sys.exit(1)
 
-    outputs = run(args, input_paths)
+    # Đọc raw text đúng một lần bằng newline="" để bảo toàn CRLF/offset.
+    raw_texts_by_id = _load_raw_texts(input_paths)
+    outputs = run(
+        args,
+        input_paths,
+        raw_texts_by_id=raw_texts_by_id,
+    )
+
+    expected_ids = [path.stem for path in input_paths]
+    expected_id_set = set(expected_ids)
+    output_id_set = set(outputs)
+    missing_ids = expected_id_set - output_id_set
+    extra_ids = output_id_set - expected_id_set
+    if missing_ids or extra_ids:
+        raise ValueError(
+            "Pipeline trả sai tập record id: "
+            f"missing={sorted(missing_ids)}, extra={sorted(extra_ids)}"
+        )
 
     n_ok = 0
-    for rid, record_output in outputs.items():
+    # Ghi theo thứ tự input thay vì phụ thuộc thứ tự dict từ pipeline.
+    for rid in expected_ids:
+        record_output = outputs[rid]
+        raw_text = raw_texts_by_id[rid]
+
         if args.output_dir is not None:
-            inference_io.write_output_json(record_output, args.output_dir / f"{rid}.json")
+            # Writer validate fail-fast với raw text trước khi ghi.
+            inference_io.write_output_json(
+                record_output,
+                args.output_dir / f"{rid}.json",
+                raw_text=raw_text,
+            )
+        else:
+            # Chế độ chỉ --print trước đây bỏ qua toàn bộ raw-span validation.
+            inference_io.validate_record_output(
+                record_output,
+                raw_text=raw_text,
+            )
+
         if args.do_print or args.output_dir is None:
             print(json.dumps(record_output, ensure_ascii=False, indent=2))
         n_ok += 1

@@ -1096,7 +1096,8 @@ NHÓM V6 — PHỦ ĐỊNH, NGOẠI TRỪ VÀ CUE GIẢ:
 - Cue phủ định chỉ tác động entity trong scope. Entity sau ngoại trừ hoặc mệnh đề đảo chiều có assertions=[].
 - Câu kiểu không nhớ thời điểm, không cải thiện, không dùng thuốc đều hoặc không đáp ứng điều trị
   không tự phủ định bệnh/triệu chứng đang tồn tại.
-- Mỗi entity tối đa một assertion theo contract BTC; lab/finding luôn [].
+- Một occurrence có thể mang nhiều assertion khi các scope cùng đúng, ví dụ phủ định tiền sử
+  có thể là ["isNegated", "isHistorical"]; lab/finding vẫn luôn [].
 """,
     },
     {
@@ -1161,12 +1162,14 @@ NHÓM V6 — CONTRACT DANH SÁCH THUỐC BTC:
         "min_entities": 5,
         "assertion_family": "same_surface_different_scope",
         "min_assertion_states": 3,
+        "min_multi_assertion_entities": 1,
         "require_complete_occurrences": True,
         "instruction": """
 NHÓM V6 — CÙNG SURFACE, KHÁC ASSERTION:
 - Nhắc lại cùng một entity ở ít nhất ba scope khác nhau trong record: hiện tại, phủ định, tiền sử hoặc gia đình.
 - Annotate đủ mọi occurrence theo thứ tự; mỗi occurrence nhận assertion cục bộ của chính nó.
-- Không gộp occurrence, không truyền cue và không tạo nhiều assertion trên cùng một entity.
+- Có ít nhất một occurrence đồng thời thuộc hai scope thật và nhận hai assertion tương ứng.
+  Không gộp occurrence và không truyền cue sang occurrence khác.
 """,
     },
 ]
@@ -1875,6 +1878,11 @@ def build_v6_generation_messages(
     )
     prompt = messages[-1]["content"].replace(" V5 ", " V6 ").replace("V5 —", "V6 —")
     prompt = prompt.replace(
+        "- Có thể multi-label nếu thật sự phù hợp, nhưng cấm đồng thời isHistorical + isNegated.",
+        "- Có thể multi-label khi nhiều scope cùng đúng; cho phép cả isHistorical + isNegated "
+        "nếu occurrence vừa thuộc tiền sử vừa bị phủ định."
+    )
+    prompt = prompt.replace(
         "Không tạo span cụt kiểu `độ`, `từ`, `nhịp`, `Thiếu`, `chảy`, `bên`, `đau ấn vùng` hay\n"
         "   `phù hợp với`; phải lấy trọn khái niệm có nghĩa.",
         "Không tạo span cụt hoặc từ chức năng đứng riêng; phải lấy trọn khái niệm có nghĩa."
@@ -1884,7 +1892,9 @@ def build_v6_generation_messages(
 CONTRACT V6 BẮT BUỘC:
 - Dữ liệu phải huấn luyện model tránh đúng error_family/assertion_family của NHÓM CHÍNH; không cố tình
   xuất gold sai để mô phỏng prediction sai. Lỗi NER chỉ xuất hiện như bẫy trong raw context, gold luôn đúng.
-- Mỗi entity tối đa một assertion theo contract BTC. TÊN_XÉT_NGHIỆM và KẾT_QUẢ_XÉT_NGHIỆM luôn [].
+- Mỗi entity có thể có 0, 1 hoặc nhiều assertion trong isNegated/isHistorical/isFamily khi
+  từng scope đều có cue cục bộ rõ ràng. Không thêm multi-label chỉ để đủ số lượng.
+  TÊN_XÉT_NGHIỆM và KẾT_QUẢ_XÉT_NGHIỆM luôn [].
 - Không dùng danh sách surface của test làm rule. Tạo từ ngữ mới nhưng giữ cấu trúc lỗi tổng quát.
 """
     if focus_cfg.get("btc_medication_contract"):
@@ -2842,8 +2852,6 @@ def validate_focus_quality(record, focus_cfg):
             if len(entities) < 3 or not any(len(entity["text"]) >= 24 for entity in entities):
                 return "dense_ner_boundaries cần >=3 entity và ít nhất một span dài"
         if focus_cfg.get("mode") == "v6":
-            if any(len(entity.get("assertions") or []) > 1 for entity in entities):
-                return "V6/BTC cho phép tối đa một assertion trên mỗi entity"
             required_assertions = set(focus_cfg.get("required_assertions", []))
             observed_assertions = {
                 assertion
@@ -2858,6 +2866,16 @@ def validate_focus_quality(record, focus_cfg):
                 return (
                     f"V6 cần ít nhất {min_assertion_states} trạng thái assertion, "
                     f"thực tế {len(assertion_states)}"
+                )
+            min_multi = focus_cfg.get("min_multi_assertion_entities", 0)
+            multi_count = sum(
+                len(set(entity.get("assertions") or [])) >= 2
+                for entity in entities
+            )
+            if multi_count < min_multi:
+                return (
+                    f"V6 cần ít nhất {min_multi} entity multi-assertion, "
+                    f"thực tế {multi_count}"
                 )
             if focus_cfg.get("key") == "ner_truncated_and_short_spans":
                 has_long = any(len(entity["text"]) >= 20 for entity in entities)

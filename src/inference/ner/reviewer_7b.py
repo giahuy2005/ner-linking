@@ -7,7 +7,12 @@ from typing import Any
 
 from ...llm.json_guard import extract_json
 from ...llm.prompts import build_ner_7b_request_prompt
-from ..rule.clinical import ALLOWED_ASSERTIONS, ALLOWED_TYPES, deterministic_cleanup
+from ..rule.clinical import (
+    ALLOWED_ASSERTIONS,
+    ALLOWED_TYPES,
+    ASSERTION_ENTITY_TYPES,
+    post_llm_validate,
+)
 from ..schemas import NerEntity
 
 LOGGER = logging.getLogger(__name__)
@@ -22,18 +27,25 @@ def _span(value: Any) -> tuple[int, int] | None:
     return int(value[0]), int(value[1])
 
 
-def _assertions(value: Any, fallback: list[str]) -> list[str] | None:
-    if value is None:
-        return list(fallback)
+def _assertions(
+    value: Any,
+    fallback: list[str],
+    *,
+    entity_type: str,
+) -> list[str] | None:
+    candidate = list(fallback) if value is None else value
     # LLM may return structurally valid JSON with objects/numbers nested in the
-    # assertion list.  Check type before set membership so malformed output is
+    # assertion list. Check type before set membership so malformed output is
     # rejected instead of crashing on an unhashable dict/list.
-    if not isinstance(value, list) or any(
+    if not isinstance(candidate, list) or any(
         not isinstance(item, str) or item not in ALLOWED_ASSERTIONS
-        for item in value
+        for item in candidate
     ):
         return None
-    return list(dict.fromkeys(value))
+    normalized = list(dict.fromkeys(candidate))
+    if entity_type not in ASSERTION_ENTITY_TYPES and normalized:
+        return None
+    return normalized
 
 
 def _validate_response(request: dict, parsed: Any) -> tuple[dict | None, str | None]:
@@ -141,7 +153,11 @@ def _apply_review(raw_text: str, entities: list[NerEntity], request: dict,
             logs.append({"status": "decision_applied", "candidate_id": candidate_id, "action": action})
             continue
         if action == "UPDATE_ASSERTIONS":
-            assertions = _assertions(decision.get("assertions"), original.assertions)
+            assertions = _assertions(
+                decision.get("assertions"),
+                original.assertions,
+                entity_type=original.type,
+            )
             if assertions is None:
                 logs.append({"status": "decision_rejected", "candidate_id": candidate_id,
                              "reason": "invalid_assertions"})
@@ -162,7 +178,11 @@ def _apply_review(raw_text: str, entities: list[NerEntity], request: dict,
             logs.append({"status": "decision_rejected", "candidate_id": candidate_id,
                          "reason": "invalid_type"})
             continue
-        assertions = _assertions(decision.get("assertions"), original.assertions)
+        assertions = _assertions(
+            decision.get("assertions"),
+            original.assertions,
+            entity_type=new_type,
+        )
         if assertions is None:
             logs.append({"status": "decision_rejected", "candidate_id": candidate_id,
                          "reason": "invalid_assertions"})
@@ -185,6 +205,21 @@ def _apply_review(raw_text: str, entities: list[NerEntity], request: dict,
         if reason:
             logs.append({"status": "decision_rejected", "candidate_id": candidate_id, "reason": reason})
             continue
+        conflicting = [
+            other
+            for other_index, other in enumerate(result)
+            if other_index != candidate_id
+            and other is not None
+            and new_span[0] < other.position[1]
+            and new_span[1] > other.position[0]
+        ]
+        if conflicting:
+            logs.append({
+                "status": "decision_rejected",
+                "candidate_id": candidate_id,
+                "reason": "unsafe_overlap",
+            })
+            continue
         result[candidate_id] = NerEntity(new_text, new_type, assertions, new_span, original.score, None)
         logs.append({"status": "decision_applied", "candidate_id": candidate_id, "action": action,
                      "before": original.text, "after": new_text})
@@ -204,7 +239,15 @@ def _apply_recovery(raw_text: str, entities: list[NerEntity], request: dict,
         relative = _span(suggestion.get("relative_position"))
         text = suggestion.get("text")
         entity_type = suggestion.get("type")
-        assertions = _assertions(suggestion.get("assertions", []), [])
+        assertions = (
+            _assertions(
+                suggestion.get("assertions", []),
+                [],
+                entity_type=entity_type,
+            )
+            if isinstance(entity_type, str) and entity_type in ALLOWED_TYPES
+            else None
+        )
         if (
             relative is None
             or not isinstance(text, str)
@@ -260,6 +303,10 @@ def review_entities_batch(raw_texts_by_id: dict[str, str], entities_by_id: dict[
             requests.append(request)
     responses, logs = _generate_requests(requests, llm, batch_size=batch_size,
                                          retry_rounds=retry_rounds)
+    pre_7b_entities = {
+        record_id: list(entities)
+        for record_id, entities in entities_by_id.items()
+    }
     result = {record_id: list(entities) for record_id, entities in entities_by_id.items()}
     for request_id, response in responses.items():
         record_id = request_owner[request_id]
@@ -272,8 +319,25 @@ def review_entities_batch(raw_texts_by_id: dict[str, str], entities_by_id: dict[
                                                 request, response, logs)
     for record_id, entities in result.items():
         entities = [entity for entity in entities if entity is not None]
-        result[record_id], cleanup_logs = deterministic_cleanup(raw_texts_by_id[record_id], entities)
-        logs.extend({"record_id": record_id, **item} for item in cleanup_logs)
+        try:
+            result[record_id], validation_logs = post_llm_validate(
+                raw_texts_by_id[record_id],
+                entities,
+            )
+            logs.extend(
+                {"record_id": record_id, **item}
+                for item in validation_logs
+            )
+        except (TypeError, ValueError) as exc:
+            # Record-level fallback is deliberate: never run semantic cleanup
+            # after 7B and never emit a partially corrupted review result.
+            result[record_id] = list(pre_7b_entities[record_id])
+            logs.append({
+                "status": "record_fallback",
+                "record_id": record_id,
+                "reason": "post_llm_validation_failed",
+                "detail": str(exc),
+            })
     for item in logs:
         LOGGER.info("7b_ner %s", item)
     return result, logs

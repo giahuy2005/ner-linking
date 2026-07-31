@@ -221,8 +221,9 @@ class InferencePipeline:
             audit_missing_entities_batch,
             fix_flagged_entities_batch,
         )
-        from .rule.clinical import deterministic_cleanup
+        from .rule.clinical import pre_llm_cleanup
         from .rule.routing import build_handoff_requests
+        from .ner.two_pass import detect_suspicious_regions
 
         fixed = fix_flagged_entities_batch(
             raw_texts_by_id,
@@ -241,14 +242,23 @@ class InferencePipeline:
         cleaned = {}
         logs = []
         for record_id, entities in fixed.items():
-            cleaned[record_id], record_logs = deterministic_cleanup(
-                raw_texts_by_id[record_id], entities
+            raw_text = raw_texts_by_id[record_id]
+            cleaned[record_id], record_logs = pre_llm_cleanup(
+                raw_text, entities
             )
             logs.extend({"record_id": record_id, **item} for item in record_logs)
-            previous = self.last_two_pass_results.get(record_id)
-            regions = previous.regions if previous is not None else []
+
+            # Recompute from the post-1.5B entity state. Reusing pass-1/pass-2
+            # regions misses newly uncovered repeated occurrences and keeps
+            # regions that the fixer has already resolved.
+            regions = detect_suspicious_regions(raw_text, cleaned[record_id])
+            logs.append({
+                "record_id": record_id,
+                "status": "handoff_regions_recomputed",
+                "region_count": len(regions),
+            })
             self.last_handoffs[record_id] = build_handoff_requests(
-                raw_texts_by_id[record_id], cleaned[record_id], regions,
+                raw_text, cleaned[record_id], regions,
                 request_prefix=record_id,
             )
         self.last_fixer_logs = logs

@@ -25,6 +25,85 @@ from . import sectioner
 from ..schemas import NerEntity, SectionResult
 
 
+def _split_bio_tag(tag: str) -> tuple[str, str | None]:
+    """Split a BIO tag without changing unknown tags.
+
+    Returns ``(prefix, entity_type)``. ``O`` becomes ``("O", None)``.
+    Unknown/malformed tags get prefix ``"INVALID"`` so they lose BIO
+    tie-breaks but are still handled later by ``repair_bio_tags``.
+    """
+    if tag == "O":
+        return "O", None
+    if isinstance(tag, str) and len(tag) > 2 and tag[1] == "-" \
+            and tag[0] in {"B", "I"}:
+        return tag[0], tag[2:]
+    return "INVALID", None
+
+
+def _bio_transition_quality(previous_tag: str, candidate_tag: str) -> int:
+    """Rank BIO compatibility for a candidate at the current word.
+
+    This score is used only after edge distance and model confidence are tied.
+    It therefore cannot make a low-confidence edge prediction beat a stronger
+    central prediction; it only prevents an arbitrary ``I-X`` from winning an
+    otherwise exact tie after ``O`` or another entity type.
+    """
+    prefix, entity_type = _split_bio_tag(candidate_tag)
+    if prefix in {"O", "B"}:
+        return 2
+    if prefix != "I" or entity_type is None:
+        return 0
+
+    previous_prefix, previous_type = _split_bio_tag(previous_tag)
+    if previous_prefix in {"B", "I"} and previous_type == entity_type:
+        return 2
+    return 0
+
+
+def _should_replace_global_tag_choice(
+    previous_choice: tuple[int, str, float] | None,
+    candidate_choice: tuple[int, str, float],
+    *,
+    previous_global_tag: str = "O",
+    confidence_epsilon: float = 1e-12,
+) -> bool:
+    """Choose between overlapping-chunk predictions deterministically.
+
+    Priority is intentionally strict:
+
+    1. prediction farther from the chunk edge;
+    2. higher emission confidence for the CRF-decoded label;
+    3. BIO-compatible transition from the already reconciled previous word;
+    4. exact ties keep the existing choice, making output deterministic.
+
+    Tuple layout remains ``(edge_distance, tag, confidence)`` so the rest of
+    ``predict_text`` and downstream score aggregation stay API-compatible.
+    """
+    if previous_choice is None:
+        return True
+
+    previous_edge, previous_tag, previous_confidence = previous_choice
+    candidate_edge, candidate_tag, candidate_confidence = candidate_choice
+
+    if candidate_edge != previous_edge:
+        return candidate_edge > previous_edge
+
+    confidence_delta = candidate_confidence - previous_confidence
+    if abs(confidence_delta) > confidence_epsilon:
+        return confidence_delta > 0
+
+    previous_bio_quality = _bio_transition_quality(
+        previous_global_tag, previous_tag,
+    )
+    candidate_bio_quality = _bio_transition_quality(
+        previous_global_tag, candidate_tag,
+    )
+    if candidate_bio_quality != previous_bio_quality:
+        return candidate_bio_quality > previous_bio_quality
+
+    return False
+
+
 class NerAssertionModel(nn.Module):
     def __init__(
         self,
@@ -244,10 +323,19 @@ class NerEngine:
                     local_index, valid_word_count - 1 - local_index,
                 )
                 previous = global_tag_choices.get(global_index)
-                if previous is None or edge_distance > previous[0]:
-                    global_tag_choices[global_index] = (
-                        edge_distance, tag, confidence,
-                    )
+                previous_global_choice = global_tag_choices.get(global_index - 1)
+                previous_global_tag = (
+                    previous_global_choice[1]
+                    if previous_global_choice is not None
+                    else "O"
+                )
+                candidate_choice = (edge_distance, tag, confidence)
+                if _should_replace_global_tag_choice(
+                    previous,
+                    candidate_choice,
+                    previous_global_tag=previous_global_tag,
+                ):
+                    global_tag_choices[global_index] = candidate_choice
 
             # Keep the encoder result on CPU so assertion aggregation does not
             # retain all long-document chunks in VRAM.
