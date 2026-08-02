@@ -1,4 +1,4 @@
-"""Surface-agnostic validation between NER and the 7B reviewer.
+"""Surface-agnostic validation between NER and the locked editor.
 
 Only deterministic structure is handled here: offset validation, mechanical
 boundary repair, assertion scope, overlap resolution and medication-list
@@ -101,7 +101,6 @@ def _copy(entity: NerEntity, *, start: int | None = None, end: int | None = None
                   entity.position[1] if end is None else end),
         score=entity.score,
         flag=flag,
-        review_hints=list(entity.review_hints),
     )
 
 
@@ -373,9 +372,7 @@ def _deduplicate_exact_entities(
     """Resolve only exact duplicates before interval scheduling.
 
     Duplicate identity is ``(start, end, type)``. The higher-confidence copy
-    wins; ties prefer the copy carrying more reviewer evidence, then more
-    assertions. Review hints from all duplicates are retained on the winner so
-    structural evidence is not silently lost.
+    wins; ties prefer the copy carrying more assertions.
     """
     best_by_key: dict[tuple[int, int, str], NerEntity] = {}
     logs: list[dict] = []
@@ -387,35 +384,15 @@ def _deduplicate_exact_entities(
             best_by_key[key] = entity
             continue
 
-        previous_rank = (
-            _safe_score(previous),
-            len(previous.review_hints),
-            len(previous.assertions),
-        )
-        entity_rank = (
-            _safe_score(entity),
-            len(entity.review_hints),
-            len(entity.assertions),
-        )
+        previous_rank = (_safe_score(previous), len(previous.assertions))
+        entity_rank = (_safe_score(entity), len(entity.assertions))
         winner, loser = (
             (entity, previous)
             if entity_rank > previous_rank
             else (previous, entity)
         )
 
-        merged_hints: list[dict] = []
-        seen_hints: set[str] = set()
-        for hint in [*winner.review_hints, *loser.review_hints]:
-            if not isinstance(hint, dict):
-                continue
-            marker = repr(sorted(hint.items(), key=lambda item: str(item[0])))
-            if marker in seen_hints:
-                continue
-            seen_hints.add(marker)
-            merged_hints.append(hint)
-
         best_by_key[key] = _copy(winner, flag=winner.flag)
-        best_by_key[key].review_hints = merged_hints
         logs.append({
             "status": "drop",
             "reason": "exact_duplicate",
@@ -602,11 +579,11 @@ def pre_llm_cleanup(
     raw_text: str,
     entities: list[NerEntity],
 ) -> tuple[list[NerEntity], list[dict]]:
-    """Semantic deterministic cleanup used only before the final 7B reviewer.
+    """Semantic deterministic cleanup used only before the final locked editor.
 
     This stage is intentionally allowed to repair boundaries/assertion scope,
     reject hard negatives and resolve overlaps.  It must not be called after
-    Qwen 7B because doing so can silently overwrite a validated LLM decision.
+    Qwen3 editor because doing so can silently overwrite a validated LLM decision.
     """
     logs: list[dict] = []
     cleaned: list[NerEntity] = []
@@ -640,87 +617,11 @@ def deterministic_cleanup(
     return pre_llm_cleanup(raw_text, entities)
 
 
-def post_llm_validate(
-    raw_text: str,
-    entities: list[NerEntity],
-) -> tuple[list[NerEntity], list[dict]]:
-    """Validate Qwen 7B output without changing its semantics.
-
-    Allowed operations are structural only: exact-offset/schema checks, exact
-    duplicate detection, illegal-overlap detection and deterministic sorting.
-    No boundary repair, assertion inference, hard-negative deletion, retyping or
-    score-based overlap resolution is performed here.  Any violation raises so
-    the caller can fall back to the complete pre-7B entity list for that record.
-    """
-    logs: list[dict] = []
-    validated: list[NerEntity] = []
-    seen_keys: set[tuple[int, int, str]] = set()
-
-    for entity_index, entity in enumerate(entities):
-        if not isinstance(entity, NerEntity):
-            raise TypeError(
-                f"post-7B entity {entity_index} must be NerEntity, "
-                f"got {type(entity).__name__}"
-            )
-        if not _exact(raw_text, entity):
-            raise ValueError(
-                f"post-7B invalid exact span at entity {entity_index}: "
-                f"text={entity.text!r}, position={entity.position}"
-            )
-        if any(
-            not isinstance(assertion, str) or assertion not in ALLOWED_ASSERTIONS
-            for assertion in entity.assertions
-        ):
-            raise ValueError(
-                f"post-7B invalid assertion at entity {entity_index}: "
-                f"{entity.assertions!r}"
-            )
-        if len(entity.assertions) != len(set(entity.assertions)):
-            raise ValueError(
-                f"post-7B duplicate assertion at entity {entity_index}: "
-                f"{entity.assertions!r}"
-            )
-        if entity.type not in ASSERTION_ENTITY_TYPES and entity.assertions:
-            raise ValueError(
-                f"post-7B type {entity.type!r} cannot carry assertions: "
-                f"{entity.assertions!r}"
-            )
-
-        key = (entity.position[0], entity.position[1], entity.type)
-        if key in seen_keys:
-            raise ValueError(f"post-7B exact duplicate entity: {key!r}")
-        seen_keys.add(key)
-        validated.append(entity)
-
-    validated.sort(key=lambda item: (item.position[0], item.position[1], item.type))
-
-    # The pre-7B cleanup already produces a non-overlapping list.  Therefore
-    # any overlap here was introduced by a 7B edit/recovery and is rejected
-    # instead of being greedily resolved after the fact.
-    active_end = -1
-    active_entity: NerEntity | None = None
-    for entity in validated:
-        if entity.position[0] < active_end:
-            raise ValueError(
-                "post-7B illegal overlap: "
-                f"{active_entity.text!r}@{active_entity.position} with "
-                f"{entity.text!r}@{entity.position}"
-            )
-        active_end = entity.position[1]
-        active_entity = entity
-
-    logs.append({
-        "status": "post_llm_validated",
-        "entity_count": len(validated),
-    })
-    return validated, logs
-
-
 def _medication_list_entities(raw_text: str) -> list[NerEntity]:
     """Recover medication spans from a numbered pre-admission list.
 
-    Text after ``điều trị`` is deliberately left to NER/LLMs: it may be a
-    symptom or a diagnosis and must not be classified from a memorized phrase.
+    Text after ``điều trị`` is deliberately left to NER/editor review: it may
+    be a symptom or diagnosis and must not be classified from a memorized phrase.
     """
     header = _DRUG_HEADER_RE.search(raw_text)
     if not header:
@@ -733,14 +634,18 @@ def _medication_list_entities(raw_text: str) -> list[NerEntity]:
         item_start = marker.end()
         item_end = markers[index + 1].start() if index + 1 < len(markers) else len(raw_text)
         item = raw_text[item_start:item_end].strip()
-        item_end = item_start + len(item)
         if not item:
             continue
         indication = re.search(r"\s+điều\s+trị\s+", item, flags=re.I)
         drug_text = item[:indication.start()].strip() if indication else item
         drug_end = item_start + len(drug_text)
-        result.append(NerEntity(drug_text, "THUỐC", ["isHistorical"],
-                                (item_start, drug_end), score=1.0))
+        result.append(NerEntity(
+            drug_text,
+            "THUỐC",
+            ["isHistorical"],
+            (item_start, drug_end),
+            score=1.0,
+        ))
     return result
 
 

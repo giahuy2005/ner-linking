@@ -20,7 +20,6 @@ scripts/
 notebook/
   # notebook dung de experiment, khong nen la noi duy nhat chua logic preprocess
 ```
-
 ### Cai VnCoreNLP
 
 `json_to_bio.py` dung VnCoreNLP de word-segment cho ViHealthBERT-word, nen can Java
@@ -115,55 +114,30 @@ Neu tai nguyen han che, co the build tung tier bang `--tiers product` hoac
 
 ## Inference BTC
 
-Chạy batch đầy đủ với two-pass NER, 7B NER review/recovery và 7B linking rerank:
+NER và linking không LLM:
 
 ```bash
 python -m src.inference.cli \
-  --input-dir data/public_test \
+  --input-dir data/input \
   --output-dir output \
-  --with-rxnorm --with-icd10 --with-llm-7b
+  --with-rxnorm --with-icd10
 ```
 
-Luồng mới chạy NER pass 1, phát hiện vùng nghi ngờ, NER pass 2, merge/cleanup,
-rồi tạo hai request grouped `REVIEW_REGION` và `RECOVER_MISSING_ENTITIES` cho
-Qwen2.5-7B. Response phải qua validator exact substring, half-open offset,
-allowed type/assertion, target-id và overlap. Batch lỗi được retry riêng; hết
-retry thì giữ nguyên output trước 7B.
-
-Sau khi NER được xác nhận, RxNorm/ICD-10 retriever hiện có sinh candidate và 7B
-chọn lại trong chính danh sách đó. 7B không được bịa code ngoài candidate;
-response lỗi fallback về thứ tự retriever. `--with-llm-fixer` và
-`--with-llm-selector` là alias của `--with-llm-7b` để script cũ không vỡ.
-
-Config generation nằm ở `src/llm/config.py` trong `NER_REVIEWER_7B_CONFIG`:
-`batch_size=4`, `max_new_tokens=512`, `temperature=0`,
-`max_context_length=8192`, `retry_rounds=1`. Rule được tách trong
-`src/inference/rule/`.
-
-Log validator mẫu:
-
-```text
-7b_ner {'status': 'response_accepted', 'request_id': '1-review-region-0-10-17', 'attempt': 0}
-7b_ner {'status': 'decision_applied', 'candidate_id': 3, 'action': 'REPAIR_SPAN', 'before': 'sốt bn', 'after': 'sốt'}
-7b_ner {'status': 'recovery_rejected', 'reason': 'invalid_exact_span', 'text': 'entity bịa'}
-7b_ner {'status': 'fallback', 'request_id': '2-region-0-20-80', 'reason': 'retry_exhausted_keep_pre_7b'}
-```
-
-Profile mặc định `mixed_v6` sinh dữ liệu theo các nhóm lỗi NER thường gặp,
-assertion có scope khó và contract danh sách thuốc BTC. Trong lúc chạy, script in
-kế hoạch focus, số ca lỗi NER, số ca assertion khó đã sinh và focus bị reject.
-Mỗi reject V6 có thêm `v6_focus`, `v6_error_family`, `v6_assertion_family` để audit.
-Gold thuốc BTC được
-khóa bằng text, boundary, candidate và assertion chính xác; generator vẫn xuất
-schema train NER bằng `text/type/assertions/entity_spans`.
+Pipeline Qwen3-8B:
 
 ```bash
-python scripts/data_gen/generate_data.py --profile mixed_v6 --samples 600
+python -m src.inference.cli \
+  --input-dir data/input \
+  --output-dir output \
+  --with-llm-8b --with-rxnorm --with-icd10 \
+  --llm-dtype bfloat16 --llm-quantization none \
+  --llm-cache-path output/qwen_cache.jsonl \
+  --llm-audit-dir output/audit
 ```
 
-Output mặc định là `data/synthetic/train_500_6.jsonl`, reject log là
-`data/synthetic/reject_500_6.jsonl`. Dữ liệu cần được chuyển BIO và dùng để train
-lại checkpoint NER thì thay đổi mới có hiệu lực.
+Production chỉ dùng một LLM là `Qwen/Qwen3-8B`. Missing recovery chỉ
+chọn proposal có sẵn và linking selector chỉ chọn code trong whitelist.
+Xem `pipeline.md` để biết kiến trúc chi tiết.
 
 ### Chay tren Colab
 

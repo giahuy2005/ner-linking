@@ -354,7 +354,6 @@ def remap_entities_to_raw(
                 position=(raw_start, raw_end),
                 score=entity.score,
                 flag=entity.flag,
-                review_hints=list(entity.review_hints),
             )
         )
 

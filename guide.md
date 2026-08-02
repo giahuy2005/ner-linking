@@ -1,18 +1,17 @@
-# RunPod Guide — chạy thử `ner-linking` pipeline
+# RunPod Guide â€” cháº¡y thá»­ `ner-linking` pipeline
 
-Guide này dùng cho pod mới trên RunPod, thư mục làm việc mặc định là:
+Guide nÃ y dÃ¹ng cho pod má»›i trÃªn RunPod, thÆ° má»¥c lÃ m viá»‡c máº·c Ä‘á»‹nh lÃ :
 
 ```bash
 /workspace/ner-linking
 ```
-
 Repo code:
 
 ```text
 https://github.com/giahuy2005/ner-linking.git
 ```
 
-Model/data/index trên HuggingFace:
+Model/data/index trÃªn HuggingFace:
 
 ```text
 AIwho/ner_llm
@@ -20,9 +19,9 @@ AIwho/ner_llm
 
 ---
 
-## 0. Tạo pod
+## 0. Táº¡o pod
 
-Nên chọn image PyTorch có CUDA sẵn. Sau khi vào terminal pod, kiểm tra GPU:
+NÃªn chá»n image PyTorch cÃ³ CUDA sáºµn. Sau khi vÃ o terminal pod, kiá»ƒm tra GPU:
 
 ```bash
 nvidia-smi
@@ -39,11 +38,11 @@ git clone https://github.com/giahuy2005/ner-linking.git
 cd /workspace/ner-linking
 ```
 
-Nếu repo private thì cần clone bằng token GitHub.
+Náº¿u repo private thÃ¬ cáº§n clone báº±ng token GitHub.
 
 ---
 
-## 2. Cài package hệ thống và Python
+## 2. CÃ i package há»‡ thá»‘ng vÃ  Python
 
 ```bash
 apt-get update
@@ -71,7 +70,7 @@ pip install -U \
   openai
 ```
 
-Kiểm tra các package chính:
+Kiá»ƒm tra cÃ¡c package chÃ­nh:
 
 ```bash
 python - <<'PY'
@@ -85,22 +84,22 @@ PY
 
 ---
 
-## 3. Login HuggingFace nếu repo HF private
+## 3. Login HuggingFace náº¿u repo HF private
 
-Nếu repo `AIwho/ner_llm` private:
+Náº¿u repo `AIwho/ner_llm` private:
 
 ```bash
 hf auth login
 hf auth whoami
 ```
 
-Nếu repo public thì có thể bỏ qua bước này.
+Náº¿u repo public thÃ¬ cÃ³ thá»ƒ bá» qua bÆ°á»›c nÃ y.
 
 ---
 
-## 4. Tải model/data/index từ HuggingFace
+## 4. Táº£i model/data/index tá»« HuggingFace
 
-Quan trọng: repo HF đang có prefix `model_ner/...`, nên phải include đúng prefix này.
+Quan trá»ng: repo HF Ä‘ang cÃ³ prefix `model_ner/...`, nÃªn pháº£i include Ä‘Ãºng prefix nÃ y.
 
 ```bash
 cd /workspace/ner-linking
@@ -128,7 +127,7 @@ mv model_ner/processed ./data/processed
 rm -rf model_ner
 ```
 
-Kiểm tra file:
+Kiá»ƒm tra file:
 
 ```bash
 ls -lah models
@@ -139,11 +138,11 @@ ls -lah models/sapbert
 ls -lah data/processed
 ```
 
-Cần thấy ít nhất:
+Cáº§n tháº¥y Ã­t nháº¥t:
 
 ```text
-models/ner/best_ner_assertion_model.pth
-models/ner/label_dicts_crf.json
+models/ner/best_ner_assertion_span_model.pth
+models/ner/label_dicts.json
 
 models/sapbert/config.json
 models/sapbert/model.safetensors
@@ -167,9 +166,9 @@ models/rxnorm/historical_sapbert_embeddings.npy
 
 ---
 
-## 5. Tải VnCoreNLP
+## 5. Táº£i VnCoreNLP
 
-Không dùng dấu `!` trong terminal Linux.
+KhÃ´ng dÃ¹ng dáº¥u `!` trong terminal Linux.
 
 ```bash
 cd /workspace/ner-linking
@@ -192,15 +191,15 @@ ls -lah vncorenlp/models/wordsegmenter
 
 ---
 
-## 6. Fix nóng path Windows trong config nếu còn lỗi
+## 6. Fix nÃ³ng path Windows trong config náº¿u cÃ²n lá»—i
 
-Nếu chạy mà thấy lỗi kiểu:
+Náº¿u cháº¡y mÃ  tháº¥y lá»—i kiá»ƒu:
 
 ```text
 Repo id ... 'D:\Viettel_AI\viettel_ai_ner\models\sapbert'
 ```
 
-thì chạy block này:
+thÃ¬ cháº¡y block nÃ y:
 
 ```bash
 cd /workspace/ner-linking
@@ -263,14 +262,14 @@ for p in targets:
 PY
 ```
 
-Check lại:
+Check láº¡i:
 
 ```bash
 cat models/icd10/icd10_index_config.json | grep model_id
 cat models/rxnorm/rxnorm_index_config.json | grep model_id
 ```
 
-Kỳ vọng:
+Ká»³ vá»ng:
 
 ```text
 "model_id": "models/sapbert"
@@ -278,124 +277,7 @@ Kỳ vọng:
 
 ---
 
-## 7. Fix nóng lỗi `assertions` do LLM trả dict
-
-Nếu gặp lỗi:
-
-```text
-TypeError: unhashable type: 'dict'
-File ".../src/inference/ner/reviewer_7b.py", line ...
-```
-
-thì LLM reviewer trả `assertions` dạng dict. Chạy block này để patch hàm `_assertions`:
-
-```bash
-cd /workspace/ner-linking
-
-python - <<'PY'
-from pathlib import Path
-
-p = Path("src/inference/ner/reviewer_7b.py")
-lines = p.read_text(encoding="utf-8").splitlines()
-
-start = None
-for i, line in enumerate(lines):
-    if line.startswith("def _assertions("):
-        start = i
-        break
-
-if start is None:
-    raise SystemExit("Không tìm thấy def _assertions")
-
-end = len(lines)
-for j in range(start + 1, len(lines)):
-    if lines[j].startswith("def ") or lines[j].startswith("class "):
-        end = j
-        break
-
-new_func = r'''
-def _assertions(value, fallback=None):
-    """Chuẩn hóa assertions từ output LLM.
-
-    Chấp nhận:
-    - ["isNegated"]
-    - "isNegated"
-    - [{"label": "isNegated"}]
-    - [{"assertion": "isNegated"}]
-    - [{"isNegated": true}]
-    - nested list/dict lỗi nhẹ từ LLM
-
-    Luôn trả list[str] hợp lệ, không crash.
-    """
-    if fallback is None:
-        fallback = []
-
-    allowed = set(ALLOWED_ASSERTIONS)
-    out = []
-
-    alias = {
-        "negated": "isNegated",
-        "negative": "isNegated",
-        "is_negated": "isNegated",
-        "historical": "isHistorical",
-        "history": "isHistorical",
-        "past": "isHistorical",
-        "is_historical": "isHistorical",
-        "family": "isFamily",
-        "family_history": "isFamily",
-        "is_family": "isFamily",
-    }
-
-    def add_one(x):
-        if x is None:
-            return
-
-        if isinstance(x, str):
-            s = x.strip()
-            s = alias.get(s, s)
-            if s in allowed and s not in out:
-                out.append(s)
-            return
-
-        if isinstance(x, dict):
-            for key in ("assertion", "label", "type", "name", "value"):
-                if key in x:
-                    add_one(x.get(key))
-
-            for key, val in x.items():
-                if key in allowed and bool(val):
-                    add_one(key)
-            return
-
-        if isinstance(x, (list, tuple, set)):
-            for item in x:
-                add_one(item)
-            return
-
-    add_one(value)
-
-    priority = ["isNegated", "isFamily", "isHistorical"]
-    out = [a for a in priority if a in out]
-
-    if out:
-        return out
-
-    if value == []:
-        return []
-
-    return list(fallback or [])
-'''.strip("\n").splitlines()
-
-new_lines = lines[:start] + new_func + lines[end:]
-p.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-
-print(f"fixed {p}")
-PY
-```
-
----
-
-## 8. Tạo input test nhanh
+## 8. Táº¡o input test nhanh
 
 ```bash
 cd /workspace/ner-linking
@@ -403,13 +285,13 @@ cd /workspace/ner-linking
 mkdir -p data/input_ output
 
 cat > data/input_/1.txt <<'TXT'
-Bệnh nhân nam 65 tuổi, tiền sử tăng huyết áp và đái tháo đường type 2, đang dùng amlodipine 5 mg uống mỗi ngày và metformin 500 mg uống hai lần mỗi ngày. Hiện vào viện vì đau ngực, khó thở, không sốt. Xét nghiệm glucose máu 12.5 mmol/L, creatinin 110 umol/L. Chẩn đoán: cơn đau thắt ngực không ổn định.
+Bá»‡nh nhÃ¢n nam 65 tuá»•i, tiá»n sá»­ tÄƒng huyáº¿t Ã¡p vÃ  Ä‘Ã¡i thÃ¡o Ä‘Æ°á»ng type 2, Ä‘ang dÃ¹ng amlodipine 5 mg uá»‘ng má»—i ngÃ y vÃ  metformin 500 mg uá»‘ng hai láº§n má»—i ngÃ y. Hiá»‡n vÃ o viá»‡n vÃ¬ Ä‘au ngá»±c, khÃ³ thá»Ÿ, khÃ´ng sá»‘t. XÃ©t nghiá»‡m glucose mÃ¡u 12.5 mmol/L, creatinin 110 umol/L. Cháº©n Ä‘oÃ¡n: cÆ¡n Ä‘au tháº¯t ngá»±c khÃ´ng á»•n Ä‘á»‹nh.
 TXT
 ```
 
 ---
 
-## 9. Chạy thử pipeline
+## 9. Cháº¡y thá»­ pipeline
 
 Xem CLI help:
 
@@ -417,7 +299,7 @@ Xem CLI help:
 python -m src.inference.cli --help
 ```
 
-Chạy full ICD10 + RxNorm:
+Cháº¡y full ICD10 + RxNorm:
 
 ```bash
 python -m src.inference.cli \
@@ -436,9 +318,9 @@ cat output/1.json
 
 ---
 
-## 10. Chạy cả folder 100 file
+## 10. Cháº¡y cáº£ folder 100 file
 
-Đặt input theo dạng:
+Äáº·t input theo dáº¡ng:
 
 ```text
 data/input_/1.txt
@@ -447,7 +329,7 @@ data/input_/2.txt
 data/input_/100.txt
 ```
 
-Chạy:
+Cháº¡y:
 
 ```bash
 cd /workspace/ner-linking
@@ -456,20 +338,20 @@ rm -rf output
 mkdir -p output
 
 python -m src.inference.cli \
-  --input data/input_ \
+  --input-dir data/input_ \
   --output-dir output \
   --with-rxnorm \
   --with-icd10
 ```
 
-Check số file:
+Check sá»‘ file:
 
 ```bash
 find output -name "*.json" | wc -l
 ls -lah output | head
 ```
 
-Zip nộp:
+Zip ná»™p:
 
 ```bash
 cd /workspace/ner-linking
@@ -478,7 +360,7 @@ zip -r output.zip output
 ls -lh output.zip
 ```
 
-Nếu BTC yêu cầu zip giải nén ra trực tiếp các file `.json`, dùng:
+Náº¿u BTC yÃªu cáº§u zip giáº£i nÃ©n ra trá»±c tiáº¿p cÃ¡c file `.json`, dÃ¹ng:
 
 ```bash
 cd /workspace/ner-linking/output
@@ -489,9 +371,9 @@ ls -lh output.zip
 
 ---
 
-## 11. Lệnh debug nhanh
+## 11. Lá»‡nh debug nhanh
 
-### Kiểm tra còn path Windows không
+### Kiá»ƒm tra cÃ²n path Windows khÃ´ng
 
 ```bash
 cd /workspace/ner-linking
@@ -500,20 +382,20 @@ grep -R --exclude="*.pth" --exclude="*.npy" --exclude="*.index" --exclude="*.saf
   "D:\\|D:/|Viettel_AI" -n src models data | head -80
 ```
 
-### Kiểm tra model_id
+### Kiá»ƒm tra model_id
 
 ```bash
 cat models/icd10/icd10_index_config.json | grep model_id
 cat models/rxnorm/rxnorm_index_config.json | grep model_id
 ```
 
-### Kiểm tra SapBERT local đủ file
+### Kiá»ƒm tra SapBERT local Ä‘á»§ file
 
 ```bash
 ls -lah models/sapbert
 ```
 
-Cần có:
+Cáº§n cÃ³:
 
 ```text
 config.json
@@ -523,19 +405,19 @@ special_tokens_map.json
 vocab.txt
 ```
 
-Nếu thiếu `pytorch_model.bin` nhưng có `model.safetensors` thì thường vẫn OK.
+Náº¿u thiáº¿u `pytorch_model.bin` nhÆ°ng cÃ³ `model.safetensors` thÃ¬ thÆ°á»ng váº«n OK.
 
-### Kiểm tra checkpoint NER
+### Kiá»ƒm tra checkpoint NER
 
 ```bash
 ls -lah models/ner
 ```
 
-Cần có:
+Cáº§n cÃ³:
 
 ```text
-best_ner_assertion_model.pth
-label_dicts_crf.json
+best_ner_assertion_span_model.pth
+label_dicts.json
 ```
 
 ### Xem GPU RAM
@@ -546,29 +428,29 @@ watch -n 1 nvidia-smi
 
 ---
 
-## 12. Sau khi chạy xong
+## 12. Sau khi cháº¡y xong
 
-Nếu chỉ test và không muốn tốn tiền nữa:
+Náº¿u chá»‰ test vÃ  khÃ´ng muá»‘n tá»‘n tiá»n ná»¯a:
 
-- `Stop` pod: thường vẫn có thể còn tính tiền storage volume.
-- `Terminate` pod: dừng compute.
-- Xóa volume nếu không cần giữ dữ liệu để tránh phí storage.
+- `Stop` pod: thÆ°á»ng váº«n cÃ³ thá»ƒ cÃ²n tÃ­nh tiá»n storage volume.
+- `Terminate` pod: dá»«ng compute.
+- XÃ³a volume náº¿u khÃ´ng cáº§n giá»¯ dá»¯ liá»‡u Ä‘á»ƒ trÃ¡nh phÃ­ storage.
 
-Trước khi terminate, nhớ tải `output.zip` về.
+TrÆ°á»›c khi terminate, nhá»› táº£i `output.zip` vá».
 
 
-## bash run 
+## Bash run
+
+```bash
 python -m src.inference.cli \
   --input-dir data/input \
-  --output-dir output_15b \
-  --with-llm-fixer \
-  2>&1 | tee run_15b.log
-
-  python -m src.inference.cli \
-  --input-dir data/input \
-  --output-dir output_7b \
-  --with-llm-fixer \
-  --with-llm-7b \
+  --output-dir output \
+  --with-llm-8b \
   --with-rxnorm \
   --with-icd10 \
-  2>&1 | tee run_7b.log
+  --llm-dtype bfloat16 \
+  --llm-quantization none \
+  --llm-cache-path output/qwen_cache.jsonl \
+  --llm-audit-dir output/audit \
+  2>&1 | tee run_qwen3_8b.log
+```

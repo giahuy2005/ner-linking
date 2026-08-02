@@ -7,7 +7,6 @@ Validation fail-fast trước output nằm trong ``io.validate_record_output``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 
 VALID_ENTITY_TYPES = frozenset({
@@ -48,7 +47,7 @@ class NerEntity:
     """Một entity NER + assertion trước khi qua linking.
 
     ``position`` là char offset ``[start, end)`` trên raw text. Các field
-    ``flag`` và ``review_hints`` chỉ dùng nội bộ, không xuất ra JSON BTC.
+    ``flag`` chỉ dùng nội bộ, không xuất ra JSON BTC.
     """
 
     text: str
@@ -57,7 +56,6 @@ class NerEntity:
     position: tuple[int, int] = (0, 0)
     score: float = 1.0
     flag: str | None = None
-    review_hints: list[dict[str, Any]] = field(default_factory=list)
 
     def to_btc_dict(self, candidates: list[str] | None = None) -> dict[str, Any]:
         """Chuyển sang đủ năm field BTC, không tự sửa text/span/assertion.

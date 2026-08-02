@@ -1,10 +1,4 @@
-"""Config cho model local dùng để sửa NER và chọn candidate linking.
-
-RÀNG BUỘC VÒNG 1: model self-host tối đa 9B tham số — Qwen2.5-1.5B và
-Qwen2.5-7B-Instruct đều nằm trong giới hạn khi chạy TÁCH BIỆT (không
-load đồng thời 2 model lên cùng 1 GPU, xem backend.py: load() ->
-dùng -> unload() trước khi load model kia).
-"""
+"""Configuration for the single Qwen3-8B editor/linking selector."""
 
 from __future__ import annotations
 
@@ -27,43 +21,23 @@ class LocalModelConfig:
     temperature: float = 0.0
     max_context_length: int = 8192
     retry_rounds: int = 1
+    dtype: str = "auto"
+    attention_implementation: str | None = "sdpa"
 
 
-# --- Máy dev (có mạng): model_id = repo Hub, local_files_only=False.
-# --- Máy chấm không mạng: đổi model_id="/models/<tên-thư-mục-local>",
-#     local_files_only=True (đã tải sẵn bằng download_models.py hoặc
-#     huggingface-cli download). KHÔNG cần sửa gì khác ở backend.py.
-
-NER_FIXER_CONFIG = LocalModelConfig(
-    # Giữ đúng small-model stage của notebook V11.
-    model_id="Qwen/Qwen2.5-1.5B-Instruct",
+QWEN3_8B_EDITOR_CONFIG = LocalModelConfig(
+    model_id="Qwen/Qwen3-8B",
     revision=None,
     cache_dir=None,
     load_in_4bit=False,
     local_files_only=False,
-    max_new_tokens=240,
-    supports_thinking=False,
+    max_new_tokens=1024,
+    supports_thinking=True,
     enable_thinking=False,
     batch_size=4,
     temperature=0.0,
-    max_context_length=8192,
+    max_context_length=16384,
     retry_rounds=1,
+    dtype="bfloat16",
+    attention_implementation="sdpa",
 )
-
-NER_REVIEWER_7B_CONFIG = LocalModelConfig(
-    model_id="Qwen/Qwen2.5-7B-Instruct",
-    revision=None,
-    cache_dir=None,
-    load_in_4bit=True,
-    local_files_only=False,
-    max_new_tokens=512,
-    supports_thinking=False,
-    enable_thinking=False,
-    batch_size=4,
-    temperature=0.0,
-    max_context_length=8192,
-    retry_rounds=1,
-)
-
-# Compatibility alias: cùng model 7B xử lý NER trước rồi linking rerank.
-CANDIDATE_SELECTOR_CONFIG = NER_REVIEWER_7B_CONFIG

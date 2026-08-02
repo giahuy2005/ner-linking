@@ -39,6 +39,7 @@ def aggregate_term_results(
         code = result["code"]
         current = by_code.get(code)
         if current is None or score > current["score"]:
+            previous_evidence = list(current.get("matched_terms", [])) if current else []
             by_code[code] = {
                 "code": code,
                 "score": score,
@@ -46,7 +47,18 @@ def aggregate_term_results(
                 "language": result["language"],
                 "term_type": result["term_type"],
                 "term_id": result["term_id"],
+                "matched_terms": [{
+                    "text": result["text"], "score": score,
+                    "language": result["language"], "term_type": result["term_type"],
+                }] + previous_evidence,
             }
+        elif current is not None:
+            evidence = {
+                "text": result["text"], "score": score,
+                "language": result["language"], "term_type": result["term_type"],
+            }
+            if evidence not in current["matched_terms"]:
+                current["matched_terms"].append(evidence)
 
     ranked = sorted(by_code.values(), key=lambda item: (-item["score"], item["code"]))
     return ranked[:top_k_codes]
@@ -116,6 +128,23 @@ def _expected_chapters(mention: str) -> tuple[str, ...] | None:
     return None
 
 
+def _query_variants(mention: str) -> list[str]:
+    """Offset-independent retrieval variants; entity text is never changed."""
+    raw = clean_query_text(mention)
+    variants = [raw]
+    normalized = _normalize_alias(raw)
+    stripped = re.sub(r"^(?:bệnh|hội chứng)\s+", "", normalized).strip()
+    if len(stripped) >= 3 and stripped != normalized:
+        variants.append(stripped)
+    suffix_trimmed = re.sub(
+        r"\s+(?:ở|trên|dưới)\s+(?:trẻ(?:\s+em)?|người\s+lớn|nam|nữ)$",
+        "", normalized,
+    ).strip()
+    if len(suffix_trimmed) >= 3 and suffix_trimmed not in variants:
+        variants.append(suffix_trimmed)
+    return variants
+
+
 def _finalize_term_results(
     mention: str,
     term_results: list[dict[str, Any]],
@@ -130,8 +159,13 @@ def _finalize_term_results(
     )
     chapters = _expected_chapters(mention)
     if chapters is not None:
-        ranked = [item for item in ranked if item["code"].startswith(chapters)]
-    return ranked[:min(top_k_codes, config.MAX_FINAL_CODES)]
+        # Chapter hints are soft evidence only; never remove a retrieved gold.
+        for item in ranked:
+            item["chapter_support"] = item["code"].startswith(chapters)
+            if item["chapter_support"]:
+                item["score"] = min(1.0, float(item["score"]) + 0.015)
+        ranked.sort(key=lambda item: (-item["score"], item["code"]))
+    return ranked[:top_k_codes]
 
 
 class Icd10Linker:
@@ -271,16 +305,10 @@ class Icd10Linker:
         min_score: float | None = config.DEFAULT_MIN_SCORE,
     ) -> list[dict[str, Any]]:
         """Link one NER mention and return ICD codes ranked by maximum term score."""
-        exact = _exact_alias_result(mention, self.metadata_alias_codes)
-        if exact is not None:
-            return exact
-        term_results = self.search_terms(mention, top_k_terms=top_k_terms)
-        return _finalize_term_results(
-            mention,
-            term_results,
-            top_k_codes=top_k_codes,
-            min_score=min_score,
-        )
+        return self.link_many(
+            [mention], top_k_terms=top_k_terms,
+            top_k_codes=top_k_codes, min_score=min_score,
+        )[0]
 
     def link_many(
         self,
@@ -296,8 +324,10 @@ class Icd10Linker:
         cleaned = [clean_query_text(mention) for mention in mentions]
         if not cleaned:
             return []
+        variants_by_mention = [_query_variants(mention) for mention in cleaned]
+        flat_variants = [variant for variants in variants_by_mention for variant in variants]
         queries = self.encoder.encode(
-            cleaned,
+            flat_variants,
             batch_size=self.query_batch_size,
             show_progress=False,
             normalize=True,
@@ -305,12 +335,19 @@ class Icd10Linker:
         count = min(top_k_terms, int(self.index.ntotal))
         scores, indices = self.index.search(queries, count)
         output = []
-        for mention, row_scores, row_indices in zip(cleaned, scores, indices):
+        cursor = 0
+        for mention, variants in zip(cleaned, variants_by_mention):
             exact = _exact_alias_result(mention, self.metadata_alias_codes)
             if exact is not None:
                 output.append(exact)
+                cursor += len(variants)
                 continue
-            term_results = self._term_results_from_search(row_scores, row_indices)
+            term_results = []
+            for row_scores, row_indices in zip(
+                scores[cursor:cursor + len(variants)], indices[cursor:cursor + len(variants)],
+            ):
+                term_results.extend(self._term_results_from_search(row_scores, row_indices))
+            cursor += len(variants)
             output.append(
                 _finalize_term_results(
                     mention,
@@ -320,6 +357,21 @@ class Icd10Linker:
                 )
             )
         return output
+
+    def predict(
+        self,
+        mention: str,
+        *,
+        top_k_terms: int = config.DEFAULT_TOP_K_TERMS,
+        min_score: float | None = config.DEFAULT_MIN_SCORE,
+    ) -> list[dict[str, Any]]:
+        """Conservative non-LLM final policy, distinct from high-recall link()."""
+        exact = _exact_alias_result(mention, self.metadata_alias_codes)
+        if exact is not None:
+            return exact[:1]
+        # Dense rank alone is not calibrated enough for a final code. Ambiguous
+        # cases are intentionally left for the whitelisted selector or abstain.
+        return []
 
 
 def parse_args() -> argparse.Namespace:

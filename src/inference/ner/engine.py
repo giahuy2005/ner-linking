@@ -9,11 +9,13 @@ nhưng assertion head học sai vùng pooling).
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchcrf import CRF  # pip install pytorch-crf
 from transformers import AutoModel, AutoTokenizer
 
@@ -23,6 +25,40 @@ from . import postprocessor as pp
 from . import repair_gate
 from . import sectioner
 from ..schemas import NerEntity, SectionResult
+from .evidence import CrfMarginalEvidence, NerDetailedResult, SpanCandidateEvidence, WordEvidence
+
+
+def crf_token_marginals(crf, emissions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Return exact token marginals for a linear-chain CRF."""
+    mask = mask.bool()
+    batch_size, sequence_length, num_tags = emissions.shape
+    marginals = emissions.new_zeros(batch_size, sequence_length, num_tags)
+    for batch_index in range(batch_size):
+        length = int(mask[batch_index].long().sum().item())
+        if length <= 0:
+            continue
+        current = emissions[batch_index, :length]
+        alpha = emissions.new_empty(length, num_tags)
+        alpha[0] = crf.start_transitions + current[0]
+        for token_index in range(1, length):
+            alpha[token_index] = torch.logsumexp(
+                alpha[token_index - 1].unsqueeze(1)
+                + crf.transitions
+                + current[token_index].unsqueeze(0),
+                dim=0,
+            )
+        log_partition = torch.logsumexp(alpha[-1] + crf.end_transitions, dim=0)
+        beta = emissions.new_empty(length, num_tags)
+        beta[-1] = crf.end_transitions
+        for token_index in range(length - 2, -1, -1):
+            beta[token_index] = torch.logsumexp(
+                crf.transitions
+                + current[token_index + 1].unsqueeze(0)
+                + beta[token_index + 1].unsqueeze(0),
+                dim=1,
+            )
+        marginals[batch_index, :length] = torch.softmax(alpha + beta - log_partition, dim=-1)
+    return marginals
 
 
 def _split_bio_tag(tag: str) -> tuple[str, str | None]:
@@ -109,9 +145,13 @@ class NerAssertionModel(nn.Module):
         self,
         model_name: str,
         num_ner_tags: int,
+        num_span_labels: int | None = None,
         num_assert_labels: int = 3,
         dropout: float = 0.1,
         assertion_dropout: float = 0.3,
+        span_dropout: float = cfg.SPAN_DROPOUT,
+        span_width_embedding_dim: int = cfg.SPAN_WIDTH_EMBEDDING_DIM,
+        max_span_width_words: int = cfg.SPAN_MAX_WIDTH_WORDS,
         context_window: int = 10,
         num_frozen_layers: int = 0,
         freeze_embeddings: bool = True,
@@ -126,6 +166,26 @@ class NerAssertionModel(nn.Module):
 
         self.ner_head = nn.Linear(hidden_size, num_ner_tags)
         self.crf = CRF(num_ner_tags, batch_first=True)
+
+        self.num_span_labels = int(num_span_labels or 0)
+        self.max_span_width_words = int(max_span_width_words)
+        if self.num_span_labels:
+            self.span_dropout = nn.Dropout(span_dropout)
+            self.span_width_embedding = nn.Embedding(
+                self.max_span_width_words + 1, span_width_embedding_dim,
+            )
+            span_feature_size = hidden_size * 3 + span_width_embedding_dim
+            self.span_head = nn.Sequential(
+                nn.LayerNorm(span_feature_size),
+                nn.Linear(span_feature_size, hidden_size),
+                nn.GELU(),
+                nn.Dropout(span_dropout),
+                nn.Linear(hidden_size, self.num_span_labels),
+            )
+        else:
+            self.span_dropout = None
+            self.span_width_embedding = None
+            self.span_head = None
 
         self.assertion_head = nn.Sequential(
             nn.LayerNorm(hidden_size * 2),
@@ -188,7 +248,41 @@ class NerAssertionModel(nn.Module):
 
         return span_vectors, span_owner
 
-    def forward(self, input_ids, attention_mask, assertion_spans_batch, ner_labels=None):
+    def _pool_candidate_spans(self, hidden_states: torch.Tensor, span_candidates_batch: list):
+        if self.span_width_embedding is None:
+            return hidden_states.new_zeros((0, 0)), []
+        batch_indices, starts, ends, widths, owners = [], [], [], [], []
+        for batch_index, spans in enumerate(span_candidates_batch):
+            for span in spans:
+                start, end = int(span["token_start"]), int(span["token_end"])
+                if end <= start:
+                    continue
+                batch_indices.append(batch_index)
+                starts.append(start)
+                ends.append(end)
+                widths.append(min(int(span.get("width_words", end - start)), self.max_span_width_words))
+                owners.append((batch_index, span))
+        if not owners:
+            size = hidden_states.size(-1) * 3 + self.span_width_embedding.embedding_dim
+            return hidden_states.new_zeros((0, size)), owners
+        device = hidden_states.device
+        batches = torch.tensor(batch_indices, dtype=torch.long, device=device)
+        starts_t = torch.tensor(starts, dtype=torch.long, device=device)
+        ends_t = torch.tensor(ends, dtype=torch.long, device=device)
+        widths_t = torch.tensor(widths, dtype=torch.long, device=device)
+        prefix = F.pad(hidden_states.cumsum(dim=1), (0, 0, 1, 0))
+        mean_repr = (prefix[batches, ends_t] - prefix[batches, starts_t]) / (
+            ends_t - starts_t
+        ).clamp_min(1).unsqueeze(-1)
+        return torch.cat([
+            hidden_states[batches, starts_t],
+            hidden_states[batches, ends_t - 1],
+            mean_repr,
+            self.span_width_embedding(widths_t),
+        ], dim=-1), owners
+
+    def forward(self, input_ids, attention_mask, assertion_spans_batch, ner_labels=None,
+                span_candidates_batch=None, decode_ner: bool = True):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         encoder_hidden = outputs.last_hidden_state
 
@@ -205,8 +299,18 @@ class NerAssertionModel(nn.Module):
             "ner_emissions": ner_emissions,
             "assertion_logits": assertion_logits,
             "span_owner": span_owner,
-            "ner_pred_tags": self.crf.decode(ner_emissions, mask=mask),
+            "ner_pred_tags": self.crf.decode(ner_emissions, mask=mask) if decode_ner else [],
         }
+        if self.span_head is not None:
+            span_candidates_batch = span_candidates_batch or [[] for _ in range(input_ids.size(0))]
+            features, owners = self._pool_candidate_spans(
+                self.span_dropout(encoder_hidden), span_candidates_batch,
+            )
+            result["span_logits"] = self.span_head(features)
+            result["span_candidate_owner"] = owners
+        else:
+            result["span_logits"] = encoder_hidden.new_zeros((0, 0))
+            result["span_candidate_owner"] = []
         return result
 
 
@@ -214,12 +318,13 @@ class NerEngine:
     """Wrap model + tokenizer + VnCoreNLP, expose predict API cấp cao."""
 
     def __init__(self, model: NerAssertionModel, tokenizer, rdr, id2nerlabel: dict,
-                 id2assertlabel: dict, device: torch.device):
+                 id2assertlabel: dict, device: torch.device, id2spanlabel: dict | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.rdr = rdr
         self.id2nerlabel = id2nerlabel
         self.id2assertlabel = id2assertlabel
+        self.id2spanlabel = id2spanlabel or {}
         self.device = device
 
     @classmethod
@@ -240,25 +345,70 @@ class NerEngine:
             label_dicts = json.load(f)
         nerlabel2id = label_dicts["nerlabel2id"]
         assertlabel2id = label_dicts["assertlabel2id"]
+        spanlabel2id = label_dicts.get("spanlabel2id") or label_dicts.get("span_label2id")
         id2nerlabel = {v: k for k, v in nerlabel2id.items()}
         id2assertlabel = {v: k for k, v in assertlabel2id.items()}
+        id2spanlabel = {v: k for k, v in (spanlabel2id or {}).items()}
 
         tokenizer = AutoTokenizer.from_pretrained(backbone)
+
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        has_span_weights = any(
+            key.startswith("span_head.") or key.startswith("span_width_embedding.")
+            for key in state_dict
+        )
+        if has_span_weights and spanlabel2id:
+            num_span_labels = len(spanlabel2id)
+        elif has_span_weights:
+            output_keys = [
+                key for key in state_dict
+                if key.startswith("span_head.") and key.endswith(".weight")
+            ]
+            if not output_keys:
+                raise ValueError("span checkpoint has no span_head output weight")
+            output_key = sorted(output_keys, key=lambda key: int(key.split(".")[1]))[-1]
+            num_span_labels = int(state_dict[output_key].shape[0])
+        else:
+            num_span_labels = 0
 
         model = NerAssertionModel(
             model_name=backbone,
             num_ner_tags=len(nerlabel2id),
+            num_span_labels=num_span_labels,
             num_assert_labels=len(assertlabel2id),
             context_window=context_window,
         )
-        state_dict = torch.load(checkpoint_path, map_location=resolved_device)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=True)
+        if not has_span_weights:
+            warnings.warn(
+                "CRF-only checkpoint: span-head inference is disabled",
+                RuntimeWarning,
+            )
         model.to(resolved_device)
         model.eval()
 
         rdr = VnCoreNLP(str(vncorenlp_jar), annotators="wseg", max_heap_size="-Xmx2g")
 
-        return cls(model, tokenizer, rdr, id2nerlabel, id2assertlabel, resolved_device)
+        return cls(
+            model, tokenizer, rdr, id2nerlabel, id2assertlabel,
+            resolved_device, id2spanlabel,
+        )
+
+    def move_to(self, device: str | torch.device) -> None:
+        """Move model and update tensor-creation device atomically."""
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            resolved = torch.device("cpu")
+        self.model.to(resolved)
+        self.device = resolved
+        self.model.eval()
+
+    def offload_to_cpu(self) -> None:
+        self.move_to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def predict_text(
@@ -469,6 +619,167 @@ class NerEngine:
             for d in final_dicts
         ]
 
+    @torch.no_grad()
+    def predict_text_detailed(
+        self,
+        text: str,
+        *,
+        max_len: int = cfg.MAX_LEN,
+        overlap_words: int = cfg.OVERLAP_WORDS,
+        span_add_threshold: float = cfg.SPAN_ADD_THRESHOLD,
+        span_audit_threshold: float = cfg.SPAN_AUDIT_THRESHOLD,
+        **predict_kwargs,
+    ) -> NerDetailedResult:
+        """Return CRF output plus exact marginals and optional span-head evidence.
+
+        Span candidates below the final lattice threshold are retained down to
+        ``span_audit_threshold`` for proposal-oracle audit.  A CRF-only
+        checkpoint produces the same final entities and an explicit disabled log.
+        """
+        self.model.eval()
+        crf_entities = self.predict_text(
+            text, max_len=max_len, overlap_words=overlap_words, **predict_kwargs,
+        )
+        tokens, offsets, line_ids = om.segment_with_offsets(text, self.rdr)
+        result = NerDetailedResult(
+            raw_text_length=len(text),
+            clean_text_length=len(text),
+            crf_entities=list(crf_entities),
+            lattice_entities=list(crf_entities),
+            final_entities=list(crf_entities),
+            thresholds={
+                "span_add": float(span_add_threshold),
+                "span_audit": float(span_audit_threshold),
+                "span_repair": float(cfg.SPAN_REPAIR_THRESHOLD),
+                "span_retype": float(cfg.SPAN_RETYPE_THRESHOLD),
+                "o_token_entity_mass": float(cfg.O_TOKEN_ENTITY_MASS_THRESHOLD),
+                "local_verification": float(cfg.LOCAL_VERIFICATION_THRESHOLD),
+            },
+            span_head_enabled=self.model.span_head is not None,
+        )
+        if not tokens:
+            return result
+
+        global_choices: dict[int, dict[str, Any]] = {}
+        span_by_key: dict[tuple[int, int, str], SpanCandidateEvidence] = {}
+        for chunk_start, requested_end in om.make_word_chunks(
+            tokens, self.tokenizer, max_len=max_len, overlap_words=overlap_words,
+        ):
+            chunk_tokens = tokens[chunk_start:requested_end]
+            input_ids, attention_mask, word_starts, word_lengths = om.encode_words_for_inference(
+                self.tokenizer, chunk_tokens, max_len=max_len,
+            )
+            valid_count = len(word_starts)
+            if not valid_count:
+                continue
+            ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+            mask = torch.tensor([attention_mask], dtype=torch.long, device=self.device)
+            hidden = self.model.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+            emissions = self.model.ner_head(self.model.ner_dropout(hidden))
+            decoded = self.model.crf.decode(emissions, mask=mask.bool())[0]
+            marginals = crf_token_marginals(self.model.crf, emissions, mask.bool())[0]
+            for local_index, subword_start in enumerate(word_starts):
+                if subword_start >= len(decoded):
+                    continue
+                global_index = chunk_start + local_index
+                edge = min(local_index, valid_count - 1 - local_index)
+                probabilities = marginals[subword_start].detach().cpu().tolist()
+                choice = {
+                    "edge": edge,
+                    "decoded": pp.get_label(self.id2nerlabel, decoded[subword_start]),
+                    "probabilities": probabilities,
+                }
+                previous = global_choices.get(global_index)
+                if previous is None or edge > previous["edge"]:
+                    global_choices[global_index] = choice
+
+            if self.model.span_head is None:
+                continue
+            candidates = []
+            for local_start in range(valid_count):
+                for local_end in range(local_start + 1, min(valid_count, local_start + self.model.max_span_width_words) + 1):
+                    if line_ids[chunk_start + local_start] != line_ids[chunk_start + local_end - 1]:
+                        break
+                    last = local_end - 1
+                    candidates.append({
+                        "token_start": word_starts[local_start],
+                        "token_end": word_starts[last] + word_lengths[last],
+                        "global_word_start": chunk_start + local_start,
+                        "global_word_end": chunk_start + local_end,
+                        "width_words": local_end - local_start,
+                    })
+            features, owners = self.model._pool_candidate_spans(
+                self.model.span_dropout(hidden), [candidates],
+            )
+            if not owners:
+                continue
+            probabilities = torch.softmax(self.model.span_head(features), dim=-1)
+            for row, (_, owner) in enumerate(owners):
+                score, label_id = probabilities[row].max(dim=-1)
+                score_value = float(score.item())
+                label = self.id2spanlabel.get(int(label_id.item()))
+                if label in {None, "NONE", "O"} or score_value < span_audit_threshold:
+                    continue
+                word_start, word_end = owner["global_word_start"], owner["global_word_end"]
+                char_start, char_end = offsets[word_start][0], offsets[word_end - 1][1]
+                if not (0 <= char_start < char_end <= len(text)):
+                    continue
+                evidence = SpanCandidateEvidence(
+                    char_start, char_end, label, score_value, word_start, word_end,
+                )
+                key = (char_start, char_end, label)
+                if key not in span_by_key or score_value > span_by_key[key].score:
+                    span_by_key[key] = evidence
+
+        result.span_candidates = sorted(
+            span_by_key.values(), key=lambda item: (item.start, item.end, item.type),
+        )
+        repaired_tags = pp.repair_bio_tags([
+            global_choices.get(index, {}).get("decoded", "O") for index in range(len(tokens))
+        ])
+        id_to_label = {int(key): value for key, value in self.id2nerlabel.items()}
+        o_id = next((key for key, value in id_to_label.items() if value == "O"), None)
+        for index, token in enumerate(tokens):
+            choice = global_choices.get(index)
+            probabilities = choice["probabilities"] if choice else []
+            prob_map = {id_to_label[i]: float(value) for i, value in enumerate(probabilities) if i in id_to_label}
+            non_o = [(label, probability) for label, probability in prob_map.items() if label != "O"]
+            top_label, top_probability = max(non_o, key=lambda item: item[1], default=(None, 0.0))
+            o_probability = probabilities[o_id] if o_id is not None and o_id < len(probabilities) else 1.0
+            result.words.append(WordEvidence(
+                index=index,
+                text=token,
+                start=offsets[index][0],
+                end=offsets[index][1],
+                line_id=line_ids[index],
+                crf=CrfMarginalEvidence(
+                    decoded_tag=choice["decoded"] if choice else "O",
+                    repaired_tag=repaired_tags[index],
+                    probabilities=prob_map,
+                    entity_mass=max(0.0, min(1.0, 1.0 - float(o_probability))),
+                    top_non_o_label=top_label,
+                    top_non_o_probability=float(top_probability),
+                ),
+            ))
+
+        # Conservative lattice rescue: only non-overlapping, high-confidence
+        # span-only candidates are added. Boundary/retype conflicts remain audit
+        # evidence for the locked editor instead of silently mutating offsets.
+        lattice = list(crf_entities)
+        for span in sorted(result.span_candidates, key=lambda item: -item.score):
+            if span.score < span_add_threshold:
+                continue
+            if any(span.start < entity.position[1] and span.end > entity.position[0] for entity in lattice):
+                continue
+            lattice.append(NerEntity(text[span.start:span.end], span.type, [], (span.start, span.end), span.score))
+        lattice.sort(key=lambda item: (*item.position, item.type))
+        result.lattice_entities = lattice
+        result.final_entities = lattice
+        if self.model.span_head is None:
+            result.logs.append({"level": "warning", "event": "span_head_disabled", "reason": "checkpoint_is_crf_only"})
+        result.validate_offsets(text)
+        return result
+
     def predict_file(self, filepath: str | Path, **predict_kwargs) -> dict[int, SectionResult]:
         """Đọc 1 file .txt, tách section (EMR + QA), làm sạch + predict
         RIÊNG từng section — đúng kiến trúc bạn đang dùng."""
@@ -503,7 +814,6 @@ class NerEngine:
                 entities.append(NerEntity(
                     entity.text, entity.type, list(entity.assertions),
                     (global_start, global_end), entity.score, entity.flag,
-                    list(entity.review_hints),
                 ))
             results[block_id] = SectionResult(section_no, title, entities)
 

@@ -2,13 +2,10 @@ import unittest
 
 from src.inference import io as inference_io
 from src.inference.pipeline import InferencePipeline
-from src.inference.ner.llm_fixer import _locate_span, audit_missing_entities
 from src.inference.ner import offset_mapper, postprocessor
 from src.inference.ner.sectioner import split_sections_by_header
-from src.inference.ner.repair_gate import filter_entities
 from src.inference.schemas import NerEntity
 from src.inference.selection.candidate_selector import select_candidates, select_candidates_many
-from src.llm.config import NER_FIXER_CONFIG
 from src.linking.rxnorm.reranker import RxNormRuleReranker
 from src.linking.rxnorm.schemas import ParsedDrugMention, RxNormCandidate
 
@@ -98,123 +95,6 @@ class InferenceRegressionTests(unittest.TestCase):
         self.assertEqual(["sốt", "đau"], [entity.text for entity in result])
         self.assertTrue(all(raw[start:end] == entity.text for entity in result
                             for start, end in [entity.position]))
-
-    def test_small_fixer_uses_notebook_qwen25_15b_model(self):
-        self.assertEqual("Qwen/Qwen2.5-1.5B-Instruct", NER_FIXER_CONFIG.model_id)
-        self.assertFalse(NER_FIXER_CONFIG.supports_thinking)
-
-    def test_small_fixer_stage_is_distinct_from_7b_reviewer(self):
-        raw = "Bệnh nhân sốt."
-        start = raw.index("sốt")
-        entity = NerEntity(
-            "sốt", "TRIỆU_CHỨNG", [], (start, start + 3),
-            score=0.4, flag="low_emission_confidence",
-        )
-        llm = _BatchLlm([
-            '{"action":"keep","text":"sốt","type":"TRIỆU_CHỨNG"}',
-        ])
-        pipeline = InferencePipeline(object())
-
-        result = pipeline.run_fixer_stage(
-            {"doc": raw}, {"doc": [entity]}, llm,
-            audit_missing=False, batch_size=4,
-        )
-
-        self.assertEqual(["sốt"], [item.text for item in result["doc"]])
-        self.assertIsNone(result["doc"][0].flag)
-        self.assertEqual(1, llm.calls)
-
-    def test_small_fixer_blocks_unsafe_drop_for_7b_handoff(self):
-        raw = "Bệnh nhân đau đầu."
-        start = raw.index("đau đầu")
-        entity = NerEntity(
-            "đau đầu", "TRIỆU_CHỨNG", [], (start, start + len("đau đầu")),
-            score=0.60, flag="low_emission_confidence",
-        )
-        llm = _BatchLlm([
-            '{"action":"drop","text":"đau đầu","type":"TRIỆU_CHỨNG"}',
-        ])
-        pipeline = InferencePipeline(object())
-
-        result = pipeline.run_fixer_stage(
-            {"doc": raw}, {"doc": [entity]}, llm,
-            audit_missing=False,
-        )
-
-        self.assertEqual(["đau đầu"], [item.text for item in result["doc"]])
-        self.assertEqual("low_emission_confidence", result["doc"][0].flag)
-        self.assertIn("doc", pipeline.last_handoffs)
-        target = pipeline.last_handoffs["doc"]["review_regions"][0]["targets"][0]
-        self.assertEqual("blocked_unsafe_drop",
-                         target["small_llm_review_hints"][0]["status"])
-
-    def test_small_fixer_retype_is_only_a_hint_for_constrained_7b_target(self):
-        raw = "Bệnh nhân có hội chứng lạ."
-        start = raw.index("hội chứng lạ")
-        entity = NerEntity(
-            "hội chứng lạ", "CHẨN_ĐOÁN", [], (start, start + len("hội chứng lạ")),
-            score=0.50, flag="low_emission_confidence",
-        )
-        llm = _BatchLlm([
-            '{"action":"retype","text":"hội chứng lạ","type":"TRIỆU_CHỨNG"}',
-        ])
-        pipeline = InferencePipeline(object())
-
-        result = pipeline.run_fixer_stage(
-            {"doc": raw}, {"doc": [entity]}, llm,
-            audit_missing=False,
-        )
-
-        # 1.5B cannot mutate the type; 7B receives the suggestion as evidence.
-        self.assertEqual("CHẨN_ĐOÁN", result["doc"][0].type)
-        target = pipeline.last_handoffs["doc"]["review_regions"][0]["targets"][0]
-        hint = target["small_llm_review_hints"][0]
-        self.assertEqual("RETYPE_SUGGEST", hint["requested_action"])
-        self.assertEqual("TRIỆU_CHỨNG", hint["suggested_type"])
-
-    def test_low_confidence_entity_is_flagged_for_1_5b(self):
-        kept, dropped = filter_entities([{
-            "text": "lazer (tbm)",
-            "type": "TÊN_XÉT_NGHIỆM",
-            "assertions": [],
-            "position": [10, 21],
-            "score": 0.74,
-        }])
-        self.assertEqual([], dropped)
-        self.assertEqual("low_emission_confidence", kept[0]["flag"])
-
-    def test_short_span_is_reviewed_but_never_rule_dropped(self):
-        kept, dropped = filter_entities([{
-            "text": "ho",
-            "type": "TRIỆU_CHỨNG",
-            "assertions": [],
-            "position": [10, 12],
-            "score": 0.99,
-        }])
-
-        self.assertEqual([], dropped)
-        self.assertEqual("short_span_review", kept[0]["flag"])
-
-    def test_recall_audit_adds_only_exact_uncovered_entity(self):
-        raw = "Đang dùng aspirin 81 mg daily và không sốt."
-        fever_start = raw.index("sốt")
-        existing = [NerEntity(
-            text="sốt",
-            type="TRIỆU_CHỨNG",
-            assertions=["isNegated"],
-            position=(fever_start, fever_start + 3),
-        )]
-        llm = _StaticLlm(
-            '{"additions":['
-            '{"text":"aspirin 81 mg daily","type":"THUỐC","assertions":[]},'
-            '{"text":"không tồn tại","type":"CHẨN_ĐOÁN","assertions":[]}'
-            ']}'
-        )
-
-        audited = audit_missing_entities(raw, existing, llm)
-
-        self.assertEqual(["aspirin 81 mg daily", "sốt"], [entity.text for entity in audited])
-        self.assertEqual(raw.index("aspirin"), audited[0].position[0])
 
     def test_exact_icd_candidate_bypasses_llm(self):
         candidates = [{
@@ -483,14 +363,6 @@ class InferenceRegressionTests(unittest.TestCase):
         self.assertEqual({"1": {0: ["aspirin-2"]}, "2": {0: ["metformin-1"]}}, attached)
         self.assertEqual(1, llm.calls)
         self.assertEqual(2, llm.prompt_count)
-
-    def test_retrim_uses_nearest_repeated_occurrence(self):
-        raw = "thiếu máu đã ổn. Hiện không có thiếu máu."
-        old_start = raw.rfind("thiếu")
-
-        span = _locate_span(raw, (old_start, old_start + 5), "thiếu máu", radius=60)
-
-        self.assertEqual((raw.rfind("thiếu máu"), len(raw) - 1), span)
 
 
 if __name__ == "__main__":

@@ -1,22 +1,4 @@
-"""Điều phối: two-pass NER -> 1.5B fixer -> 7B review -> linking -> BTC JSON.
-
-Hai LLM được load tuần tự: Qwen2.5-1.5B sửa batch rồi unload; Qwen 7B review
-NER, rerank candidate linking, rồi mới unload.
-
-Luồng dùng đúng cho batch (xem cli.py):
-    entities_by_id = pipeline.run_ner_stage(raw_texts_by_id)
-    fixer_1_5b.load(); entities_by_id = pipeline.run_fixer_stage(...)
-    fixer_1_5b.unload()
-    reviewer_7b.load(); entities_by_id = pipeline.run_7b_ner_stage(...)
-    candidates_by_id = pipeline.run_linking_stage(entities_by_id, selector_llm=reviewer_7b)
-    reviewer_7b.unload()
-    outputs = pipeline.build_outputs(entities_by_id, candidates_by_id)
-
-`process_record()` / `process_file()` vẫn giữ lại cho test nhanh 1 file
-(1 record thì load/unload 1 lần cũng không sao) — nhận thẳng instance
-LocalLLM ĐÃ LOAD (fixer_llm=..., selector_llm=...), không tự load bên
-trong pipeline nữa.
-"""
+"""Production pipeline: detailed CRF/span NER -> Qwen3 editor -> linking."""
 
 from __future__ import annotations
 
@@ -82,9 +64,9 @@ class InferencePipeline:
         self._linkers = {"rxnorm": rxnorm_linker, "icd10": icd10_linker}
         self.top_k_candidates = top_k_candidates
         self.last_two_pass_results = {}
-        self.last_handoffs = {}
-        self.last_fixer_logs = []
-        self.last_7b_logs = []
+        self.last_detailed_results = {}
+        self.last_editor_audit = {}
+        self.last_linking_retrieval = {}
 
     @classmethod
     def load(
@@ -130,13 +112,12 @@ class InferencePipeline:
         raw_texts_by_id: dict[str, str],
         *,
         two_pass: bool = True,
-        maximum_second_pass_regions: int = 24,
+        maximum_second_pass_regions: int = cfg.MAXIMUM_SECOND_PASS_REGIONS,
         **predict_kwargs,
     ) -> dict[str, list[NerEntity]]:
         from .ner.two_pass import run_two_pass_ner
         from .ner.sectioner import split_sections_by_header
         from .rule.clinical import apply_clinical_rules
-        from .rule.routing import build_handoff_requests
 
         entities_by_id: dict[str, list[NerEntity]] = {}
         for rid, raw_text in raw_texts_by_id.items():
@@ -167,7 +148,6 @@ class InferencePipeline:
                         position=(global_start, global_end),
                         score=entity.score,
                         flag=entity.flag,
-                        review_hints=list(entity.review_hints),
                     ))
             pass1.sort(key=lambda entity: (
                 entity.position[0], entity.position[1], entity.type,
@@ -186,115 +166,151 @@ class InferencePipeline:
                 )
                 final = result.final_entities
                 self.last_two_pass_results[rid] = result
-                self.last_handoffs[rid] = build_handoff_requests(
-                    raw_text, final, result.regions, request_prefix=rid
-                )
             else:
                 final, logs = apply_clinical_rules(raw_text, pass1)
                 self.last_two_pass_results[rid] = None
-                self.last_handoffs[rid] = build_handoff_requests(
-                    raw_text, final, [], request_prefix=rid
-                )
             entities_by_id[rid] = final
         return entities_by_id
 
-    # ------------------------------------------------------------
-    # Stage 2 (optional): grouped 7B NER review/recovery, before linking.
-    # ------------------------------------------------------------
-    def run_fixer_stage(
+    def run_ner_stage_detailed(
         self,
         raw_texts_by_id: dict[str, str],
-        entities_by_id: dict[str, list[NerEntity]],
-        fixer_llm,
-        *,
-        audit_missing: bool = True,
-        batch_size: int = 4,
-    ) -> dict[str, list[NerEntity]]:
-        """Run the notebook small-model stage before the separate 7B stage.
+        **predict_kwargs,
+    ):
+        """Run offset-preserving section inference and retain detailed evidence."""
+        from .ner.evidence import NerDetailedResult, SpanCandidateEvidence, WordEvidence
+        from .ner.sectioner import split_sections_by_header
 
-        Qwen2.5-1.5B reviews candidates flagged by the deterministic gates in
-        batches.  Its output is schema/offset checked, then the optional recall
-        audit is also batched.  Final deterministic cleanup prevents an unsafe
-        small-model suggestion from reaching 7B/linking unchecked.
-        """
-        from .ner.llm_fixer import (
-            audit_missing_entities_batch,
-            fix_flagged_entities_batch,
-        )
-        from .rule.clinical import pre_llm_cleanup
-        from .rule.routing import build_handoff_requests
-        from .ner.two_pass import detect_suspicious_regions
+        outputs = {}
+        for record_id, raw_text in raw_texts_by_id.items():
+            combined = NerDetailedResult(len(raw_text), len(raw_text))
+            for block_id, block in split_sections_by_header(raw_text).items():
+                body = block["body"]
+                if not body.strip():
+                    continue
+                block_start = int(block["start"])
+                detail = self.ner_engine.predict_text_detailed(body, **predict_kwargs)
 
-        fixed = fix_flagged_entities_batch(
-            raw_texts_by_id,
-            entities_by_id,
-            fixer_llm,
-            batch_size=batch_size,
-        )
-        if audit_missing:
-            fixed = audit_missing_entities_batch(
-                raw_texts_by_id,
-                fixed,
-                fixer_llm,
-                batch_size=batch_size,
-            )
+                def shift_entity(entity):
+                    start, end = entity.position
+                    global_start, global_end = block_start + start, block_start + end
+                    if raw_text[global_start:global_end] != entity.text:
+                        raise ValueError("detailed section offset mismatch")
+                    return NerEntity(
+                        entity.text, entity.type, list(entity.assertions),
+                        (global_start, global_end), entity.score, entity.flag,
+                    )
 
-        cleaned = {}
-        logs = []
-        for record_id, entities in fixed.items():
-            raw_text = raw_texts_by_id[record_id]
-            cleaned[record_id], record_logs = pre_llm_cleanup(
-                raw_text, entities
-            )
-            logs.extend({"record_id": record_id, **item} for item in record_logs)
+                combined.crf_entities.extend(shift_entity(item) for item in detail.crf_entities)
+                combined.lattice_entities.extend(shift_entity(item) for item in detail.lattice_entities)
+                combined.final_entities.extend(shift_entity(item) for item in detail.final_entities)
+                combined.span_candidates.extend(SpanCandidateEvidence(
+                    item.start + block_start, item.end + block_start, item.type,
+                    item.score, item.word_start, item.word_end, item.source,
+                ) for item in detail.span_candidates)
+                word_base = len(combined.words)
+                combined.words.extend(WordEvidence(
+                    word_base + item.index, item.text,
+                    item.start + block_start, item.end + block_start,
+                    item.line_id, block_id, item.crf,
+                    item.span_top_label, item.span_top_score,
+                ) for item in detail.words)
+                combined.thresholds.update(detail.thresholds)
+                combined.logs.extend({"block_id": block_id, **item} for item in detail.logs)
+                combined.span_head_enabled = combined.span_head_enabled or detail.span_head_enabled
+            for field_name in ("crf_entities", "lattice_entities", "final_entities"):
+                getattr(combined, field_name).sort(key=lambda item: (*item.position, item.type))
+            combined.validate_offsets(raw_text)
+            outputs[record_id] = combined
+        self.last_detailed_results = outputs
+        return outputs
 
-            # Recompute from the post-1.5B entity state. Reusing pass-1/pass-2
-            # regions misses newly uncovered repeated occurrences and keeps
-            # regions that the fixer has already resolved.
-            regions = detect_suspicious_regions(raw_text, cleaned[record_id])
-            logs.append({
-                "record_id": record_id,
-                "status": "handoff_regions_recomputed",
-                "region_count": len(regions),
-            })
-            self.last_handoffs[record_id] = build_handoff_requests(
-                raw_text, cleaned[record_id], regions,
-                request_prefix=record_id,
-            )
-        self.last_fixer_logs = logs
-        return cleaned
-
-    def run_7b_ner_stage(
+    def run_qwen8b_ner_editor_stage(
         self,
         raw_texts_by_id: dict[str, str],
-        entities_by_id: dict[str, list[NerEntity]],
-        reviewer_llm,
+        detailed_by_id: dict,
+        qwen_llm,
         *,
         batch_size: int = 4,
-        retry_rounds: int = 1,
         include_recovery: bool = True,
+        review_only_auto_add_eligible: bool = False,
+        cache_path: str | Path | None = None,
+        model_id: str = "Qwen/Qwen3-8B",
     ) -> dict[str, list[NerEntity]]:
-        from .ner.reviewer_7b import review_entities_batch
-
-        handoffs = self.last_handoffs
-        if not include_recovery:
-            handoffs = {
-                rid: {**handoff, "region_recoveries": [], "region_recovery_count": 0}
-                for rid, handoff in handoffs.items()
-            }
-        reviewed, logs = review_entities_batch(
-            raw_texts_by_id,
-            entities_by_id,
-            handoffs,
-            reviewer_llm,
-            batch_size=batch_size,
-            retry_rounds=retry_rounds,
+        """Build stable catalogs and run one locked-editor batch."""
+        from .ner.candidates import build_candidate_catalog, build_missing_proposals
+        from .ner.qwen_editor import (
+            apply_editor_response, apply_missing_decisions, build_editor_request,
+            build_missing_request, parse_missing_response,
+            generate_with_cache, VersionedJsonlCache,
         )
-        self.last_7b_logs = logs
-        return reviewed
+
+        record_ids, catalogs, prompts = [], {}, []
+        for record_id, detailed in detailed_by_id.items():
+            raw_text = raw_texts_by_id[record_id]
+            catalog = build_candidate_catalog(record_id, raw_text, detailed)
+            catalogs[record_id] = catalog
+            if catalog:
+                record_ids.append(record_id)
+                prompts.append(build_editor_request(record_id, raw_text, 0, catalog))
+        cache = VersionedJsonlCache(cache_path) if cache_path is not None else None
+        raw_outputs = generate_with_cache(
+            qwen_llm, prompts, batch_size=batch_size, model_id=model_id,
+            task="ner_editor", cache=cache,
+        )
+        outputs = {
+            record_id: list(detailed.final_entities)
+            for record_id, detailed in detailed_by_id.items()
+        }
+        audit = {}
+        proposals_by_id = {}
+        for record_id, raw_output in zip(record_ids, raw_outputs):
+            result = apply_editor_response(
+                raw_texts_by_id[record_id], catalogs[record_id], raw_output,
+            )
+            outputs[record_id] = result.entities
+            proposals = build_missing_proposals(
+                record_id, raw_texts_by_id[record_id], catalogs[record_id],
+            )
+            if review_only_auto_add_eligible:
+                proposals = [item for item in proposals if item.auto_add_eligible]
+            proposals_by_id[record_id] = proposals
+            audit[record_id] = {
+                "candidate_catalog": [item.__dict__ for item in catalogs[record_id]],
+                "missing_proposals": [item.__dict__ for item in proposals],
+                "raw_response": raw_output,
+                "applied": result.applied,
+                "rejected": result.rejected,
+                "unresolved": result.unresolved,
+            }
+        if include_recovery:
+            missing_ids = [record_id for record_id in record_ids if proposals_by_id.get(record_id)]
+            missing_prompts = [
+                build_missing_request(
+                    f"{record_id}:missing", raw_texts_by_id[record_id], 0,
+                    proposals_by_id[record_id],
+                )
+                for record_id in missing_ids
+            ]
+            missing_outputs = generate_with_cache(
+                qwen_llm, missing_prompts, batch_size=batch_size, model_id=model_id,
+                task="missing_proposal", cache=cache,
+            )
+            for record_id, raw_output in zip(missing_ids, missing_outputs):
+                decisions, rejected = parse_missing_response(raw_output)
+                missing_result = apply_missing_decisions(
+                    raw_texts_by_id[record_id], outputs[record_id],
+                    proposals_by_id[record_id], decisions,
+                )
+                outputs[record_id] = missing_result.entities
+                audit[record_id]["missing_raw_response"] = raw_output
+                audit[record_id]["missing_applied"] = missing_result.applied
+                audit[record_id]["missing_rejected"] = rejected + missing_result.rejected
+        self.last_editor_audit = audit
+        return outputs
 
     # ------------------------------------------------------------
-    # Stage 3: existing retrievers followed by optional 7B candidate selection.
+    # Batched retrievers followed by optional Qwen3 candidate selection.
     # ------------------------------------------------------------
     def _get_raw_candidates(self, ent: NerEntity):
         """Trả candidate RAW (list[RxNormCandidate] hoặc list[dict]) CHƯA
@@ -327,7 +343,7 @@ class InferencePipeline:
         selector_llm=None,
         raw_text: str | None = None,
     ) -> dict[int, list[str]]:
-        """Attach linker candidates, optionally reranked by the loaded 7B.
+        """Attach linker candidates, optionally selected by the loaded Qwen3 model.
 
         The selector may only choose codes already returned by the existing
         retriever; schema validation in ``candidate_selector`` rejects invented
@@ -375,42 +391,84 @@ class InferencePipeline:
 
         return candidates_by_entity
 
-    def run_linking_stage(
+    def run_linking_retrieval_stage_batch(
         self,
         entities_by_id: dict[str, list[NerEntity]],
+        *,
+        top_k: int | None = None,
+    ) -> dict[str, dict[int, list]]:
+        """Retrieve all mentions by ontology, using one encoder batch when supported."""
+        from .rule.clinical import is_linkable_entity
+
+        top_k = top_k or self.top_k_candidates
+        results: dict[str, dict[int, list]] = {rid: {} for rid in entities_by_id}
+        grouped: dict[str, list[tuple[str, int, NerEntity]]] = {"rxnorm": [], "icd10": []}
+        for rid, entities in entities_by_id.items():
+            for index, entity in enumerate(entities):
+                linker_name = TYPE_TO_LINKER.get(entity.type)
+                if linker_name and self._linkers.get(linker_name) is not None and is_linkable_entity(entity):
+                    grouped[linker_name].append((rid, index, entity))
+
+        for linker_name, items in grouped.items():
+            if not items:
+                continue
+            linker = self._linkers[linker_name]
+            mentions = [item[2].text for item in items]
+            try:
+                if hasattr(linker, "link_many"):
+                    if linker_name == "icd10":
+                        batches = linker.link_many(mentions, top_k_codes=top_k)
+                    else:
+                        batches = linker.link_many(mentions, top_k=top_k)
+                else:
+                    batches = []
+                    for mention in mentions:
+                        value = linker.link(mention, **({"top_k_codes": top_k} if linker_name == "icd10" else {"top_k": top_k}))
+                        batches.append(value.get("candidates", []) if isinstance(value, dict) else value)
+                if len(batches) != len(items):
+                    raise ValueError("link_many returned the wrong number of rows")
+            except Exception as exc:
+                print(f"[pipeline] batch {linker_name} linking failed: {exc}", file=sys.stderr)
+                batches = [[] for _ in items]
+            for (rid, index, _entity), candidates in zip(items, batches):
+                results[rid][index] = list(candidates or [])
+        self.last_linking_retrieval = results
+        return results
+
+    def run_qwen8b_linking_selector_stage(
+        self,
+        entities_by_id: dict[str, list[NerEntity]],
+        retrieval_by_id: dict[str, dict[int, list]],
         *,
         selector_llm=None,
         raw_texts_by_id: dict[str, str] | None = None,
     ) -> dict[str, dict[int, list[str]]]:
-        if selector_llm is None:
-            return {
-                rid: self.attach_candidates(entities)
-                for rid, entities in entities_by_id.items()
-            }
-
-        from .selection.candidate_selector import select_candidates_many
+        from .selection.candidate_selector import select_candidates_many, select_supported_top_candidates
 
         results: dict[str, dict[int, list[str]]] = {rid: {} for rid in entities_by_id}
-        destinations: list[tuple[str, int]] = []
-        selector_items: list[dict] = []
+        destinations, selector_items = [], []
         raw_texts_by_id = raw_texts_by_id or {}
         for rid, entities in entities_by_id.items():
-            raw_text = raw_texts_by_id.get(rid)
             for index, entity in enumerate(entities):
-                raw_candidates = self._get_raw_candidates(entity)
-                if not raw_candidates:
+                candidates = retrieval_by_id.get(rid, {}).get(index, [])
+                if not candidates:
                     continue
-                context = ""
-                if raw_text is not None:
-                    start, end = entity.position
-                    context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)]
+                if selector_llm is None:
+                    results[rid][index] = select_supported_top_candidates(
+                        entity.text, entity.type, candidates,
+                        max_choices=MAX_OUTPUT_CANDIDATES[entity.type],
+                    )
+                    continue
+                start, end = entity.position
+                raw_text = raw_texts_by_id.get(rid, "")
+                context = raw_text[max(0, start - 120):min(len(raw_text), end + 120)] if raw_text else ""
                 destinations.append((rid, index))
                 selector_items.append({
-                    "entity_text": entity.text,
-                    "entity_type": entity.type,
-                    "candidates": raw_candidates,
-                    "context": context,
+                    "entity_text": entity.text, "entity_type": entity.type,
+                    "candidates": candidates, "context": context,
                 })
+        if selector_llm is None:
+            return results
         selected_batches = select_candidates_many(
             selector_items,
             selector_llm,
@@ -419,6 +477,19 @@ class InferencePipeline:
         for (rid, index), selected in zip(destinations, selected_batches):
             results[rid][index] = selected
         return results
+
+    def run_linking_stage(
+        self,
+        entities_by_id: dict[str, list[NerEntity]],
+        *,
+        selector_llm=None,
+        raw_texts_by_id: dict[str, str] | None = None,
+    ) -> dict[str, dict[int, list[str]]]:
+        retrieval = self.run_linking_retrieval_stage_batch(entities_by_id)
+        return self.run_qwen8b_linking_selector_stage(
+            entities_by_id, retrieval, selector_llm=selector_llm,
+            raw_texts_by_id=raw_texts_by_id,
+        )
 
     # ------------------------------------------------------------
     # Build output cuối — thuần ghép dữ liệu, không gọi model gì nữa
@@ -436,26 +507,16 @@ class InferencePipeline:
     # ------------------------------------------------------------
     # Tiện ích test nhanh 1 record/file — load/unload LLM (nếu có) NGAY
     # TRONG lệnh gọi này KHÔNG hợp lý cho batch, chỉ dùng cho test đơn lẻ.
-    # Muốn dùng LLM ở đây, tự load fixer_llm/selector_llm rồi truyền vào.
+    # The optional selector must already be loaded by the caller.
     # ------------------------------------------------------------
     def process_record(
         self,
         raw_text: str,
         *,
-        fixer_llm=None,
         selector_llm=None,
-        audit_missing: bool = True,
         **predict_kwargs,
     ) -> list[dict]:
         entities_by_id = self.run_ner_stage({"_single": raw_text}, **predict_kwargs)
-
-        if fixer_llm is not None:
-            entities_by_id = self.run_fixer_stage(
-                {"_single": raw_text},
-                entities_by_id,
-                fixer_llm,
-                audit_missing=audit_missing,
-            )
 
         candidates_by_id = self.run_linking_stage(
             entities_by_id,

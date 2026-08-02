@@ -116,11 +116,6 @@ def _clone_result(result: dict) -> dict:
     cloned = dict(result)
     if isinstance(result.get("assertions"), list):
         cloned["assertions"] = list(result["assertions"])
-    if isinstance(result.get("review_hints"), list):
-        cloned["review_hints"] = [
-            dict(item) if isinstance(item, dict) else item
-            for item in result["review_hints"]
-        ]
     return cloned
 
 
@@ -155,39 +150,21 @@ def _merge_unique_strings(*groups: object) -> list[str]:
     return merged
 
 
-def _merge_review_hints(*groups: object) -> list:
-    merged: list = []
-    seen: set[str] = set()
-    for group in groups:
-        if not isinstance(group, list):
-            continue
-        for item in group:
-            marker = repr(sorted(item.items())) if isinstance(item, dict) else repr(item)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            merged.append(dict(item) if isinstance(item, dict) else item)
-    return merged
-
-
 def _prefer_exact_duplicate(current: dict, challenger: dict) -> dict:
     """Pick the representative for one exact ``(start, end, type)`` key.
 
-    Assertions and review hints from both chunk predictions are preserved.  The
-    representative is selected by score, then number of review hints, then
-    number of assertions.  No input dictionary is mutated.
+    Assertions from both chunk predictions are preserved. The representative
+    is selected by score, then number of assertions. No input is mutated.
     """
     current_clone = _clone_result(current)
     challenger_clone = _clone_result(challenger)
 
     current_rank = (
         _score(current_clone),
-        len(current_clone.get("review_hints") or []),
         len(current_clone.get("assertions") or []),
     )
     challenger_rank = (
         _score(challenger_clone),
-        len(challenger_clone.get("review_hints") or []),
         len(challenger_clone.get("assertions") or []),
     )
 
@@ -195,12 +172,6 @@ def _prefer_exact_duplicate(current: dict, challenger: dict) -> dict:
     winner["assertions"] = _merge_unique_strings(
         current_clone.get("assertions"), challenger_clone.get("assertions"),
     )
-
-    merged_hints = _merge_review_hints(
-        current_clone.get("review_hints"), challenger_clone.get("review_hints"),
-    )
-    if merged_hints:
-        winner["review_hints"] = merged_hints
 
     return winner
 

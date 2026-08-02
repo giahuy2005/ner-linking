@@ -1,5 +1,4 @@
-"""Dùng LocalLLM (CANDIDATE_SELECTOR_CONFIG) chọn lại candidate đúng nhất
-trong list mà RxNormLinker/Icd10Linker đã retrieval + rerank sẵn.
+"""Use the loaded Qwen3-8B instance to select from retrieved candidates.
 
 LUÔN validate code LLM chọn PHẢI nằm trong list candidate gốc đưa vào —
 không tin LLM tự bịa code không có trong danh sách (hallucination). Nếu
@@ -119,6 +118,12 @@ def _candidate_supported(entity_text: str, entity_type: str, candidate) -> bool:
         coverage, similarity = _lexical_support(entity_text, matched_term)
         mention_tokens = _meaningful_tokens(entity_text)
         candidate_tokens = _meaningful_tokens(matched_term)
+        # Production ICD candidates carry aggregated matched-term evidence. A
+        # label that adds an unsupported disease qualifier is over-specific
+        # even when it contains every mention token (for example an anatomic
+        # subtype). Keep it in retrieval, but do not emit it deterministically.
+        if candidate.get("matched_terms") and candidate_tokens - mention_tokens:
+            return False
         compact = re.sub(r"\W+", "", entity_text, flags=re.UNICODE)
         abbreviation = compact.isupper() and 2 <= len(compact) <= 8
         if len(mention_tokens) == 1 and len(candidate_tokens) > 1 and not abbreviation:

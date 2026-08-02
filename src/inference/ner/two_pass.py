@@ -201,7 +201,6 @@ def _clone_entity(
     entity: NerEntity,
     *,
     assertions: list[str] | None = None,
-    review_hints: list[dict] | None = None,
     flag: str | None = None,
     keep_original_flag: bool = True,
 ) -> NerEntity:
@@ -217,24 +216,10 @@ def _clone_entity(
         position=tuple(entity.position),
         score=float(entity.score),
         flag=resolved_flag,
-        review_hints=list(entity.review_hints if review_hints is None else review_hints),
     )
 
 
-def _merge_unique_dicts(values: list[dict]) -> list[dict]:
-    """Deduplicate hint dict theo nội dung, giữ nguyên thứ tự."""
-
-    result: list[dict] = []
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        if any(value == old for old in result):
-            continue
-        result.append(dict(value))
-    return result
-
-
-def _duplicate_rank(entity: NerEntity, source: str) -> tuple[float, int, int, int]:
+def _duplicate_rank(entity: NerEntity, source: str) -> tuple[float, int, int]:
     """Chọn base exact duplicate mà không phụ thuộc thứ tự input.
 
     Pass 2 chỉ được ưu tiên khi score và lượng evidence bằng nhau, vì Pass 2
@@ -243,7 +228,6 @@ def _duplicate_rank(entity: NerEntity, source: str) -> tuple[float, int, int, in
 
     return (
         float(entity.score),
-        len(entity.review_hints),
         len(entity.assertions),
         1 if source == "pass2" else 0,
     )
@@ -273,18 +257,11 @@ def _deduplicate_exact(
             for _source, entity in versions
             for assertion in entity.assertions
         ))
-        hints = _merge_unique_dicts([
-            hint
-            for _source, entity in versions
-            for hint in entity.review_hints
-            if isinstance(hint, dict)
-        ])
         flags = [entity.flag for _source, entity in versions if entity.flag]
         merged_flag = base_entity.flag or (flags[0] if flags else None)
         merged_entity = _clone_entity(
             base_entity,
             assertions=assertions,
-            review_hints=hints,
             flag=merged_flag,
         )
         sources = tuple(dict.fromkeys(source for source, _entity in versions))
@@ -479,7 +456,6 @@ def run_two_pass_ner(
                     position=(start, end),
                     score=local.score,
                     flag=local.flag,
-                    review_hints=list(local.review_hints),
                 ))
                 accepted_count += 1
             else:

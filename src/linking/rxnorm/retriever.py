@@ -126,6 +126,27 @@ class RxNormRetriever:
 
         return results
 
+    def search_tier_many(self, queries: list[str], tier: str, k: int) -> list[list[dict[str, Any]]]:
+        """Search one tier for a query batch with a single encoder pass."""
+        if not queries:
+            return []
+        index = self.repository.indexes[tier]
+        metadata = self.repository.metadata[tier]
+        search_k = min(k, index.ntotal)
+        vectors = self.encoder.encode(queries)
+        scores, ids = index.search(vectors, search_k)
+        output = []
+        for row_scores, row_ids in zip(scores, ids):
+            row_results = []
+            for score, vector_id in zip(row_scores, row_ids):
+                if vector_id < 0:
+                    continue
+                row = metadata[int(vector_id)]
+                if row is not None:
+                    row_results.append({**row, "tier": tier, "dense_score": float(score)})
+            output.append(row_results)
+        return output
+
     def search_full_query(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
 
@@ -270,3 +291,47 @@ class RxNormRetriever:
             candidate.lexical_score = self._lexical_score(parsed, candidate)
 
         return merged
+
+    def retrieve_many(self, parsed_mentions: list[ParsedDrugMention]) -> list[dict[str, RxNormCandidate]]:
+        """High-recall retrieval for many mentions without per-mention encoding."""
+        if not parsed_mentions:
+            return []
+        full_queries = [item.normalized_text for item in parsed_mentions]
+        tier_rows = {
+            "product": self.search_tier_many(full_queries, "product", config.DEFAULT_PRODUCT_K),
+            "support": self.search_tier_many(full_queries, "support", config.DEFAULT_SUPPORT_K),
+            "historical": self.search_tier_many(full_queries, "historical", config.DEFAULT_HISTORICAL_K),
+        }
+        core_indexes = [index for index, item in enumerate(parsed_mentions) if item.ingredient_core]
+        core_queries = [parsed_mentions[index].ingredient_core for index in core_indexes]
+        core_rows = {index: [] for index in range(len(parsed_mentions))}
+        if core_queries:
+            support = self.search_tier_many(core_queries, "support", config.DEFAULT_SUPPORT_K)
+            product = self.search_tier_many(core_queries, "product", config.DEFAULT_PRODUCT_K)
+            for index, left, right in zip(core_indexes, support, product):
+                core_rows[index] = left + right
+
+        outputs = []
+        for index, parsed in enumerate(parsed_mentions):
+            merged: dict[str, RxNormCandidate] = {}
+            sources = (
+                ("full_query", tier_rows["product"][index] + tier_rows["support"][index] + tier_rows["historical"][index]),
+                ("core_query", core_rows[index]),
+                ("exact_term", self.inject_exact_term(parsed)),
+                ("exact_ingredient", self.inject_exact_ingredient(parsed)),
+            )
+            for source_name, raw_results in sources:
+                for rxcui, candidate in self.aggregate_by_rxcui(raw_results, source_name).items():
+                    if rxcui not in merged:
+                        merged[rxcui] = candidate
+                        continue
+                    existing = merged[rxcui]
+                    existing.dense_score = max(existing.dense_score, candidate.dense_score)
+                    existing.exact_term_match |= candidate.exact_term_match
+                    existing.exact_ingredient_match |= candidate.exact_ingredient_match
+                    existing.matched_terms.extend(term for term in candidate.matched_terms if term not in existing.matched_terms)
+                    existing.retrieval_sources.extend(src for src in candidate.retrieval_sources if src not in existing.retrieval_sources)
+            for candidate in merged.values():
+                candidate.lexical_score = self._lexical_score(parsed, candidate)
+            outputs.append(merged)
+        return outputs

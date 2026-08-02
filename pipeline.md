@@ -1,332 +1,58 @@
-# Kiến trúc model và luồng dữ liệu hiện tại
-
-> Cập nhật 2026-07-30: notebook `predict_ner_crf_and__llm_fixed.ipynb`
-> là nguồn chuẩn cho phần NER. Luồng production hiện tại là:
+# Production NER + linking pipeline
 
 ```text
-NER Pass 1 (global BIO centrality merge, overlap 50)
-  -> rule audit + suspicious regions
-  -> NER Pass 2 trên các region
-  -> exact dedup + conflict resolution
-  -> surface-agnostic validation + mechanical boundary cleanup
-  -> Qwen2.5-1.5B guarded batch + danger hints
-  -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
-  -> Qwen2.5-7B NER batch (retry riêng request/batch lỗi)
-  -> exact-span/type/assertion/overlap validation
-  -> RxNorm + ICD-10 retriever hiện có
-  -> Qwen2.5-7B chọn/rerank trong candidate linking
-  -> BTC JSON
+raw text
+  -> offset-preserving sectioning/tokenization
+  -> ViHealthBERT CRF + trained span head
+  -> exact CRF marginals + conservative span lattice
+  -> stable candidate catalog + closed missing proposals
+  -> Qwen3-8B locked editor
+  -> action-level Python guards + structural validation
+  -> batched RxNorm/ICD-10 retrieval
+  -> deterministic reranking
+  -> same Qwen3-8B whitelisted code selector
+  -> strict BTC output validation + audit JSON
 ```
 
-Trong task NER, 7B không được sinh mã. Ở stage linking riêng, 7B được chọn
-RxNorm/ICD-10 nhưng chỉ trong candidate do retriever hiện tại trả về; code ngoài
-danh sách bị validator từ chối. Khi response lỗi, NER trước 7B được giữ nguyên
-và linking fallback theo thứ tự retriever. Các rule deterministic nằm trong
-`src/inference/rule/`.
+The production path has one optional LLM: `Qwen/Qwen3-8B`. Candidate IDs are
+stable and missing-entity recovery is restricted to exact proposals.
 
+## Main modules
 
-## 1. Luồng xử lý inference tổng thể
+- `src/inference/ner/engine.py`: strict CRF/span checkpoint load and detailed inference.
+- `src/inference/ner/evidence.py`: typed word/CRF/span/local evidence.
+- `src/inference/ner/candidates.py`: stable catalog and exact proposals.
+- `src/inference/ner/editor_schemas.py`: closed editor schemas.
+- `src/inference/ner/qwen_editor.py`: prompts, cache, validation and application.
+- `src/inference/pipeline.py`: batch stage orchestration.
+- `src/inference/selection/candidate_selector.py`: whitelisted linking selection.
+- `src/linking/rxnorm/`: batched RxNorm retrieval and ranking.
+- `src/linking/icd10/`: metadata aliases, query variants and batched ICD retrieval.
 
-```text
-Nhiều file .txt
-  -> giữ nguyên raw text; QA chạy nguyên file, EMR tách block và giữ heading
-  -> NER Pass 1: ViHealthBERT + CRF + assertion
-  -> rule audit + phát hiện suspicious regions
-  -> NER Pass 2 chỉ trên các region
-  -> exact dedup + merge + conflict resolution
-  -> surface-agnostic validation + mechanical boundary cleanup
-  -> Qwen2.5-1.5B guarded fixer theo batch
-  -> grouped REVIEW_REGION + RECOVER_MISSING_ENTITIES
-  -> Qwen2.5-7B review/recover NER theo batch
-  -> validator exact span/type/assertion/overlap
-  -> danh sách NER cuối cùng
-  -> RxNorm retrieval cho THUỐC / ICD-10 retrieval cho CHẨN_ĐOÁN
-  -> Qwen2.5-7B rerank candidate linking theo batch
-  -> validate code; abstain `[]` nếu candidate không đủ bằng chứng
-  -> assemble BTC JSON
-```
+## Commands
 
-Văn bản được ánh xạ offset về raw text ngay sau mỗi lượt NER. Mọi stage sau đó
-dùng half-open position `[start, end)` trên raw text và phải thỏa:
-
-```python
-0 <= start < end <= len(raw_text)
-raw_text[start:end] == entity.text
-```
-
-Ba type `TRIỆU_CHỨNG`, `TÊN_XÉT_NGHIỆM` và
-`KẾT_QUẢ_XÉT_NGHIỆM` không chạy linking.
-
-## 2. Stage 1 — Two-pass NER
-
-Điểm vào là `InferencePipeline.run_ner_stage()`.
-
-### 2.1. NER Pass 1
-
-`NerEngine` dùng VnCoreNLP để word-segment, ViHealthBERT làm encoder, linear
-head tạo BIO emission và CRF để decode chuỗi tag. Assertion head pool entity
-cùng context xung quanh để dự đoán `isHistorical`, `isNegated`, `isFamily`.
-
-Với document dài, mỗi global word lấy BIO tag từ chunk nơi word nằm xa biên
-nhất; sau đó entity mới được extract đúng một lần trên chuỗi BIO toàn document.
-Không còn extract riêng từng chunk rồi bỏ entity ở đầu chunk. Assertion của một
-entity được weighted-average từ mọi chunk chứa trọn entity theo centrality.
-Overlap mặc định là 50 word, khớp notebook. `clean_text_for_inference()` không
-thay đổi ký tự nên offset luôn trỏ trực tiếp vào raw text.
-
-Năm type hợp lệ:
-
-```text
-TRIỆU_CHỨNG
-CHẨN_ĐOÁN
-THUỐC
-TÊN_XÉT_NGHIỆM
-KẾT_QUẢ_XÉT_NGHIỆM
-```
-
-### 2.2. Suspicious-region detection và Pass 2
-
-`detect_suspicious_regions()` trong `src/inference/ner/two_pass.py` route vùng
-có confidence thấp, repair flag, boundary đáng ngờ, token lặp, occurrence bị
-sót, dòng y tế không có entity hoặc long medical gap. Các hit gần nhau được
-gộp thành `SuspiciousRegion`; mặc định tối đa 24 region mỗi document.
-
-Pass 2 dùng lại chính `NerEngine` đã load và chỉ predict context của các region.
-Offset local được đổi về global raw offset. Region lỗi sẽ log `pass2_error` và
-không làm mất candidate Pass 1.
-
-### 2.3. Merge và deterministic cleanup
-
-Candidate Pass 1 và Pass 2 được exact-dedup theo `(start, end, type)`, hợp
-assertions, rồi resolve overlap deterministic theo score, độ dài và vị trí.
-Validation production nằm trong `src/inference/rule/clinical.py`, gồm:
-
-- Boundary thừa/thiếu như `sốt bn`, `bn vàng da`, ngoặc/newline/connector thừa.
-- Repeated token/cụm như `chụp chụp...`, `Chụp lại chụp...`.
-- Specimen boundary `hầu họng` -> `dịch hầu họng` khi context hỗ trợ.
-- Loại span sai cấu trúc như chỉ có dấu câu, offset/text không khớp, số hoặc
-  số đo đứng riêng; trim dấu ngoặc/connector thừa và xử lý overlap.
-- Không dùng whitelist/blacklist tên triệu chứng, bệnh, thuốc hay các surface
-  lấy từ output local; retype/recover lâm sàng do NER, 1.5B và 7B xử lý theo context.
-- Danh sách thuốc trước nhập viện: recover riêng regimen thuốc và gán
-  `isHistorical`; phần sau `điều trị` được giữ cho NER/LLM phân loại, không có
-  rule cứng cho tên triệu chứng/chẩn đoán.
-
-## 3. Qwen2.5-1.5B và handoff 7B giới hạn
-
-Sau two-pass NER, 1.5B chỉ review candidate đã bị flag theo batch. Chính sách
-V9/V11 của notebook được giữ: `RETYPE` và đề nghị boundary chỉ là suggestion;
-`DROP` chỉ được áp dụng khi Python guarded-drop cho phép. Quyết định bị chặn
-được lưu trong `small_llm_review_hints`, entity gốc được giữ và route cho 7B.
-Handoff được dựng lại sau stage 1.5B.
-CLI in thêm số hint theo `requested_action` (`DROP`, `RETYPE_SUGGEST`,
-`BOUNDARY_REVIEW_SUGGESTED`) để phân biệt trường hợp output BTC không đổi nhưng
-1.5B vẫn đã tạo sidecar evidence cho 7B.
-
-7B chỉ được quyết định trên `target_candidate_ids`; entity sạch ngoài target
-không được sửa. Raw hint 1.5B là bằng chứng tham khảo, 7B phải kiểm tra lại bằng
-context và validator vẫn kiểm tra schema/offset/overlap. Action `DROP` chỉ xuất
-hiện khi 1.5B đã độc lập đề nghị `DROP`; `RETYPE` chỉ mở đúng type 1.5B đề nghị;
-`REPAIR_SPAN` chỉ mở khi có hint boundary/cờ boundary. `UPDATE_ASSERTIONS` không
-được đổi text/type/position. Không entity nào được sửa dựa trên danh sách surface hard-code.
-
-`build_handoff_requests()` trong `src/inference/rule/routing.py` tạo schema
-`7b_handoff_v2_grouped` với hai task.
-
-### 3.1. `REVIEW_REGION`
-
-Nhiều target gần nhau được gom trong cùng context. Request giữ `request_id`,
-`candidate_id`, global/relative position, assertions và allowed actions.
-
-```json
-{
-  "task": "REVIEW_REGION",
-  "request_id": "record-review-region-0-100-150",
-  "context_global_position": [20, 250],
-  "target_candidate_ids": [3, 4],
-  "targets": [{
-    "candidate_id": 3,
-    "text": "sốt bn",
-    "type": "TRIỆU_CHỨNG",
-    "global_position": [100, 106],
-    "relative_position": [80, 86],
-    "assertions": [],
-    "small_llm_review_hints": [{
-      "requested_action": "DROP",
-      "status": "blocked_unsafe_drop"
-    }],
-    "allowed_actions": ["KEEP", "UPDATE_ASSERTIONS", "DROP"],
-    "allowed_retype_types": [],
-    "allowed_repair_types": ["TRIỆU_CHỨNG"]
-  }]
-}
-```
-
-7B phải trả đúng một decision cho mỗi target. `KEEP` giữ nguyên; `DROP` xóa;
-`REPAIR_SPAN` sửa boundary; `RETYPE` chỉ đổi sang type được 1.5B đề nghị;
-`UPDATE_ASSERTIONS` chỉ sửa assertion.
-
-### 3.2. `RECOVER_MISSING_ENTITIES`
-
-Request chứa suspicious region, focus span và entity đã tồn tại trong context.
-7B chỉ được trả entity thật sự bị bỏ sót hoặc boundary rộng hơn cho fragment
-cùng type. `relative_position` luôn là `[start, end)` trên context request.
-
-`--no-llm-recall-audit` chỉ tắt recovery request; review target đã có và 7B
-linking vẫn chạy.
-
-### 3.3. Batch, retry và validator
-
-`review_entities_batch()` gom request của nhiều document và gọi Qwen2.5-7B qua
-`generate_batch()`. Chỉ request lỗi được retry; request hợp lệ không chạy lại.
-
-Validator kiểm tra tối thiểu:
-
-- `request_id` khớp và mỗi target có đúng một decision.
-- Không chỉnh candidate ngoài `target_candidate_ids`.
-- Action/type/assertion thuộc allow-list riêng của từng target; retype khác type
-  1.5B đề nghị bị từ chối.
-- Text khớp chính xác `raw_text[start:end]`.
-- Span sửa nằm trong context và gần/overlap span gốc.
-- Relative position không âm, không vượt context.
-- Không tạo exact duplicate hoặc overlap không an toàn.
-- Recovery chỉ được thay fragment cùng type khi span mới bao trọn fragment.
-
-Parse/schema/generation lỗi sau retry sẽ fallback về output NER trước 7B. Log
-accepted/rejected/fallback được lưu ở `InferencePipeline.last_7b_logs`.
-
-## 4. Retrieval và 7B linking
-
-Linking chỉ chạy sau khi NER đã hoàn tất:
-
-```text
-THUỐC      -> RxNormLinker
-CHẨN_ĐOÁN -> Icd10Linker
-```
-
-Index, embedding, FAISS, retrieval và ranking hiện có không bị thay đổi. Nếu 7B
-đã sửa text/type NER, linker chạy lại trên entity cuối; candidate cũ không được
-tái sử dụng.
-
-Khi không bật 7B, pipeline lấy theo ranking của linker: tối đa 1 RxNorm code
-cho thuốc và 2 ICD-10 code cho chẩn đoán.
-
-Khi bật 7B, `select_candidates_many()` gom các entity mơ hồ của nhiều document
-thành batch. Prompt linking nhận entity text/type, raw context và candidate kèm
-metadata/ranking feature. 7B có quyền chọn/rerank candidate, với các giới hạn:
-
-- Chỉ được chọn code có trong candidate do retriever trả về.
-- Không được bịa code mới.
-- THUỐC tối đa 1 RxNorm code và có thể trả `[]` nếu không candidate nào đúng ingredient.
-- CHẨN_ĐOÁN mặc định tối đa 1 ICD-10; chỉ cho tối đa 2 khi mention có cấu trúc
-  phối hợp chẩn đoán rõ ràng. Exact alias trả 1 mã và semantic candidate dưới ngưỡng bị loại.
-- JSON lỗi, code không hợp lệ, LLM chọn rỗng hoặc lỗi generation sẽ trả `[]`
-  đối với candidate mơ hồ; chỉ exact match đã kiểm chứng mới fallback top-1.
-
-Exact match chắc chắn có thể bypass 7B để tiết kiệm generation: ICD-10 khi text
-khớp normalized `matched_term`; RxNorm khi ingredient exact và
-strength/form/release không mismatch.
-
-## 5. Lifecycle model và cấu hình
-
-CLI quản lý model theo trình tự:
-
-```text
-1. Load NER engine và các linker được bật.
-2. Chạy two-pass NER cho toàn bộ input batch.
-3. Load Qwen2.5-7B đúng một lần.
-4. Chạy tất cả NER review/recovery request theo batch.
-5. Giữ 7B trên GPU.
-6. Chạy retrieval và 7B linking rerank theo batch.
-7. Unload 7B và giải phóng VRAM.
-8. Assemble và ghi BTC JSON.
-```
-
-Pipeline không load/unload 7B theo candidate hoặc document.
-
-`NER_REVIEWER_7B_CONFIG` mặc định:
-
-```text
-model_id           = Qwen/Qwen2.5-7B-Instruct
-load_in_4bit       = true
-batch_size         = 4
-max_new_tokens     = 512
-temperature        = 0.0
-max_context_length = 8192
-retry_rounds       = 1
-```
-
-## 6. Output
-
-```json
-{
-  "text": "amlodipine 10 mg po daily",
-  "type": "THUỐC",
-  "candidates": ["308135"],
-  "assertions": ["isHistorical"],
-  "position": [58, 83]
-}
-```
-
-`candidates` chỉ được gắn ở stage linking sau khi NER hoàn tất. Entity không
-thuộc type cần linking không nhận code.
-
-## 7. CLI
-
-Chỉ NER:
+NER only:
 
 ```bash
-python -m src.inference.cli --input data/1.txt --print
+python -m src.inference.cli --input data/input/1.txt --print
 ```
 
-NER + linker, không dùng 7B:
+Full A40 pipeline:
 
 ```bash
 python -m src.inference.cli \
-  --input-dir data/public_test \
+  --input-dir data/input \
   --output-dir output \
-  --with-rxnorm --with-icd10
+  --with-llm-8b --with-rxnorm --with-icd10 \
+  --llm-dtype bfloat16 --llm-quantization none \
+  --llm-cache-path output/qwen_cache.jsonl \
+  --llm-audit-dir output/audit
 ```
 
-Pipeline đầy đủ đúng thứ tự notebook, gồm 1.5B fixer, 7B NER và 7B linking:
+Strict relink without changing NER identity:
 
 ```bash
-python -m src.inference.cli \
-  --input-dir data/public_test \
-  --output-dir output \
-  --with-llm-fixer --with-llm-7b \
-  --with-rxnorm --with-icd10
+python -m src.inference.relink_cli \
+  --input-dir data/input --entities-dir output \
+  --output-dir output_relinked --with-rxnorm --with-icd10
 ```
-
-Cờ LLM:
-
-- `--with-llm-fixer`: chạy riêng `Qwen2.5-1.5B-Instruct` sau two-pass NER.
-- `--with-llm-7b`: chạy reviewer/recovery 7B rồi dùng cùng model rerank linking.
-- `--with-llm-selector`: chỉ dùng 7B rerank linking, không chạy 7B NER review.
-- `--no-llm-recall-audit`: tắt recovery NER của các stage LLM được bật.
-- `--no-repair-gate`: tắt repair gate để A/B test.
-
-## 8. Module chịu trách nhiệm
-
-| Module | Trách nhiệm |
-|---|---|
-| `src/inference/pipeline.py` | Điều phối stage và dữ liệu batch |
-| `src/inference/ner/engine.py` | ViHealthBERT + CRF + assertion inference |
-| `src/inference/ner/two_pass.py` | Suspicious region, Pass 2, merge |
-| `src/inference/rule/clinical.py` | Offset/boundary/assertion validation và cấu trúc danh sách thuốc |
-| `src/inference/rule/routing.py` | Tạo grouped 7B NER requests |
-| `src/inference/ner/reviewer_7b.py` | Batch/retry/validate/apply NER response |
-| `src/inference/selection/candidate_selector.py` | 7B linking rerank và code validation |
-| `src/linking/rxnorm/` | RxNorm retrieval/ranking hiện có |
-| `src/linking/icd10/` | ICD-10 retrieval/ranking hiện có |
-| `src/llm/backend.py` | Local model load, batch generation, unload |
-| `src/inference/io.py` | Raw-offset mapping, output assembly/validation |
-
-## 9. Test và invariant chính
-
-`tests/test_new_ner_pipeline.py` kiểm tra gold 11 thuốc trước nhập viện,
-assertion/offset, boundary, repeated token, false positive, recovery,
-batch/retry/fallback và thời điểm gắn RxNorm ID.
-
-`tests/test_inference_regressions.py` kiểm tra candidate selector theo batch,
-code allow-list, fallback linker và giới hạn số code output.

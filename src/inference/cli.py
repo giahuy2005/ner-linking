@@ -1,27 +1,11 @@
-"""CLI chạy two-pass NER, 1.5B fixer, 7B review và 7B-assisted linking.
-
-Qwen 7B được load một lần cho toàn bộ batch: trước tiên review/recover NER,
-sau đó chọn trong candidate do RxNorm/ICD-10 retriever trả về, rồi mới unload.
-
-Ví dụ dùng:
-
-    # test nhanh chỉ NER
-    python -m src.inference.cli --input data/1.txt --print
-
-    # batch full pipeline (linking, không LLM)
-    python -m src.inference.cli --input-dir data/public_test --output-dir output \\
-        --with-rxnorm --with-icd10
-
-    # pipeline notebook + 1.5B fixer + 7B review/linking
-    python -m src.inference.cli --input-dir data/public_test --output-dir output \\
-        --with-llm-fixer --with-llm-7b --with-rxnorm --with-icd10
-"""
+"""CLI for detailed CRF/span NER, Qwen3-8B editing, and ontology linking."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from . import config as cfg
@@ -30,7 +14,6 @@ from .pipeline import InferencePipeline
 
 
 def _configure_utf8_stdio() -> None:
-    """Keep Vietnamese help/log/JSON usable on Windows legacy consoles."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
@@ -41,45 +24,41 @@ def _configure_utf8_stdio() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input", type=Path, help="một file .txt")
+    inputs.add_argument("--input-dir", type=Path, help="thư mục chứa file .txt")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--print", dest="do_print", action="store_true")
 
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--input", type=Path, help="1 file .txt duy nhất")
-    input_group.add_argument("--input-dir", type=Path, help="thư mục chứa nhiều file .txt")
-
-    parser.add_argument("--output-dir", type=Path, default=None,
-                         help="thư mục ghi output .json (bắt buộc nếu dùng --input-dir, trừ khi có --print)")
-    parser.add_argument("--print", dest="do_print", action="store_true",
-                         help="in JSON ra stdout thay vì/thêm vào ghi file")
-
-    parser.add_argument("--with-rxnorm", action="store_true", help="bật linking RxNorm cho THUỐC")
-    parser.add_argument("--with-icd10", action="store_true", help="bật linking ICD-10 cho CHẨN_ĐOÁN")
-    parser.add_argument("--with-llm-7b", action="store_true",
-                        help="bật Qwen 7B cho NER review/recovery và linking rerank")
-    parser.add_argument("--with-llm-fixer", action="store_true",
-                        help="bật Qwen2.5-1.5B fixer sau NER, trước reviewer 7B")
-    parser.add_argument("--with-llm-selector", action="store_true",
-                        help="bật riêng Qwen 7B rerank candidate linking")
+    parser.add_argument("--with-rxnorm", action="store_true")
+    parser.add_argument("--with-icd10", action="store_true")
+    parser.add_argument("--with-llm-8b", action="store_true")
+    parser.add_argument("--llm-model-id", default="Qwen/Qwen3-8B")
     parser.add_argument(
-        "--no-llm-recall-audit",
-        action="store_true",
-        help="khi bật fixer, chỉ sửa span bị flag và không audit entity bị sót",
+        "--llm-dtype", choices=("auto", "bfloat16", "float16"),
+        default="bfloat16",
     )
+    parser.add_argument(
+        "--llm-quantization", choices=("none", "4bit"), default="none",
+    )
+    parser.add_argument("--llm-batch-size", type=int, default=4)
+    parser.add_argument("--llm-cache-path", type=Path)
+    parser.add_argument("--llm-audit-dir", type=Path)
+    parser.add_argument("--no-llm-recovery", action="store_true")
+    parser.add_argument("--review-only-auto-add-eligible", action="store_true")
 
     parser.add_argument("--checkpoint", type=Path, default=cfg.DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--label-dicts", type=Path, default=cfg.DEFAULT_LABEL_DICTS_PATH)
     parser.add_argument("--backbone", default=cfg.DEFAULT_BACKBONE)
     parser.add_argument("--vncorenlp-jar", type=Path, default=cfg.DEFAULT_VNCORENLP_JAR)
     parser.add_argument("--device", default=cfg.DEFAULT_DEVICE)
-
-    parser.add_argument("--no-repair-gate", action="store_true",
-                         help="tắt rule filter, để so sánh A/B raw model output")
-
+    parser.add_argument("--no-repair-gate", action="store_true")
     return parser.parse_args()
 
 
 def _load_raw_texts(paths: list[Path]) -> dict[str, str]:
-    return {p.stem: inference_io.read_text_file(p) for p in paths}
+    return {path.stem: inference_io.read_text_file(path) for path in paths}
 
 
 def run(
@@ -98,156 +77,98 @@ def run(
         vncorenlp_jar=args.vncorenlp_jar,
         device=args.device,
     )
-    print("[cli] Load NER engine xong.", file=sys.stderr)
-
+    raw_texts_by_id = raw_texts_by_id or _load_raw_texts(input_paths)
     predict_kwargs = {"apply_repair_gate": not args.no_repair_gate}
-    if raw_texts_by_id is None:
-        raw_texts_by_id = _load_raw_texts(input_paths)
 
-    # ---- Stage 1: NER cho toàn bộ batch (không LLM) ----
-    entities_by_id = pipeline.run_ner_stage(raw_texts_by_id, **predict_kwargs)
+    detailed_by_id = None
+    if args.with_llm_8b:
+        detailed_by_id = pipeline.run_ner_stage_detailed(
+            raw_texts_by_id, **predict_kwargs,
+        )
+        entities_by_id = {
+            record_id: list(detail.final_entities)
+            for record_id, detail in detailed_by_id.items()
+        }
+    else:
+        entities_by_id = pipeline.run_ner_stage(
+            raw_texts_by_id, **predict_kwargs,
+        )
 
-    # ---- Stage 2 (optional): notebook Qwen2.5-1.5B guarded fixer ----
-    if args.with_llm_fixer:
+    qwen_llm = None
+    if args.with_llm_8b:
         from ..llm.backend import LocalLLM
-        from ..llm.config import NER_FIXER_CONFIG
+        from ..llm.config import QWEN3_8B_EDITOR_CONFIG
 
-        print("[cli] Đang load Qwen2.5-1.5B NER fixer...", file=sys.stderr)
-        fixer_llm = LocalLLM(NER_FIXER_CONFIG)
-        fixer_llm.load()
-        entities_by_id = pipeline.run_fixer_stage(
+        llm_config = replace(
+            QWEN3_8B_EDITOR_CONFIG,
+            model_id=args.llm_model_id,
+            dtype=args.llm_dtype,
+            load_in_4bit=args.llm_quantization == "4bit",
+            batch_size=args.llm_batch_size,
+        )
+        print(f"[cli] Đang load {llm_config.model_id}...", file=sys.stderr)
+        qwen_llm = LocalLLM(llm_config)
+        qwen_llm.load()
+        pipeline.ner_engine.offload_to_cpu()
+        entities_by_id = pipeline.run_qwen8b_ner_editor_stage(
             raw_texts_by_id,
-            entities_by_id,
-            fixer_llm,
-            audit_missing=not args.no_llm_recall_audit,
-            batch_size=NER_FIXER_CONFIG.batch_size,
+            detailed_by_id,
+            qwen_llm,
+            batch_size=args.llm_batch_size,
+            include_recovery=not args.no_llm_recovery,
+            review_only_auto_add_eligible=args.review_only_auto_add_eligible,
+            cache_path=args.llm_cache_path,
+            model_id=args.llm_model_id,
         )
-        handoff_targets = sum(
-            handoff.get("review_target_count", 0)
-            for handoff in pipeline.last_handoffs.values()
-        )
-        handoff_regions = sum(
-            handoff.get("review_region_count", 0)
-            for handoff in pipeline.last_handoffs.values()
-        )
-        handoff_recoveries = sum(
-            handoff.get("region_recovery_count", 0)
-            for handoff in pipeline.last_handoffs.values()
-        )
-        hint_counts: dict[str, int] = {}
-        for entities in entities_by_id.values():
-            for entity in entities:
-                for hint in entity.review_hints:
-                    if not isinstance(hint, dict):
-                        continue
-                    action = str(hint.get("requested_action", "UNKNOWN"))
-                    hint_counts[action] = hint_counts.get(action, 0) + 1
-        hint_summary = ", ".join(
-            f"{action}={count}" for action, count in sorted(hint_counts.items())
-        ) or "none"
-        print(
-            "[cli] 1.5B -> 7B danger handoff: "
-            f"targets={handoff_targets}, regions={handoff_regions}, "
-            f"recoveries={handoff_recoveries}, hints=({hint_summary})",
-            file=sys.stderr,
-        )
-        fixer_llm.unload()
-        print("[cli] 1.5B fixer xong, đã unload trước khi load 7B.", file=sys.stderr)
+        if args.llm_audit_dir is not None:
+            args.llm_audit_dir.mkdir(parents=True, exist_ok=True)
+            for record_id, audit in pipeline.last_editor_audit.items():
+                path = args.llm_audit_dir / f"{record_id}.ner_audit.json"
+                path.write_text(
+                    json.dumps(audit, ensure_ascii=False, indent=2, default=list),
+                    encoding="utf-8",
+                )
 
-    # ---- Stage 3 (optional): grouped 7B NER review/recovery ----
-    use_7b_reviewer = args.with_llm_7b
-    use_7b_selector = args.with_llm_7b or args.with_llm_selector
-    reviewer_llm = None
-    if use_7b_reviewer or use_7b_selector:
-        from ..llm.backend import LocalLLM
-        from ..llm.config import NER_REVIEWER_7B_CONFIG
-
-        print("[cli] Đang load Qwen 7B...", file=sys.stderr)
-        reviewer_llm = LocalLLM(NER_REVIEWER_7B_CONFIG)
-        reviewer_llm.load()
-
-    if use_7b_reviewer:
-        entities_by_id = pipeline.run_7b_ner_stage(
-            raw_texts_by_id,
-            entities_by_id,
-            reviewer_llm,
-            batch_size=NER_REVIEWER_7B_CONFIG.batch_size,
-            retry_rounds=NER_REVIEWER_7B_CONFIG.retry_rounds,
-            include_recovery=not args.no_llm_recall_audit,
-        )
-        print("[cli] 7B NER reviewer xong; giữ model để rerank linking.", file=sys.stderr)
-
-    # ---- Stage 4: retriever hiện tại -> optional 7B chọn trong candidate ----
     candidates_by_id = pipeline.run_linking_stage(
         entities_by_id,
-        selector_llm=reviewer_llm if use_7b_selector else None,
+        selector_llm=qwen_llm,
         raw_texts_by_id=raw_texts_by_id,
     )
-
-    if reviewer_llm is not None:
-        reviewer_llm.unload()
-        print("[cli] 7B xong, đã unload.", file=sys.stderr)
-
+    if qwen_llm is not None:
+        qwen_llm.unload()
     return pipeline.build_outputs(entities_by_id, candidates_by_id)
 
 
 def main() -> None:
     _configure_utf8_stdio()
     args = parse_args()
-
     if args.input_dir is not None and args.output_dir is None and not args.do_print:
-        print("Cần --output-dir hoặc --print khi dùng --input-dir", file=sys.stderr)
-        sys.exit(1)
-
-    input_paths = [args.input] if args.input is not None else sorted(args.input_dir.glob("*.txt"))
-    if not input_paths:
-        print("Không tìm thấy file .txt nào để chạy.", file=sys.stderr)
-        sys.exit(1)
-
-    # Đọc raw text đúng một lần bằng newline="" để bảo toàn CRLF/offset.
-    raw_texts_by_id = _load_raw_texts(input_paths)
-    outputs = run(
-        args,
-        input_paths,
-        raw_texts_by_id=raw_texts_by_id,
+        raise SystemExit("Cần --output-dir hoặc --print khi dùng --input-dir")
+    input_paths = (
+        [args.input]
+        if args.input is not None
+        else sorted(args.input_dir.glob("*.txt"))
     )
+    if not input_paths:
+        raise SystemExit("Không tìm thấy file .txt")
 
+    raw_texts_by_id = _load_raw_texts(input_paths)
+    outputs = run(args, input_paths, raw_texts_by_id=raw_texts_by_id)
     expected_ids = [path.stem for path in input_paths]
-    expected_id_set = set(expected_ids)
-    output_id_set = set(outputs)
-    missing_ids = expected_id_set - output_id_set
-    extra_ids = output_id_set - expected_id_set
-    if missing_ids or extra_ids:
-        raise ValueError(
-            "Pipeline trả sai tập record id: "
-            f"missing={sorted(missing_ids)}, extra={sorted(extra_ids)}"
-        )
+    if set(outputs) != set(expected_ids):
+        raise ValueError("Pipeline trả sai tập record ID")
 
-    n_ok = 0
-    # Ghi theo thứ tự input thay vì phụ thuộc thứ tự dict từ pipeline.
-    for rid in expected_ids:
-        record_output = outputs[rid]
-        raw_text = raw_texts_by_id[rid]
-
+    for record_id in expected_ids:
+        output = outputs[record_id]
+        raw_text = raw_texts_by_id[record_id]
+        inference_io.validate_record_output(output, raw_text=raw_text)
         if args.output_dir is not None:
-            # Writer validate fail-fast với raw text trước khi ghi.
             inference_io.write_output_json(
-                record_output,
-                args.output_dir / f"{rid}.json",
-                raw_text=raw_text,
+                output, args.output_dir / f"{record_id}.json", raw_text=raw_text,
             )
-        else:
-            # Chế độ chỉ --print trước đây bỏ qua toàn bộ raw-span validation.
-            inference_io.validate_record_output(
-                record_output,
-                raw_text=raw_text,
-            )
-
         if args.do_print or args.output_dir is None:
-            print(json.dumps(record_output, ensure_ascii=False, indent=2))
-        n_ok += 1
-
-    print(f"[cli] Xong: {n_ok} record.", file=sys.stderr)
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+    print(f"[cli] Xong: {len(expected_ids)} record.", file=sys.stderr)
 
 
 if __name__ == "__main__":

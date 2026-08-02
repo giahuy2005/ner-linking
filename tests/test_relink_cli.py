@@ -8,7 +8,7 @@ from src.inference.relink_cli import run
 
 
 class RelinkCliTests(unittest.TestCase):
-    def test_relink_revalidates_raw_boundaries_and_discards_old_candidates(self):
+    def test_strict_relink_preserves_ner_identity_and_discards_old_candidates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_dir = root / "input"
@@ -52,16 +52,17 @@ class RelinkCliTests(unittest.TestCase):
                 output_dir=output_dir,
                 with_rxnorm=False,
                 with_icd10=False,
-                with_llm_selector=False,
+                with_llm_8b=False,
             )
 
             stats = run(args)
             output = json.loads((output_dir / "1.json").read_text(encoding="utf-8"))
 
             self.assertEqual(1, stats["records"])
-            self.assertEqual(["Khó thở", "bệnh tim"], [item["text"] for item in output])
+            self.assertEqual(["Khó th", "bệnh tim", "1 gram"], [item["text"] for item in output])
             self.assertEqual([], output[1]["candidates"])
-            self.assertNotIn("candidates", output[0])
+            self.assertEqual([], output[2]["candidates"])
+            self.assertEqual([], output[0]["candidates"])
 
     def test_relink_refuses_to_overwrite_source_entities(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -72,7 +73,7 @@ class RelinkCliTests(unittest.TestCase):
                 output_dir=root,
                 with_rxnorm=False,
                 with_icd10=False,
-                with_llm_selector=False,
+                with_llm_8b=False,
             )
             with self.assertRaisesRegex(ValueError, "khác"):
                 run(args)

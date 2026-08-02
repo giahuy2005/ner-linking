@@ -1,8 +1,4 @@
-"""LocalLLM: load model 4-bit khi cần, generate qua chat template, unload
-giải phóng VRAM. Gọi load()/unload() thủ công quanh 1 batch xử lý (KHÔNG
-tự load trong __init__) để 2 model (fixer + selector) không bao giờ cùng
-ở trên GPU 1 lúc — xem docstring ở cli/pipeline chỗ gọi.
-"""
+"""Lifecycle-managed local Qwen backend with deterministic batched generation."""
 
 from __future__ import annotations
 
@@ -58,15 +54,33 @@ class LocalLLM:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_id,
-            revision=self.config.revision,
-            cache_dir=self.config.cache_dir,
-            local_files_only=self.config.local_files_only,
-            quantization_config=quantization_config,
-            device_map="auto",
-            torch_dtype="auto",
-        )
+        dtype = {
+            "auto": "auto",
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }.get(self.config.dtype)
+        if dtype is None:
+            raise ValueError(f"Unsupported LLM dtype: {self.config.dtype}")
+        model_kwargs = {
+            "revision": self.config.revision,
+            "cache_dir": self.config.cache_dir,
+            "local_files_only": self.config.local_files_only,
+            "quantization_config": quantization_config,
+            "device_map": "auto",
+            "torch_dtype": dtype,
+        }
+        if self.config.attention_implementation:
+            model_kwargs["attn_implementation"] = self.config.attention_implementation
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_id, **model_kwargs,
+            )
+        except (ImportError, ValueError) as exc:
+            if model_kwargs.pop("attn_implementation", None) is None:
+                raise
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_id, **model_kwargs,
+            )
         self.model.eval()
 
     def unload(self) -> None:

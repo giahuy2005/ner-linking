@@ -134,26 +134,8 @@ class Icd10LinkingTests(unittest.TestCase):
             ],
         )
 
-    def test_exact_vietnamese_aliases_prevent_unrelated_icd_candidates(self):
-        expected = {
-            "ăng huyết áp": "I10",
-            "ổ loét trong bao tử": "K25",
-            "viêm bao tử": "K29",
-            "Bệnh đa xơ cứng": "G35",
-            "thiếu men G6PD": "D55.0",
-            "thiếu máu": "D64.9",
-            "nhiễm khuẩn tiết niệu": "N39.0",
-            "co giật": "R56.8",
-            "sốt siêu vi": "B34.9",
-            "Viêm cơ tim": "I51.4",
-            "Tràn dịch màng tim": "I31.3",
-            "ngoại tâm thu thất": "I49.3",
-        }
-        for mention, code in expected.items():
-            with self.subTest(mention=mention):
-                result = _exact_alias_result(mention)
-                self.assertIsNotNone(result)
-                self.assertEqual([code], [row["code"] for row in result])
+    def test_production_has_no_observed_surface_alias_table(self):
+        self.assertIsNone(_exact_alias_result("ổ loét trong bao tử"))
 
     def test_metadata_builds_only_unambiguous_exact_aliases(self):
         metadata = [
@@ -174,7 +156,7 @@ class Icd10LinkingTests(unittest.TestCase):
         self.assertNotIn("cụm mơ hồ", aliases)
         self.assertNotIn("english only", aliases)
 
-    def test_icd_finalize_filters_threshold_chapter_and_caps_at_two(self):
+    def test_icd_finalize_uses_chapter_as_soft_evidence_without_early_truncation(self):
         rows = [
             {"score": 0.93, "term_id": "K25|vi|preferred|0", "code": "K25",
              "text": "Loét dạ dày", "language": "vi", "term_type": "preferred"},
@@ -192,7 +174,9 @@ class Icd10LinkingTests(unittest.TestCase):
             "ổ loét trong bao tử", rows, top_k_codes=10, min_score=0.55,
         )
 
-        self.assertEqual(["K25", "K26"], [row["code"] for row in result])
+        self.assertEqual(4, len(result))
+        self.assertEqual("K25", result[0]["code"])
+        self.assertIn("chapter_support", result[0])
 
     def test_term_loading_and_metadata_preserve_vector_order(self):
         terms = [

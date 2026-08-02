@@ -36,9 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-rxnorm", action="store_true")
     parser.add_argument("--with-icd10", action="store_true")
     parser.add_argument(
-        "--with-llm-selector",
+        "--with-llm-8b",
         action="store_true",
-        help="Use Qwen 7B only for candidate selection; NER is not rerun.",
+        help="Use Qwen3-8B only for candidate selection; NER is not rerun.",
     )
     parser.add_argument(
         "--cleanup-entities",
@@ -305,11 +305,11 @@ def run(args: argparse.Namespace) -> dict[str, int | bool | str]:
     )
 
     selector_llm = None
-    if args.with_llm_selector:
+    if getattr(args, "with_llm_8b", False):
         from ..llm.backend import LocalLLM
-        from ..llm.config import NER_REVIEWER_7B_CONFIG
+        from ..llm.config import QWEN3_8B_EDITOR_CONFIG
 
-        selector_llm = LocalLLM(NER_REVIEWER_7B_CONFIG)
+        selector_llm = LocalLLM(QWEN3_8B_EDITOR_CONFIG)
         selector_llm.load()
 
     try:

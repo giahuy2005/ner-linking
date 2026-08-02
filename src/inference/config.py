@@ -25,15 +25,15 @@ from ..linking.icd10.config import DEFAULT_INDEX_DIR as DEFAULT_ICD10_INDEX_DIR
 # Model NER + assertion (bản CRF, khớp train_ner_colab_crf)
 # ---------------------------------------------------------------------------
 DEFAULT_BACKBONE = "demdecuong/vihealthbert-base-word"
-DEFAULT_CHECKPOINT_PATH = Path("models/ner/best_ner_assertion_model.pth")
-DEFAULT_LABEL_DICTS_PATH = Path("models/ner/label_dicts_crf.json")
+DEFAULT_CHECKPOINT_PATH = Path("models/ner/best_ner_assertion_span_model.pth")
+DEFAULT_LABEL_DICTS_PATH = Path("models/ner/label_dicts.json")
 DEFAULT_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 
 
 # PHẢI khớp giá trị dùng lúc train — sai giá trị này thì load_state_dict
 # vẫn chạy được (không đổi shape) nhưng assertion head sẽ pool sai vùng
 # context, làm assertion prediction sai lệch không báo lỗi.
-CONTEXT_WINDOW = 10
+CONTEXT_WINDOW = 24
 
 # ---------------------------------------------------------------------------
 # VnCoreNLP (word segmenter dùng để map offset)
@@ -48,17 +48,24 @@ OVERLAP_WORDS = 50
 ASSERTION_THRESHOLD = 0.5
 SINGLE_ASSERTION = False  # True nếu submit yêu cầu ép 1 assertion/entity
 
+# CRF + span lattice thresholds ported from the reference notebook.
+SPAN_ADD_THRESHOLD = 0.82
+SPAN_AUDIT_THRESHOLD = 0.35
+SPAN_REPAIR_THRESHOLD = 0.90
+SPAN_RETYPE_THRESHOLD = 0.95
+O_TOKEN_ENTITY_MASS_THRESHOLD = 0.55
+LOCAL_VERIFICATION_THRESHOLD = 0.72
+SPAN_MAX_WIDTH_WORDS = 16
+SPAN_WIDTH_EMBEDDING_DIM = 32
+SPAN_DROPOUT = 0.20
+
 # ---------------------------------------------------------------------------
 # Rule filter (repair_gate) — bật/tắt để dễ so sánh A/B khi tune
 # ---------------------------------------------------------------------------
 ENABLE_REPAIR_GATE = True
 
-# Notebook V11 two-pass / grouped 7B handoff defaults.
+# Optional local second-pass NER limit.
 MAXIMUM_SECOND_PASS_REGIONS = 24
-ENTITY_REVIEW_SCORE_THRESHOLD = 0.82
-MAXIMUM_REVIEW_REGIONS = 15
-MAXIMUM_REVIEW_TARGETS_PER_REGION = 8
-MAXIMUM_RECOVERY_REGIONS = 12
 
 # ---------------------------------------------------------------------------
 # Linking (RxNorm cho THUỐC, ICD-10 cho CHẨN_ĐOÁN) — dùng ở pipeline.py.
