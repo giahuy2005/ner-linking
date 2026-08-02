@@ -23,6 +23,11 @@ checkpoints/
 *.bin
 *.onnx
 *.gguf
+!models/
+models/*
+!models/ner/
+models/ner/*
+!models/ner/model_config.json
 .cache/
 huggingface/
 hf_cache/

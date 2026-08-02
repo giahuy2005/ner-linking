@@ -50,7 +50,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--checkpoint", type=Path, default=cfg.DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--label-dicts", type=Path, default=cfg.DEFAULT_LABEL_DICTS_PATH)
-    parser.add_argument("--backbone", default=cfg.DEFAULT_BACKBONE)
+    parser.add_argument(
+        "--model-config",
+        type=Path,
+        default=None,
+        help="mặc định dùng model_config.json nằm cạnh checkpoint",
+    )
+    parser.add_argument(
+        "--backbone",
+        default=None,
+        help="override model_name trong model config",
+    )
     parser.add_argument("--vncorenlp-jar", type=Path, default=cfg.DEFAULT_VNCORENLP_JAR)
     parser.add_argument("--device", default=cfg.DEFAULT_DEVICE)
     parser.add_argument("--no-repair-gate", action="store_true")
@@ -73,6 +83,7 @@ def run(
         with_icd10=args.with_icd10,
         checkpoint_path=args.checkpoint,
         label_dicts_path=args.label_dicts,
+        model_config_path=args.model_config,
         backbone=args.backbone,
         vncorenlp_jar=args.vncorenlp_jar,
         device=args.device,

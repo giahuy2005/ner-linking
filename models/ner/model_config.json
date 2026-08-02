@@ -1,0 +1,24 @@
+{
+  "model_name": "demdecuong/vihealthbert-base-word",
+  "context_window": 24,
+  "span_max_width_words": 16,
+  "span_width_embedding_dim": 32,
+  "span_dropout": 0.2,
+  "span_architecture": "start+end+mean+width_embedding",
+  "span_add_threshold": 0.82,
+  "span_audit_threshold": 0.35,
+  "span_repair_threshold": 0.9,
+  "span_retype_threshold": 0.95,
+  "o_token_entity_mass_threshold": 0.55,
+  "local_verification_threshold": 0.72,
+  "loss_weights": {
+    "auxiliary_token_ce": 0.2,
+    "span_loss": 0.45,
+    "assertion_loss": 0.5
+  },
+  "validation": {
+    "assertions_on_predicted_spans": true,
+    "wrong_type_counted_as_fp_and_fn": true,
+    "candidate_predictor_required_for_official_final_score": true
+  }
+}

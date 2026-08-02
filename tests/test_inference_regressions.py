@@ -36,6 +36,24 @@ class _BatchLlm:
 
 
 class InferenceRegressionTests(unittest.TestCase):
+    def test_offset_mapper_never_builds_a_token_across_physical_lines(self):
+        class _LineSensitiveRdr:
+            @staticmethod
+            def tokenize(text):
+                if "\n" in text:
+                    return [["bệnh_Kawasaki_Mặc"]]
+                return [[text.replace(" ", "_")]]
+
+        text = "bệnh Kawasaki\nMặc"
+        tokens, offsets, line_ids = offset_mapper.segment_with_offsets(
+            text, _LineSensitiveRdr(),
+        )
+
+        self.assertEqual(["bệnh_Kawasaki", "Mặc"], tokens)
+        self.assertEqual([(0, 13), (14, 17)], offsets)
+        self.assertEqual([0, 1], line_ids)
+        self.assertTrue(all("\n" not in text[start:end] for start, end in offsets))
+
     def test_notebook_offset_validation_checks_every_internal_word(self):
         self.assertFalse(offset_mapper.is_valid_char_span(
             [(0, 3), (None, None), (7, 10)], 0, 3,

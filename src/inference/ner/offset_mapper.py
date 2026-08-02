@@ -147,8 +147,17 @@ def segment_with_offsets(
     vị trí trước token. Một bounded resync chỉ được dùng khi token chưa match
     được syllable nào, nhằm tránh một lỗi OCR làm lệch toàn bộ token phía sau.
     """
-    sentences = rdr.tokenize(text)
-    word_tokens = [tok for sent in sentences for tok in sent]
+    # VnCoreNLP may join syllables on adjacent physical lines into one
+    # underscore token when the whole block is submitted at once. Such a token
+    # has a character span containing ``\n`` and can make BIO extraction create
+    # an illegal cross-line entity. Tokenize each physical line independently;
+    # the global offset mapper below still maps every token against ``text``.
+    word_tokens: list[str] = []
+    for physical_line in text.splitlines():
+        if not physical_line.strip():
+            continue
+        sentences = rdr.tokenize(physical_line)
+        word_tokens.extend(tok for sent in sentences for tok in sent)
 
     offsets: list[tuple[int | None, int | None]] = []
     mapped_tokens: list[str] = []

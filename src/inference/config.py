@@ -27,6 +27,7 @@ from ..linking.icd10.config import DEFAULT_INDEX_DIR as DEFAULT_ICD10_INDEX_DIR
 DEFAULT_BACKBONE = "demdecuong/vihealthbert-base-word"
 DEFAULT_CHECKPOINT_PATH = Path("models/ner/best_ner_assertion_span_model.pth")
 DEFAULT_LABEL_DICTS_PATH = Path("models/ner/label_dicts.json")
+DEFAULT_MODEL_CONFIG_PATH = Path("models/ner/model_config.json")
 DEFAULT_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 
 

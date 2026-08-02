@@ -318,7 +318,8 @@ class NerEngine:
     """Wrap model + tokenizer + VnCoreNLP, expose predict API cấp cao."""
 
     def __init__(self, model: NerAssertionModel, tokenizer, rdr, id2nerlabel: dict,
-                 id2assertlabel: dict, device: torch.device, id2spanlabel: dict | None = None):
+                 id2assertlabel: dict, device: torch.device, id2spanlabel: dict | None = None,
+                 model_config: dict[str, Any] | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.rdr = rdr
@@ -326,20 +327,51 @@ class NerEngine:
         self.id2assertlabel = id2assertlabel
         self.id2spanlabel = id2spanlabel or {}
         self.device = device
+        self.model_config = dict(model_config or {})
 
     @classmethod
     def load(
         cls,
         checkpoint_path: str | Path = cfg.DEFAULT_CHECKPOINT_PATH,
         label_dicts_path: str | Path = cfg.DEFAULT_LABEL_DICTS_PATH,
-        backbone: str = cfg.DEFAULT_BACKBONE,
+        model_config_path: str | Path | None = None,
+        backbone: str | None = None,
         vncorenlp_jar: str | Path = cfg.DEFAULT_VNCORENLP_JAR,
         device: str = cfg.DEFAULT_DEVICE,
-        context_window: int = cfg.CONTEXT_WINDOW,
+        context_window: int | None = None,
     ) -> "NerEngine":
         from vncorenlp import VnCoreNLP
 
         resolved_device = torch.device(device if torch.cuda.is_available() else "cpu")
+        checkpoint_path = Path(checkpoint_path)
+        config_path = (
+            Path(model_config_path)
+            if model_config_path is not None
+            else checkpoint_path.with_name("model_config.json")
+        )
+        model_config: dict[str, Any] = {}
+        if model_config_path is not None and not config_path.is_file():
+            raise FileNotFoundError(f"NER model config not found: {config_path}")
+        if config_path.exists():
+            with config_path.open("r", encoding="utf-8") as file:
+                loaded_config = json.load(file)
+            if not isinstance(loaded_config, dict):
+                raise ValueError(f"NER model config must be a JSON object: {config_path}")
+            model_config = loaded_config
+
+        resolved_backbone = backbone or model_config.get("model_name") or cfg.DEFAULT_BACKBONE
+        resolved_context_window = int(
+            context_window
+            if context_window is not None
+            else model_config.get("context_window", cfg.CONTEXT_WINDOW)
+        )
+        span_max_width_words = int(
+            model_config.get("span_max_width_words", cfg.SPAN_MAX_WIDTH_WORDS)
+        )
+        span_width_embedding_dim = int(
+            model_config.get("span_width_embedding_dim", cfg.SPAN_WIDTH_EMBEDDING_DIM)
+        )
+        span_dropout = float(model_config.get("span_dropout", cfg.SPAN_DROPOUT))
 
         with open(label_dicts_path, "r", encoding="utf-8") as f:
             label_dicts = json.load(f)
@@ -350,7 +382,7 @@ class NerEngine:
         id2assertlabel = {v: k for k, v in assertlabel2id.items()}
         id2spanlabel = {v: k for k, v in (spanlabel2id or {}).items()}
 
-        tokenizer = AutoTokenizer.from_pretrained(backbone)
+        tokenizer = AutoTokenizer.from_pretrained(resolved_backbone)
 
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         if isinstance(state_dict, dict) and "state_dict" in state_dict:
@@ -374,11 +406,14 @@ class NerEngine:
             num_span_labels = 0
 
         model = NerAssertionModel(
-            model_name=backbone,
+            model_name=resolved_backbone,
             num_ner_tags=len(nerlabel2id),
             num_span_labels=num_span_labels,
             num_assert_labels=len(assertlabel2id),
-            context_window=context_window,
+            context_window=resolved_context_window,
+            span_dropout=span_dropout,
+            span_width_embedding_dim=span_width_embedding_dim,
+            max_span_width_words=span_max_width_words,
         )
         model.load_state_dict(state_dict, strict=True)
         if not has_span_weights:
@@ -393,7 +428,7 @@ class NerEngine:
 
         return cls(
             model, tokenizer, rdr, id2nerlabel, id2assertlabel,
-            resolved_device, id2spanlabel,
+            resolved_device, id2spanlabel, model_config,
         )
 
     def move_to(self, device: str | torch.device) -> None:
@@ -626,8 +661,8 @@ class NerEngine:
         *,
         max_len: int = cfg.MAX_LEN,
         overlap_words: int = cfg.OVERLAP_WORDS,
-        span_add_threshold: float = cfg.SPAN_ADD_THRESHOLD,
-        span_audit_threshold: float = cfg.SPAN_AUDIT_THRESHOLD,
+        span_add_threshold: float | None = None,
+        span_audit_threshold: float | None = None,
         **predict_kwargs,
     ) -> NerDetailedResult:
         """Return CRF output plus exact marginals and optional span-head evidence.
@@ -637,6 +672,14 @@ class NerEngine:
         checkpoint produces the same final entities and an explicit disabled log.
         """
         self.model.eval()
+        span_add_threshold = float(
+            self.model_config.get("span_add_threshold", cfg.SPAN_ADD_THRESHOLD)
+            if span_add_threshold is None else span_add_threshold
+        )
+        span_audit_threshold = float(
+            self.model_config.get("span_audit_threshold", cfg.SPAN_AUDIT_THRESHOLD)
+            if span_audit_threshold is None else span_audit_threshold
+        )
         crf_entities = self.predict_text(
             text, max_len=max_len, overlap_words=overlap_words, **predict_kwargs,
         )
@@ -650,10 +693,18 @@ class NerEngine:
             thresholds={
                 "span_add": float(span_add_threshold),
                 "span_audit": float(span_audit_threshold),
-                "span_repair": float(cfg.SPAN_REPAIR_THRESHOLD),
-                "span_retype": float(cfg.SPAN_RETYPE_THRESHOLD),
-                "o_token_entity_mass": float(cfg.O_TOKEN_ENTITY_MASS_THRESHOLD),
-                "local_verification": float(cfg.LOCAL_VERIFICATION_THRESHOLD),
+                "span_repair": float(self.model_config.get(
+                    "span_repair_threshold", cfg.SPAN_REPAIR_THRESHOLD,
+                )),
+                "span_retype": float(self.model_config.get(
+                    "span_retype_threshold", cfg.SPAN_RETYPE_THRESHOLD,
+                )),
+                "o_token_entity_mass": float(self.model_config.get(
+                    "o_token_entity_mass_threshold", cfg.O_TOKEN_ENTITY_MASS_THRESHOLD,
+                )),
+                "local_verification": float(self.model_config.get(
+                    "local_verification_threshold", cfg.LOCAL_VERIFICATION_THRESHOLD,
+                )),
             },
             span_head_enabled=self.model.span_head is not None,
         )
