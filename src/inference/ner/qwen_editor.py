@@ -55,8 +55,7 @@ def _candidate_payload(
     optional = {
         "assertions": item.assertions, "sources": item.sources,
         "score": round(max((float(score) for score in item.scores.values()), default=0.0), 4),
-        "allowed_types": item.allowed_types, "supports": item.supports,
-        "flags": item.negative_flags, "related_ids": item.related_candidate_ids,
+        "allowed_types": item.allowed_types, "flags": item.negative_flags,
     }
     value.update({key: item_value for key, item_value in optional.items() if item_value})
     if item.strong_consensus:

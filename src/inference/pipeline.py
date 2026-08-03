@@ -305,6 +305,7 @@ class InferencePipeline:
             build_missing_request, parse_missing_response,
             generate_with_cache, VersionedJsonlCache, PROMPT_VERSION,
         )
+        from .ner.editor_schemas import ReviewRegion
         from .schemas import normalize_entity_schema
 
         catalogs, regions_by_id = {}, {}
@@ -317,10 +318,72 @@ class InferencePipeline:
             regions = build_review_regions(record_id, raw_text, catalog)
             if speed_profile == "fast":
                 regions = [region for region in regions if region.priority >= 100]
-            regions_by_id[record_id] = regions
+            fitted_regions = []
             for region in regions:
                 region_candidates = [by_id[candidate_id] for candidate_id in region.candidate_ids]
-                prompt_entries.append((record_id, region, region_candidates, build_editor_request(region, region_candidates)))
+                queue = [(region, region_candidates)]
+                while queue:
+                    current, current_candidates = queue.pop(0)
+                    prompt = build_editor_request(current, current_candidates)
+                    token_count = None
+                    if hasattr(qwen_llm, "count_prompt_tokens"):
+                        try:
+                            token_count = qwen_llm.count_prompt_tokens(
+                                [prompt], enforce_limit=False,
+                            )[0]
+                        except TypeError:
+                            token_count = qwen_llm.count_prompt_tokens([prompt])[0]
+                    max_input = int(getattr(getattr(qwen_llm, "config", None), "max_context_length", 2048))
+                    if token_count is None or token_count <= max_input:
+                        fitted_regions.append(current)
+                        prompt_entries.append((record_id, current, current_candidates, prompt))
+                        continue
+
+                    targets = [by_id[candidate_id] for candidate_id in current.target_candidate_ids]
+                    if len(targets) > 1:
+                        midpoint = max(1, len(targets) // 2)
+                        groups = (targets[:midpoint], targets[midpoint:])
+                    else:
+                        groups = (targets,)
+                    rebuilt = []
+                    for group_index, group in enumerate(groups):
+                        core_start = min(item.position[0] for item in group)
+                        core_end = max(item.position[1] for item in group)
+                        if len(group) == 1:
+                            existing_radius = max(
+                                core_start - current.context_start,
+                                current.context_end - core_end,
+                            )
+                            radius = min(96, max(0, existing_radius // 2))
+                        else:
+                            radius = 128
+                        context_start = max(0, core_start - radius)
+                        context_end = min(len(raw_text), core_end + radius)
+                        target_ids = [item.candidate_id for item in group]
+                        context_items = [
+                            by_id[candidate_id] for candidate_id in current.context_candidate_ids
+                            if candidate_id in by_id
+                            and by_id[candidate_id].position[0] >= context_start
+                            and by_id[candidate_id].position[1] <= context_end
+                        ]
+                        compact_region = ReviewRegion(
+                            request_id=f"{current.request_id}:fit{group_index}",
+                            record_id=current.record_id,
+                            context=raw_text[context_start:context_end],
+                            context_start=context_start, context_end=context_end,
+                            target_candidate_ids=target_ids,
+                            context_candidate_ids=[item.candidate_id for item in context_items],
+                            reasons=list(current.reasons), priority=current.priority,
+                            must_review=current.must_review,
+                        )
+                        rebuilt.append((compact_region, [*group, *context_items]))
+                    if len(rebuilt) == 1 and rebuilt[0][0].context == current.context:
+                        raise ValueError(
+                            f"editor prompt cannot fit max_context_length={max_input}: "
+                            f"request={current.request_id} tokens={token_count}"
+                        )
+                    queue = [*rebuilt, *queue]
+            regions_by_id[record_id] = fitted_regions
         editor_prompts = [item[3] for item in prompt_entries]
         editor_token_counts = (
             qwen_llm.count_prompt_tokens(editor_prompts)

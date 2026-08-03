@@ -79,13 +79,19 @@ class LocalLLM:
         device_map_value = getattr(self.model, "hf_device_map", None)
         devices = {str(value) for value in (device_map_value or {}).values()}
         offloaded = any(value == "cpu" or value == "disk" for value in devices)
+        primary_device = str(next(self.model.parameters()).device)
         self.load_stats = {
             "load_seconds": time.perf_counter() - started,
-            "hf_device_map": device_map_value, "cpu_or_disk_offload": offloaded,
+            "hf_device_map": device_map_value, "primary_device": primary_device,
+            "cpu_or_disk_offload": offloaded,
         }
-        print(f"[Qwen] loaded in {self.load_stats['load_seconds']:.2f}s device_map={device_map_value}", flush=True)
-        if offloaded:
-            message = "Qwen has CPU/disk-offloaded layers; A40 inference will be very slow"
+        print(
+            f"[Qwen] loaded in {self.load_stats['load_seconds']:.2f}s "
+            f"device={primary_device} device_map={device_map_value}", flush=True,
+        )
+        not_full_gpu = offloaded or not primary_device.startswith("cuda")
+        if not_full_gpu:
+            message = f"Qwen is not fully on CUDA (primary={primary_device}, map={device_map_value})"
             if self.config.require_full_gpu:
                 raise RuntimeError(message)
             print(f"[Qwen] WARNING: {message}", flush=True)
@@ -108,7 +114,9 @@ class LocalLLM:
             {"role": "user", "content": user_prompt},
         ], **kwargs)
 
-    def count_prompt_tokens(self, prompts: list[tuple[str, str]]) -> list[int]:
+    def count_prompt_tokens(
+        self, prompts: list[tuple[str, str]], *, enforce_limit: bool = True,
+    ) -> list[int]:
         self.load()
         texts = [self._build_prompt_text(*prompt) for prompt in prompts]
         encoded = self.tokenizer(
@@ -120,7 +128,7 @@ class LocalLLM:
         else:
             lengths = [len(row) for row in encoded["input_ids"]]
         oversized = [value for value in lengths if value > self.config.max_context_length]
-        if oversized:
+        if oversized and enforce_limit:
             raise ValueError(
                 f"prompt exceeds max_context_length={self.config.max_context_length}: max={max(oversized)}"
             )
