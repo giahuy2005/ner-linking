@@ -301,9 +301,16 @@ class InferencePipeline:
             build_review_regions,
         )
         from .ner.qwen_editor import (
-            apply_editor_response, apply_missing_decisions, build_editor_request,
-            build_missing_request, parse_missing_response,
-            generate_with_cache, VersionedJsonlCache, PROMPT_VERSION,
+            PROMPT_VERSION,
+            VersionedJsonlCache,
+            apply_editor_response,
+            apply_missing_decisions,
+            build_editor_request,
+            build_missing_request,
+            editor_response_error,
+            editor_response_is_valid,
+            generate_with_cache,
+            parse_missing_response,
         )
         from .ner.editor_schemas import ReviewRegion
         from .schemas import normalize_entity_schema
@@ -407,6 +414,7 @@ class InferencePipeline:
 
         cache = VersionedJsonlCache(cache_path, fsync=cache_fsync) if cache_path is not None else None
         raw_outputs = [""] * len(prompt_entries)
+        token_budget_by_index: dict[int, int] = {}
         editor_generation_started = time.perf_counter()
         for token_budget in (128, 160, 224, 256):
             indexes = [index for index, item in enumerate(prompt_entries) if (
@@ -415,8 +423,22 @@ class InferencePipeline:
                 else 224 if not any(reason in {"boundary_disagreement", "merge_required"} for reason in item[1].reasons)
                 else 256
             ) == token_budget]
+            for index in indexes:
+                token_budget_by_index[index] = token_budget
+            subset_entries = [prompt_entries[index] for index in indexes]
+
+            def validate_subset_response(
+                local_index: int,
+                response: str,
+                entries=subset_entries,
+            ) -> bool:
+                return editor_response_is_valid(
+                    response,
+                    expected_request_id=entries[local_index][1].request_id,
+                )
+
             generated = generate_with_cache(
-                qwen_llm, [prompt_entries[index][3] for index in indexes],
+                qwen_llm, [item[3] for item in subset_entries],
                 batch_size=batch_size, model_id=model_id,
                 task=f"ner_editor:max{token_budget}", cache=cache,
                 max_new_tokens=token_budget,
@@ -425,10 +447,66 @@ class InferencePipeline:
                 dynamic_batching=dynamic_batching, progress_every=progress_every,
                 progress_callback=record_progress,
                 prompt_token_counts=[editor_token_counts[index] for index in indexes] if editor_token_counts else None,
+                response_validator=validate_subset_response,
             )
             for index, response in zip(indexes, generated):
                 raw_outputs[index] = response
+
+        initial_raw_outputs = list(raw_outputs)
+        retry_errors = {
+            index: editor_response_error(
+                response,
+                expected_request_id=prompt_entries[index][1].request_id,
+            )
+            for index, response in enumerate(raw_outputs)
+        }
+        retry_indexes = [
+            index for index, error in retry_errors.items() if error is not None
+        ]
+        workload["editor_retry_count"] = len(retry_indexes)
+        if retry_indexes:
+            retry_entries = [prompt_entries[index] for index in retry_indexes]
+            retry_budget = min(
+                512,
+                max(
+                    256,
+                    max(token_budget_by_index.get(index, 128) * 2 for index in retry_indexes),
+                ),
+            )
+
+            def validate_retry_response(
+                local_index: int,
+                response: str,
+                entries=retry_entries,
+            ) -> bool:
+                return editor_response_is_valid(
+                    response,
+                    expected_request_id=entries[local_index][1].request_id,
+                )
+
+            retry_generated = generate_with_cache(
+                qwen_llm, [item[3] for item in retry_entries],
+                batch_size=batch_size, model_id=model_id,
+                task=f"ner_editor_retry:max{retry_budget}", cache=cache,
+                max_new_tokens=retry_budget,
+                prompt_version=PROMPT_VERSION,
+                max_batch_tokens=max_batch_tokens, min_batch_size=min_batch_size,
+                dynamic_batching=dynamic_batching, progress_every=progress_every,
+                progress_callback=record_progress,
+                prompt_token_counts=[editor_token_counts[index] for index in retry_indexes] if editor_token_counts else None,
+                response_validator=validate_retry_response,
+            )
+            for index, response in zip(retry_indexes, retry_generated):
+                raw_outputs[index] = response
         editor_generation_seconds = time.perf_counter() - editor_generation_started
+        def entity_audit_value(entity: NerEntity) -> dict:
+            return {
+                "text": entity.text,
+                "type": entity.type,
+                "assertions": list(entity.assertions),
+                "position": list(entity.position),
+            }
+
         outputs = {
             record_id: [normalize_entity_schema(item) for item in detailed.final_entities]
             for record_id, detailed in detailed_by_id.items()
@@ -436,6 +514,9 @@ class InferencePipeline:
         audit = {
             record_id: {
                 "candidate_catalog": [item.__dict__ for item in catalogs[record_id]],
+                "entities_before_editor": [
+                    entity_audit_value(item) for item in outputs[record_id]
+                ],
                 "regions": [],
                 "summary": {
                     "catalog_count": len(catalogs[record_id]),
@@ -455,39 +536,72 @@ class InferencePipeline:
                     ),
                     "applied": 0, "rejected": 0, "unresolved": 0,
                     "parse_success": 0, "parse_failure": 0,
+                    "retried": 0,
                 },
             }
             for record_id in detailed_by_id
         }
         editor_apply_started = time.perf_counter()
-        for (record_id, region, region_candidates, _prompt), raw_output in zip(prompt_entries, raw_outputs):
+        retry_index_set = set(retry_indexes)
+        for entry_index, (
+            (record_id, region, region_candidates, _prompt), raw_output,
+        ) in enumerate(zip(prompt_entries, raw_outputs)):
+            before_record = list(outputs[record_id])
+            region_keys = {
+                (item.position[0], item.position[1], item.type)
+                for item in region_candidates
+            }
+            before_region = [
+                entity_audit_value(entity) for entity in before_record
+                if (entity.position[0], entity.position[1], entity.type) in region_keys
+            ]
             result = apply_editor_response(
                 raw_texts_by_id[record_id], region_candidates, raw_output,
                 context_start=region.context_start,
                 validation_candidates=catalogs[record_id],
                 target_candidate_ids=region.target_candidate_ids,
+                expected_request_id=region.request_id,
+                baseline_entities=before_record,
             )
-            target_id_set = set(region.target_candidate_ids)
-            target_keys = {
-                (item.position[0], item.position[1], item.type)
-                for item in region_candidates
-                if item.pre_llm_selected and item.candidate_id in target_id_set
-            }
             retained = [
-                entity for entity in outputs[record_id]
-                if (entity.position[0], entity.position[1], entity.type) not in target_keys
+                entity for entity in before_record
+                if (entity.position[0], entity.position[1], entity.type) not in region_keys
             ]
             retained.extend(normalize_entity_schema(item) for item in result.entities)
-            dedup = {(item.position[0], item.position[1], item.type): item for item in retained}
-            outputs[record_id] = sorted(dedup.values(), key=lambda item: (*item.position, item.type))
-            parse_failed = any(item.get("reason") == "invalid_json" for item in result.rejected)
+            dedup = {
+                (item.position[0], item.position[1], item.type): item
+                for item in retained
+            }
+            outputs[record_id] = sorted(
+                dedup.values(), key=lambda item: (*item.position, item.type)
+            )
+            after_region = [
+                entity_audit_value(entity) for entity in outputs[record_id]
+                if (
+                    entity.position[0] < region.context_end
+                    and entity.position[1] > region.context_start
+                )
+            ]
+            parse_failed = any(
+                item.get("reason") == "invalid_response_envelope"
+                for item in result.rejected
+            )
+            was_retried = entry_index in retry_index_set
             audit[record_id]["regions"].append({
                 "request_id": region.request_id,
                 "context_start": region.context_start,
                 "context_end": region.context_end,
                 "candidate_ids": list(region.candidate_ids),
+                "target_candidate_ids": list(region.target_candidate_ids),
+                "context_candidate_ids": list(region.context_candidate_ids),
                 "reasons": list(region.reasons),
+                "raw_response_initial": initial_raw_outputs[entry_index],
                 "raw_response": raw_output,
+                "retry_attempted": was_retried,
+                "initial_response_error": retry_errors.get(entry_index),
+                "entities_before": before_region,
+                "entities_after": after_region,
+                "consumed_candidate_ids": result.consumed_candidate_ids,
                 "applied": result.applied,
                 "rejected": result.rejected,
                 "unresolved": result.unresolved,
@@ -497,7 +611,12 @@ class InferencePipeline:
             summary["applied"] += len(result.applied)
             summary["rejected"] += len(result.rejected)
             summary["unresolved"] += len(result.unresolved)
+            summary["retried"] += int(was_retried)
             summary["parse_failure" if parse_failed else "parse_success"] += 1
+        for record_id in outputs:
+            audit[record_id]["entities_after_editor"] = [
+                entity_audit_value(item) for item in outputs[record_id]
+            ]
         editor_apply_seconds = time.perf_counter() - editor_apply_started
 
         recovery_started = time.perf_counter()
@@ -598,6 +717,9 @@ class InferencePipeline:
                 })
         for record_id, entities in outputs.items():
             outputs[record_id] = [normalize_entity_schema(item) for item in entities]
+            audit[record_id]["entities_after_recovery"] = [
+                entity_audit_value(item) for item in outputs[record_id]
+            ]
         self.last_editor_audit = audit
         output_tokens = [
             int(value)

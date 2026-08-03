@@ -10,17 +10,16 @@ from ..schemas import ASSERTION_ENTITY_TYPES, VALID_ASSERTIONS, VALID_ENTITY_TYP
 
 
 class EditAction(str, Enum):
-    KEEP = "KEEP"
+    """Only mutation actions are valid in the change-only editor contract."""
+
     DROP = "DROP"
     RETYPE = "RETYPE"
     REPAIR_SPAN = "REPAIR_SPAN"
     MERGE = "MERGE"
     UPDATE_ASSERTIONS = "UPDATE_ASSERTIONS"
-    FLAG_UNRESOLVED = "FLAG_UNRESOLVED"
 
 
 class ReasonCode(str, Enum):
-    VALID_ENTITY = "VALID_ENTITY"
     WRONG_TYPE = "WRONG_TYPE"
     WRONG_BOUNDARY = "WRONG_BOUNDARY"
     MERGE_REQUIRED = "MERGE_REQUIRED"
@@ -34,7 +33,19 @@ class ReasonCode(str, Enum):
     GENERIC_BIOMEDICAL = "GENERIC_BIOMEDICAL"
     FUNCTION_WORD_OR_FRAGMENT = "FUNCTION_WORD_OR_FRAGMENT"
     PROCEDURE_NOT_TEST = "PROCEDURE_NOT_TEST"
-    AMBIGUOUS = "AMBIGUOUS"
+
+
+DROP_REASON_CODES = frozenset({
+    ReasonCode.NON_ENTITY_ANATOMY,
+    ReasonCode.NON_ENTITY_PERSON,
+    ReasonCode.NON_ENTITY_SPECIALTY,
+    ReasonCode.NON_ENTITY_SPECIMEN,
+    ReasonCode.NON_ENTITY_ACTIVITY,
+    ReasonCode.NON_ENTITY_MECHANISM,
+    ReasonCode.GENERIC_BIOMEDICAL,
+    ReasonCode.FUNCTION_WORD_OR_FRAGMENT,
+    ReasonCode.PROCEDURE_NOT_TEST,
+})
 
 
 class MissingDecisionAction(str, Enum):
@@ -98,6 +109,17 @@ def _position(value: Any) -> tuple[int, int] | None:
     return value[0], value[1]
 
 
+_EDIT_OPERATION_FIELDS = frozenset({
+    "action",
+    "candidate_ids",
+    "text",
+    "type",
+    "assertions",
+    "local_position",
+    "reason_code",
+})
+
+
 @dataclass(frozen=True)
 class EditOperation:
     action: EditAction
@@ -106,13 +128,20 @@ class EditOperation:
     type: str | None
     assertions: list[str]
     local_position: tuple[int, int] | None
-    confidence: str
     reason_code: ReasonCode
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "EditOperation":
         if not isinstance(value, dict):
             raise TypeError("edit operation must be an object")
+        fields = set(value)
+        missing = _EDIT_OPERATION_FIELDS - fields
+        extra = fields - _EDIT_OPERATION_FIELDS
+        if missing:
+            raise ValueError(f"edit operation missing fields: {sorted(missing)}")
+        if extra:
+            raise ValueError(f"edit operation has unsupported fields: {sorted(extra)}")
+
         action = EditAction(value.get("action"))
         ids = _string_list(value.get("candidate_ids"), "candidate_ids")
         if not ids:
@@ -123,43 +152,65 @@ class EditOperation:
         entity_type = value.get("type")
         if entity_type is not None and entity_type not in VALID_ENTITY_TYPES:
             raise ValueError("invalid entity type")
-        assertions = _string_list(value.get("assertions", []), "assertions")
+        assertions = _string_list(value.get("assertions"), "assertions")
         if set(assertions) - VALID_ASSERTIONS:
             raise ValueError("invalid assertion")
-        confidence = value.get("confidence", "HIGH")
-        if confidence not in {"HIGH", "MEDIUM", "LOW"}:
-            raise ValueError("invalid confidence")
         reason = ReasonCode(value.get("reason_code"))
-        operation = cls(action, ids, text, entity_type, assertions, _position(value.get("local_position")), confidence, reason)
+        operation = cls(
+            action,
+            ids,
+            text,
+            entity_type,
+            assertions,
+            _position(value.get("local_position")),
+            reason,
+        )
         operation._validate_action_shape()
         return operation
 
     def _validate_action_shape(self) -> None:
-        if self.action == EditAction.MERGE and len(self.candidate_ids) < 2:
-            raise ValueError("MERGE requires at least two candidate IDs")
-        if self.action != EditAction.MERGE and len(self.candidate_ids) != 1:
+        if self.action == EditAction.MERGE:
+            if len(self.candidate_ids) < 2:
+                raise ValueError("MERGE requires at least two candidate IDs")
+        elif len(self.candidate_ids) != 1:
             raise ValueError(f"{self.action.value} requires exactly one candidate ID")
+
+        if self.action == EditAction.DROP:
+            if self.reason_code not in DROP_REASON_CODES:
+                raise ValueError("DROP requires an explicit non-entity reason_code")
+            if self.text is not None or self.type is not None or self.local_position is not None:
+                raise ValueError("DROP cannot mutate text, type, or position")
+            if self.assertions:
+                raise ValueError("DROP requires assertions=[]")
+            return
+
         expected_reason = {
             EditAction.RETYPE: ReasonCode.WRONG_TYPE,
             EditAction.REPAIR_SPAN: ReasonCode.WRONG_BOUNDARY,
             EditAction.MERGE: ReasonCode.MERGE_REQUIRED,
             EditAction.UPDATE_ASSERTIONS: ReasonCode.ASSERTION_ERROR,
-        }.get(self.action)
-        if expected_reason is not None and self.reason_code != expected_reason:
+        }[self.action]
+        if self.reason_code != expected_reason:
             raise ValueError(f"{self.action.value} requires reason {expected_reason.value}")
-        if self.action == EditAction.DROP and self.confidence != "HIGH":
-            raise ValueError("DROP requires HIGH confidence")
-        if self.action in {EditAction.KEEP, EditAction.DROP, EditAction.FLAG_UNRESOLVED}:
-            if self.text is not None or self.type is not None or self.local_position is not None:
-                raise ValueError(f"{self.action.value} cannot mutate text, type, or position")
+
+        if self.action == EditAction.RETYPE:
+            if self.type is None:
+                raise ValueError("RETYPE requires type")
+            if self.text is not None or self.local_position is not None:
+                raise ValueError("RETYPE cannot mutate text or position")
+            if self.assertions:
+                raise ValueError("RETYPE requires assertions=[]")
+            return
+
         if self.action == EditAction.UPDATE_ASSERTIONS:
             if self.text is not None or self.type is not None or self.local_position is not None:
                 raise ValueError("UPDATE_ASSERTIONS can only change assertions")
-        if self.action == EditAction.RETYPE and self.type is None:
-            raise ValueError("RETYPE requires type")
-        if self.action in {EditAction.REPAIR_SPAN, EditAction.MERGE}:
-            if not self.text or self.local_position is None or self.type is None:
-                raise ValueError(f"{self.action.value} requires text, type and local_position")
+            return
+
+        if not self.text or self.local_position is None or self.type is None:
+            raise ValueError(f"{self.action.value} requires text, type and local_position")
+        if self.type not in ASSERTION_ENTITY_TYPES and self.assertions:
+            raise ValueError("assertions not allowed for selected type")
 
 
 @dataclass(frozen=True)

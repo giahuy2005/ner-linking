@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -102,6 +103,68 @@ def _load_raw_texts(paths: list[Path]) -> dict[str, str]:
     return {path.stem: inference_io.read_text_file(path) for path in paths}
 
 
+def _stable_object(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_object(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_object(item) for item in value]
+    if isinstance(value, set):
+        return sorted(_stable_object(item) for item in value)
+    if hasattr(value, "__dict__"):
+        return _stable_object(vars(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _fingerprint(value) -> str:
+    payload = json.dumps(
+        _stable_object(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _editor_evidence_fingerprint(detailed_by_id: dict) -> str:
+    fields = (
+        "crf_entities",
+        "span_candidates",
+        "lattice_entities",
+        "local_verifications",
+        "final_entities",
+    )
+    payload = {
+        record_id: {
+            field: getattr(detail, field, [])
+            for field in fields
+        }
+        for record_id, detail in detailed_by_id.items()
+    }
+    return _fingerprint(payload)
+
+
+def _entities_fingerprint(entities_by_id: dict) -> str:
+    return _fingerprint({
+        record_id: [
+            {
+                "text": entity.text,
+                "type": entity.type,
+                "assertions": list(entity.assertions),
+                "position": list(entity.position),
+            }
+            for entity in entities
+        ]
+        for record_id, entities in entities_by_id.items()
+    })
+
+
 def _write_stage_checkpoint(output_dir: Path | None, stage: str, payload) -> None:
     if output_dir is None:
         return
@@ -156,6 +219,10 @@ def run(
 
     use_editor = args.with_llm_8b or args.with_llm_ner_editor
     use_selector = (args.with_llm_8b or args.with_llm_linking_selector) and not args.deterministic_linking_only
+    if use_editor:
+        from .ner.qwen_editor import PROMPT_VERSION as editor_prompt_version
+    else:
+        editor_prompt_version = "editor_disabled"
     if args.saved_detailed_ner_dir is not None and not use_editor:
         raise ValueError("--saved-detailed-ner-dir requires --with-llm-8b or --with-llm-ner-editor")
     if args.saved_detailed_ner_dir is not None:
@@ -171,6 +238,7 @@ def run(
         if stage_cache_root is not None:
             from .stage_cache import StageCache
             detailed_cache = StageCache(stage_cache_root, "detailed_ner", {
+                "stage_schema": "detailed_ner_v2",
                 "checkpoint": str(args.checkpoint), "model_config": str(args.model_config),
                 "backbone": args.backbone, "predict": predict_kwargs,
             })
@@ -248,14 +316,17 @@ def run(
         stage_times["load_llm"] = qwen_llm.load_stats.get("load_seconds", 0.0)
     if use_editor:
         stage_started = time.perf_counter()
+        editor_evidence_fingerprint = _editor_evidence_fingerprint(detailed_by_id)
         editor_cache = None
         resumed_entities = {}
         if stage_cache_root is not None:
             from .stage_cache import StageCache
             editor_cache = StageCache(stage_cache_root, "editor", {
+                "stage_schema": "editor_entities_v2",
                 "model": args.llm_model_id, "profile": args.speed_profile,
                 "recovery": not args.no_llm_recovery,
-                "prompt": "qwen3_locked_editor_v3_change_only_speed",
+                "prompt": editor_prompt_version,
+                "editor_evidence_fingerprint": editor_evidence_fingerprint,
             })
             if args.resume:
                 resumed_entities = {
@@ -287,7 +358,9 @@ def run(
                 editor_cache.put(record_id, raw_texts_by_id[record_id], value)
         if stage_cache_root is not None:
             recovery_cache = StageCache(stage_cache_root, "recovery", {
-                "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+                "stage_schema": "recovery_entities_v2",
+                "editor_prompt": editor_prompt_version,
+                "editor_evidence_fingerprint": editor_evidence_fingerprint,
                 "profile": args.speed_profile, "enabled": not args.no_llm_recovery,
             })
             for record_id, value in computed_entities.items():
@@ -311,15 +384,18 @@ def run(
     })
 
     stage_started = time.perf_counter()
+    entities_fingerprint = _entities_fingerprint(entities_by_id)
     linking_cache = None
     candidates_by_id = {}
     if stage_cache_root is not None:
         from .stage_cache import StageCache
         linking_cache = StageCache(stage_cache_root, "linking_selector", {
+            "stage_schema": "linking_selector_v2",
             "rxnorm": args.with_rxnorm, "icd10": args.with_icd10,
             "selector": use_selector, "model": args.llm_model_id,
             "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
-            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "editor_prompt": editor_prompt_version,
+            "entities_fingerprint": entities_fingerprint,
             "profile": args.speed_profile, "recovery": not args.no_llm_recovery,
         })
         if args.resume:
@@ -333,9 +409,11 @@ def run(
     retrieval_by_id = {}
     if stage_cache_root is not None:
         retrieval_cache = StageCache(stage_cache_root, "linking_retrieval", {
+            "stage_schema": "linking_retrieval_v2",
             "rxnorm": args.with_rxnorm, "icd10": args.with_icd10,
             "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
-            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "editor_prompt": editor_prompt_version,
+            "entities_fingerprint": entities_fingerprint,
             "profile": args.speed_profile, "recovery": not args.no_llm_recovery,
         })
         if args.resume:
@@ -399,7 +477,9 @@ def run(
     if stage_cache_root is not None:
         from .stage_cache import StageCache
         final_cache = StageCache(stage_cache_root, "final", {
-            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "stage_schema": "final_output_v2",
+            "editor_prompt": editor_prompt_version,
+            "entities_fingerprint": entities_fingerprint,
             "profile": args.speed_profile, "selector": use_selector,
             "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
         })
