@@ -23,6 +23,11 @@ class LocalModelConfig:
     retry_rounds: int = 1
     dtype: str = "auto"
     attention_implementation: str | None = "sdpa"
+    device_map_mode: str = "single_gpu"
+    require_full_gpu: bool = False
+    max_batch_tokens: int = 16384
+    min_batch_size: int = 1
+    dynamic_batching: bool = True
 
 
 QWEN3_8B_EDITOR_CONFIG = LocalModelConfig(
@@ -34,10 +39,13 @@ QWEN3_8B_EDITOR_CONFIG = LocalModelConfig(
     max_new_tokens=1024,
     supports_thinking=True,
     enable_thinking=False,
-    batch_size=4,
+    batch_size=12,
     temperature=0.0,
-    max_context_length=16384,
+    max_context_length=2048,
     retry_rounds=1,
     dtype="bfloat16",
     attention_implementation="sdpa",
+    device_map_mode="single_gpu",
+    require_full_gpu=False,
+    max_batch_tokens=16384,
 )

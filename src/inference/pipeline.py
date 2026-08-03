@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import math
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +28,13 @@ MAX_OUTPUT_CANDIDATES = {
     "THUỐC": 1,
     "CHẨN_ĐOÁN": 2,
 }
+
+
+def _pctl(values: list[int], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    return int(ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))])
 
 
 def _extract_codes(candidates: list, top_k: int, key_priority: tuple[str, ...] = ("code", "rxcui")) -> list[str]:
@@ -69,6 +78,8 @@ class InferencePipeline:
         self.last_linking_retrieval = {}
         self.last_linking_audit = {}
         self.last_schema_normalization = {}
+        self.last_llm_workload = {}
+        self.last_editor_stage_times = {}
 
     @classmethod
     def load(
@@ -105,6 +116,26 @@ class InferencePipeline:
             )
 
         return cls(ner_engine, rxnorm_linker, icd10_linker)
+
+    @classmethod
+    def load_linking_only(
+        cls, *, with_rxnorm: bool = False, with_icd10: bool = False,
+    ) -> "InferencePipeline":
+        """Load linkers without loading NER, for saved-detail LLM benchmarks."""
+        pipeline = cls(None)
+        if with_rxnorm and cfg.RXNORM_INDEX_DIR is not None:
+            from ..linking.rxnorm.linker import RxNormLinker
+            pipeline._linkers["rxnorm"] = RxNormLinker(
+                index_dir=str(cfg.RXNORM_INDEX_DIR),
+                clean_path=str(cfg.RXNORM_CLEAN_PATH) if cfg.RXNORM_CLEAN_PATH else None,
+                device=cfg.LINKER_DEVICE,
+            )
+        if with_icd10 and cfg.ICD10_INDEX_DIR is not None:
+            from ..linking.icd10.icd10_linker import Icd10Linker
+            pipeline._linkers["icd10"] = Icd10Linker(
+                index_dir=cfg.ICD10_INDEX_DIR, device=cfg.LINKER_DEVICE,
+            )
+        return pipeline
 
     # ------------------------------------------------------------
     # Stage 1: NER (không LLM) — an toàn chạy cho cả batch bất kỳ lúc nào
@@ -177,6 +208,7 @@ class InferencePipeline:
     def run_ner_stage_detailed(
         self,
         raw_texts_by_id: dict[str, str],
+        on_record_complete=None,
         **predict_kwargs,
     ):
         """Run offset-preserving section inference and retain detailed evidence."""
@@ -235,6 +267,8 @@ class InferencePipeline:
                 getattr(combined, field_name).sort(key=lambda item: (*item.position, item.type))
             combined.validate_offsets(raw_text)
             outputs[record_id] = combined
+            if on_record_complete is not None:
+                on_record_complete(record_id, raw_text, combined)
         self.last_detailed_results = outputs
         return outputs
 
@@ -249,8 +283,18 @@ class InferencePipeline:
         review_only_auto_add_eligible: bool = False,
         cache_path: str | Path | None = None,
         model_id: str = "Qwen/Qwen3-8B",
+        max_batch_tokens: int | None = None,
+        min_batch_size: int = 1,
+        dynamic_batching: bool = True,
+        cache_fsync: bool = False,
+        progress_every: int = 1,
+        speed_profile: str = "balanced",
+        max_recovery_proposals_per_record: int = 24,
+        max_recovery_requests_per_record: int = 4,
     ) -> dict[str, list[NerEntity]]:
         """Run bounded region reviews; failures fall back only for that region."""
+        if speed_profile not in {"fast", "balanced", "full"}:
+            raise ValueError("speed_profile must be fast, balanced, or full")
         from .ner.candidates import (
             build_candidate_catalog,
             build_missing_proposals,
@@ -259,7 +303,7 @@ class InferencePipeline:
         from .ner.qwen_editor import (
             apply_editor_response, apply_missing_decisions, build_editor_request,
             build_missing_request, parse_missing_response,
-            generate_with_cache, VersionedJsonlCache,
+            generate_with_cache, VersionedJsonlCache, PROMPT_VERSION,
         )
         from .schemas import normalize_entity_schema
 
@@ -271,24 +315,57 @@ class InferencePipeline:
             catalogs[record_id] = catalog
             by_id = {item.candidate_id: item for item in catalog}
             regions = build_review_regions(record_id, raw_text, catalog)
+            if speed_profile == "fast":
+                regions = [region for region in regions if region.priority >= 100]
             regions_by_id[record_id] = regions
             for region in regions:
-                targets = [by_id[candidate_id] for candidate_id in region.candidate_ids]
-                prompt_entries.append((record_id, region, targets, build_editor_request(region, targets)))
-        cache = VersionedJsonlCache(cache_path) if cache_path is not None else None
+                region_candidates = [by_id[candidate_id] for candidate_id in region.candidate_ids]
+                prompt_entries.append((record_id, region, region_candidates, build_editor_request(region, region_candidates)))
+        editor_prompts = [item[3] for item in prompt_entries]
+        editor_token_counts = (
+            qwen_llm.count_prompt_tokens(editor_prompts)
+            if editor_prompts and hasattr(qwen_llm, "count_prompt_tokens") else []
+        )
+        workload = {
+            "editor_target_count": sum(len(item[1].target_candidate_ids) for item in prompt_entries),
+            "editor_region_count": len(prompt_entries),
+            "editor_input_tokens_p50": _pctl(editor_token_counts, 0.50),
+            "editor_input_tokens_p95": _pctl(editor_token_counts, 0.95),
+            "editor_input_tokens_max": max(editor_token_counts, default=0),
+            "editor_microbatches": 0, "recovery_microbatches": 0,
+        }
+        print(f"[Qwen:workload-before-editor] {workload}", file=sys.stderr, flush=True)
+        progress_events: list[dict] = []
+
+        def record_progress(event: dict) -> None:
+            progress_events.append(event)
+            key = "recovery_microbatches" if event["task"].startswith("missing_proposal") else "editor_microbatches"
+            workload[key] += 1
+
+        cache = VersionedJsonlCache(cache_path, fsync=cache_fsync) if cache_path is not None else None
         raw_outputs = [""] * len(prompt_entries)
-        for token_budget in (256, 384, 512):
+        editor_generation_started = time.perf_counter()
+        for token_budget in (128, 160, 224, 256):
             indexes = [index for index, item in enumerate(prompt_entries) if (
-                256 if len(item[2]) <= 2 else 384 if len(item[2]) <= 4 else 512
+                128 if len(item[1].target_candidate_ids) <= 2
+                else 160 if len(item[1].target_candidate_ids) <= 4
+                else 224 if not any(reason in {"boundary_disagreement", "merge_required"} for reason in item[1].reasons)
+                else 256
             ) == token_budget]
             generated = generate_with_cache(
                 qwen_llm, [prompt_entries[index][3] for index in indexes],
                 batch_size=batch_size, model_id=model_id,
                 task=f"ner_editor:max{token_budget}", cache=cache,
                 max_new_tokens=token_budget,
+                prompt_version=PROMPT_VERSION,
+                max_batch_tokens=max_batch_tokens, min_batch_size=min_batch_size,
+                dynamic_batching=dynamic_batching, progress_every=progress_every,
+                progress_callback=record_progress,
+                prompt_token_counts=[editor_token_counts[index] for index in indexes] if editor_token_counts else None,
             )
             for index, response in zip(indexes, generated):
                 raw_outputs[index] = response
+        editor_generation_seconds = time.perf_counter() - editor_generation_started
         outputs = {
             record_id: [normalize_entity_schema(item) for item in detailed.final_entities]
             for record_id, detailed in detailed_by_id.items()
@@ -303,21 +380,35 @@ class InferencePipeline:
                     "reviewed_candidate_count": sum(
                         len(region.candidate_ids) for region in regions_by_id[record_id]
                     ),
+                    "selected_target_count": sum(
+                        len(region.target_candidate_ids) for region in regions_by_id[record_id]
+                    ),
+                    "context_only_count": sum(
+                        len(region.context_candidate_ids) for region in regions_by_id[record_id]
+                    ),
+                    "audit_only_count": sum(
+                        1 for item in catalogs[record_id]
+                        if not item.pre_llm_selected
+                    ),
                     "applied": 0, "rejected": 0, "unresolved": 0,
                     "parse_success": 0, "parse_failure": 0,
                 },
             }
             for record_id in detailed_by_id
         }
-        for (record_id, region, targets, _prompt), raw_output in zip(prompt_entries, raw_outputs):
+        editor_apply_started = time.perf_counter()
+        for (record_id, region, region_candidates, _prompt), raw_output in zip(prompt_entries, raw_outputs):
             result = apply_editor_response(
-                raw_texts_by_id[record_id], targets, raw_output,
+                raw_texts_by_id[record_id], region_candidates, raw_output,
                 context_start=region.context_start,
                 validation_candidates=catalogs[record_id],
+                target_candidate_ids=region.target_candidate_ids,
             )
+            target_id_set = set(region.target_candidate_ids)
             target_keys = {
                 (item.position[0], item.position[1], item.type)
-                for item in targets if item.pre_llm_selected
+                for item in region_candidates
+                if item.pre_llm_selected and item.candidate_id in target_id_set
             }
             retained = [
                 entity for entity in outputs[record_id]
@@ -344,17 +435,31 @@ class InferencePipeline:
             summary["rejected"] += len(result.rejected)
             summary["unresolved"] += len(result.unresolved)
             summary["parse_failure" if parse_failed else "parse_success"] += 1
+        editor_apply_seconds = time.perf_counter() - editor_apply_started
 
+        recovery_started = time.perf_counter()
         proposals_by_id = {}
         missing_entries: list[tuple[str, list, int, tuple[str, str]]] = []
         for record_id, catalog in catalogs.items():
             proposals = build_missing_proposals(
                 record_id, raw_texts_by_id[record_id], catalog,
             )
-            if review_only_auto_add_eligible or include_recovery:
+            if speed_profile == "fast" or not include_recovery:
+                proposals = []
+            elif speed_profile == "balanced":
+                proposals = [
+                    item for item in proposals
+                    if item.auto_add_eligible or len(set(item.hard_supports)) >= 2
+                ]
+            elif speed_profile == "full":
+                proposals = [item for item in proposals if item.auto_add_eligible or item.hard_supports]
+            if review_only_auto_add_eligible:
                 proposals = [item for item in proposals if item.auto_add_eligible]
+            uncapped_count = len(proposals)
+            proposals = proposals[:max_recovery_proposals_per_record]
             proposals_by_id[record_id] = proposals
             audit[record_id]["missing_proposals"] = [item.__dict__ for item in proposals]
+            audit[record_id]["recovery_proposals_capped"] = max(0, uncapped_count - len(proposals))
             proposal_groups: list[list] = []
             for proposal in proposals:
                 if (
@@ -364,7 +469,7 @@ class InferencePipeline:
                 ):
                     proposal_groups.append([])
                 proposal_groups[-1].append(proposal)
-            for chunk_index, chunk in enumerate(proposal_groups):
+            for chunk_index, chunk in enumerate(proposal_groups[:max_recovery_requests_per_record]):
                 if not chunk:
                     continue
                 core_start = min(item.position[0] for item in chunk)
@@ -381,15 +486,32 @@ class InferencePipeline:
                 missing_entries.append((record_id, chunk, context_start, prompt))
         if include_recovery:
             missing_outputs = [""] * len(missing_entries)
-            for token_budget in (224, 352, 480):
+            recovery_prompts = [item[3] for item in missing_entries]
+            recovery_token_counts = (
+                qwen_llm.count_prompt_tokens(recovery_prompts)
+                if recovery_prompts and hasattr(qwen_llm, "count_prompt_tokens") else []
+            )
+            workload.update({
+                "recovery_count": len(missing_entries),
+                "recovery_input_tokens_p50": _pctl(recovery_token_counts, 0.50),
+                "recovery_input_tokens_p95": _pctl(recovery_token_counts, 0.95),
+                "recovery_input_tokens_max": max(recovery_token_counts, default=0),
+            })
+            print(f"[Qwen:workload-before-recovery] {workload}", file=sys.stderr, flush=True)
+            for token_budget in (96, 128, 160):
                 indexes = [index for index, item in enumerate(missing_entries) if (
-                    224 if len(item[1]) <= 2 else 352 if len(item[1]) <= 4 else 480
+                    96 if len(item[1]) <= 2 else 128 if len(item[1]) <= 4 else 160
                 ) == token_budget]
                 generated = generate_with_cache(
                     qwen_llm, [missing_entries[index][3] for index in indexes],
                     batch_size=batch_size, model_id=model_id,
                     task=f"missing_proposal:max{token_budget}", cache=cache,
                     max_new_tokens=token_budget,
+                    prompt_version=PROMPT_VERSION,
+                    max_batch_tokens=max_batch_tokens, min_batch_size=min_batch_size,
+                    dynamic_batching=dynamic_batching, progress_every=progress_every,
+                    progress_callback=record_progress,
+                    prompt_token_counts=[recovery_token_counts[index] for index in indexes] if recovery_token_counts else None,
                 )
                 for index, response in zip(indexes, generated):
                     missing_outputs[index] = response
@@ -414,6 +536,23 @@ class InferencePipeline:
         for record_id, entities in outputs.items():
             outputs[record_id] = [normalize_entity_schema(item) for item in entities]
         self.last_editor_audit = audit
+        output_tokens = [
+            int(value)
+            for event in progress_events
+            for value in event.get("output_tokens_by_row", [])
+        ]
+        workload.update({
+            "llm_microbatch_count": len(progress_events),
+            "output_tokens_p50": _pctl(output_tokens, 0.50),
+            "output_tokens_p95": _pctl(output_tokens, 0.95),
+        })
+        self.last_llm_workload = workload
+        self.last_editor_stage_times = {
+            "editor_generation": editor_generation_seconds,
+            "editor_apply": editor_apply_seconds,
+            "recovery_total": time.perf_counter() - recovery_started,
+        }
+        print(f"[Qwen:workload-after-editor] {workload}", file=sys.stderr, flush=True)
         return outputs
 
     # ------------------------------------------------------------
@@ -594,6 +733,8 @@ class InferencePipeline:
             cache_path=cache_path,
             model_id=model_id,
         )
+        from .selection import candidate_selector as selector_module
+        self.last_llm_workload.update(selector_module.LAST_SELECTION_WORKLOAD)
         for (rid, index), selected in zip(destinations, selected_batches):
             results[rid][index] = selected
         selector_audit = getattr(select_candidates_many, "last_audit", [])

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
+from ...llm.batching import VersionedJsonlCache, generate_with_cache
 from ...llm.json_guard import extract_json
 from ..schemas import (
     ASSERTION_ENTITY_TYPES,
@@ -25,7 +24,7 @@ from .editor_schemas import (
 )
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v2_region"
+PROMPT_VERSION = "qwen3_locked_editor_v3_change_only_speed"
 _EXPLICIT_DROP_REASONS = {
     ReasonCode.NON_ENTITY_ANATOMY, ReasonCode.NON_ENTITY_PERSON,
     ReasonCode.NON_ENTITY_SPECIALTY, ReasonCode.NON_ENTITY_SPECIMEN,
@@ -44,119 +43,54 @@ class EditorResult:
     raw_response: str | None = None
 
 
-class VersionedJsonlCache:
-    """Append-only cache whose key includes model/task/prompt and full payload."""
-
-    def __init__(self, path: str | Path):
-        self.path = Path(path)
-        self.values: dict[str, str] = {}
-        if self.path.exists():
-            with self.path.open(encoding="utf-8") as handle:
-                for line in handle:
-                    try:
-                        row = json.loads(line)
-                        self.values[str(row["key"])] = str(row["response"])
-                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                        continue
-
-    @staticmethod
-    def make_key(model_id: str, task: str, prompt: tuple[str, str], config_hash: str = "") -> str:
-        payload = json.dumps({
-            "model_id": model_id, "task": task, "prompt_version": PROMPT_VERSION,
-            "system": prompt[0], "user": prompt[1], "config_hash": config_hash,
-        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def get(self, key: str) -> str | None:
-        return self.values.get(key)
-
-    def put(self, key: str, response: str) -> None:
-        if key in self.values:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n")
-        self.values[key] = response
-
-
-def generate_with_cache(
-    llm, prompts: list[tuple[str, str]], *, batch_size: int, model_id: str,
-    task: str, cache: VersionedJsonlCache | None = None,
-    max_new_tokens: int | None = None,
-) -> list[str]:
-    results: list[str | None] = [None] * len(prompts)
-    pending_indexes, pending_prompts, keys = [], [], []
-    for index, prompt in enumerate(prompts):
-        key = VersionedJsonlCache.make_key(model_id, task, prompt)
-        cached = cache.get(key) if cache else None
-        if cached is None:
-            pending_indexes.append(index); pending_prompts.append(prompt); keys.append(key)
-        else:
-            results[index] = cached
-    if pending_prompts:
-        generation_kwargs = {"batch_size": batch_size}
-        if max_new_tokens is not None:
-            generation_kwargs["max_new_tokens"] = max_new_tokens
-        generated = llm.generate_batch(pending_prompts, **generation_kwargs)
-        if len(generated) != len(pending_prompts):
-            generated = [""] * len(pending_prompts)
-        for index, key, response in zip(pending_indexes, keys, generated):
-            results[index] = response
-            if cache:
-                cache.put(key, response)
-    return [item or "" for item in results]
-
-
-def _candidate_payload(item: CandidateEvidence, context_start: int = 0) -> dict[str, Any]:
-    value = asdict(item)
-    value["global_position"] = list(item.position)
-    value["local_position"] = [
-        item.position[0] - context_start, item.position[1] - context_start,
-    ]
-    value.pop("position", None)
-    value["strong_consensus"] = item.strong_consensus
+def _candidate_payload(
+    item: CandidateEvidence, context_start: int = 0, *, role: str = "selected_target",
+) -> dict[str, Any]:
+    """Compact payload containing only evidence the editor can use."""
+    value: dict[str, Any] = {
+        "id": item.candidate_id, "role": role, "text": item.text,
+        "type": item.type,
+        "local_position": [item.position[0] - context_start, item.position[1] - context_start],
+    }
+    optional = {
+        "assertions": item.assertions, "sources": item.sources,
+        "score": round(max((float(score) for score in item.scores.values()), default=0.0), 4),
+        "allowed_types": item.allowed_types, "supports": item.supports,
+        "flags": item.negative_flags, "related_ids": item.related_candidate_ids,
+    }
+    value.update({key: item_value for key, item_value in optional.items() if item_value})
+    if item.strong_consensus:
+        value["strong_consensus"] = True
     return value
 
 
 def build_editor_request(region: ReviewRegion, candidates: list[CandidateEvidence]) -> tuple[str, str]:
-    system = """Bạn là bộ biên tập NER y tế tiếng Việt bị khóa theo candidate.
-Ontology hợp lệ: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
-Assertion isNegated/isHistorical/isFamily chỉ hợp lệ với TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC.
-Action hợp lệ: KEEP, DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS, FLAG_UNRESOLVED.
-Phải quyết định đúng một lần cho mỗi candidate. candidate_ids LUÔN là list.
-KEEP cũng phải có confidence và reason_code. Field không dùng phải là null hoặc [].
-Không phát minh ID/text/span/type; span local [start,end) phải là exact substring và không qua newline/câu.
-Không phải entity: anatomy/person/specialty/specimen/activity/mechanism/device/procedure/equipment/function fragment.
-Không chắc chắn thì FLAG_UNRESOLVED. Không reasoning, markdown hay copy input payload.
-Reason code: VALID_ENTITY, WRONG_TYPE, WRONG_BOUNDARY, MERGE_REQUIRED, ASSERTION_ERROR,
-NON_ENTITY_ANATOMY, NON_ENTITY_PERSON, NON_ENTITY_SPECIALTY, NON_ENTITY_SPECIMEN,
-NON_ENTITY_ACTIVITY, NON_ENTITY_MECHANISM, GENERIC_BIOMEDICAL,
-FUNCTION_WORD_OR_FRAGMENT, PROCEDURE_NOT_TEST, AMBIGUOUS.
-Exact output schema:
-{"request_id":"...","actions":[{"action":"KEEP|DROP|RETYPE|REPAIR_SPAN|MERGE|UPDATE_ASSERTIONS|FLAG_UNRESOLVED","candidate_ids":["cand_id"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH|MEDIUM|LOW","reason_code":"VALID_ENTITY"}]}
-Ví dụ hợp lệ:
-{"request_id":"r","actions":[
-{"action":"KEEP","candidate_ids":["c1"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"VALID_ENTITY"},
-{"action":"DROP","candidate_ids":["c2"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"FUNCTION_WORD_OR_FRAGMENT"},
-{"action":"RETYPE","candidate_ids":["c3"],"text":null,"type":"CHẨN_ĐOÁN","assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"WRONG_TYPE"},
-{"action":"UPDATE_ASSERTIONS","candidate_ids":["c4"],"text":null,"type":null,"assertions":["isNegated"],"local_position":null,"confidence":"HIGH","reason_code":"ASSERTION_ERROR"}]}
-Chỉ xuất đúng một JSON object."""
+    """Build the compact V3 change-only request."""
+    system = """Bạn là bộ biên tập NER y tế bị khóa theo candidate.
+Chỉ trả các THAY ĐỔI cần thiết cho target. Candidate bị lược khỏi changes nghĩa là KEEP.
+Context-only chỉ để tham khảo; không được chỉnh hoặc thêm nó, trừ khi tham gia MERGE với target.
+Action hợp lệ trong changes: DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS.
+ID phải có trong payload. Span [start,end) là local exact substring, không qua newline/câu.
+Không chắc chắn: đưa ID target vào unresolved_ids. Không reasoning/markdown.
+Mỗi change có action,candidate_ids,text,type,assertions,local_position,reason_code; field không dùng là null/[].
+Ontology: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
+Assertion isNegated/isHistorical/isFamily chỉ dùng cho triệu chứng/chẩn đoán/thuốc.
+Output duy nhất: {"request_id":"...","changes":[],"unresolved_ids":[]}."""
+    target_ids = set(region.target_candidate_ids)
     user = json.dumps({
         "schema_version": PROMPT_VERSION,
         "request_id": region.request_id,
-        "record_id": region.record_id,
         "context": region.context,
-        "context_global_start": region.context_start,
         "review_reasons": region.reasons,
-        "candidates": [_candidate_payload(item, region.context_start) for item in candidates],
+        "candidates": [
+            _candidate_payload(
+                item, region.context_start,
+                role="selected_target" if item.candidate_id in target_ids else "context_only",
+            )
+            for item in candidates
+        ],
         "response_schema": {
-            "request_id": region.request_id,
-            "actions": [{
-                "action": "KEEP", "candidate_ids": ["cand_id"],
-                "text": None, "type": None, "assertions": [],
-                "local_position": None, "confidence": "HIGH",
-                "reason_code": "VALID_ENTITY",
-            }],
+            "request_id": region.request_id, "changes": [], "unresolved_ids": [],
         },
     }, ensure_ascii=False, separators=(",", ":"))
     return system, user
@@ -165,22 +99,24 @@ Chỉ xuất đúng một JSON object."""
 def build_missing_request(
     request_id: str, context: str, context_start: int, proposals: list[MissingProposal]
 ) -> tuple[str, str]:
-    system = """Bạn là bộ duyệt proposal NER y tế tiếng Việt bị khóa.
-Chọn đúng một decision cho mỗi proposal_id: ADD_PROPOSAL, REJECT hoặc UNRESOLVED.
-Không phát minh ID/text/span/type. Assertion chỉ hợp lệ cho triệu chứng/chẩn đoán/thuốc.
-Không reasoning/markdown. Exact schema:
-{"request_id":"...","decisions":[{"proposal_id":"prop_id","decision":"ADD_PROPOSAL|REJECT|UNRESOLVED","type":"CHẨN_ĐOÁN|null","assertions":[],"confidence":"HIGH|MEDIUM|LOW","reason_code":"VALID_MISSING_ENTITY|NOT_AN_ENTITY|INSUFFICIENT_EVIDENCE|AMBIGUOUS"}]}
-Ví dụ: {"request_id":"r","decisions":[
-{"proposal_id":"p1","decision":"REJECT","type":null,"assertions":[],"confidence":"HIGH","reason_code":"NOT_AN_ENTITY"},
-{"proposal_id":"p2","decision":"ADD_PROPOSAL","type":"CHẨN_ĐOÁN","assertions":[],"confidence":"HIGH","reason_code":"VALID_MISSING_ENTITY"}]}
-Chỉ xuất đúng một JSON object."""
+    system = """Bạn duyệt proposal NER y tế bị khóa theo ID.
+Chỉ liệt kê proposal chắc chắn cần ADD trong additions; proposal bị lược nghĩa là REJECT/no-add.
+Không chắc chắn thì đưa ID vào unresolved_ids. Không phát minh ID/text/span/type.
+Assertion chỉ hợp lệ cho TRIỆU_CHỨNG/CHẨN_ĐOÁN/THUỐC. Không reasoning/markdown.
+Output duy nhất: {"request_id":"...","additions":[{"proposal_id":"p","type":"CHẨN_ĐOÁN","assertions":[]}],"unresolved_ids":[]}."""
     payload = []
     for item in proposals:
-        value = asdict(item)
-        value["position"] = list(item.position)
-        value["local_position"] = [
-            item.position[0] - context_start, item.position[1] - context_start,
-        ]
+        value = {
+            "id": item.proposal_id, "text": item.text,
+            "local_position": [item.position[0] - context_start, item.position[1] - context_start],
+            "allowed_types": item.allowed_types,
+        }
+        for key, field_value in {
+            "supports": item.supports, "hard_supports": item.hard_supports,
+            "flags": item.negative_flags,
+        }.items():
+            if field_value:
+                value[key] = field_value
         payload.append(value)
     user = json.dumps({
         "schema_version": PROMPT_VERSION,
@@ -188,10 +124,9 @@ Chỉ xuất đúng một JSON object."""
         "context": context,
         "context_global_start": context_start,
         "proposals": payload,
-        "response_schema": {"request_id": request_id, "decisions": [{
-            "proposal_id": "prop_id", "decision": "REJECT", "type": None,
-            "assertions": [], "confidence": "HIGH", "reason_code": "NOT_AN_ENTITY",
-        }]},
+        "response_schema": {
+            "request_id": request_id, "additions": [], "unresolved_ids": [],
+        },
     }, ensure_ascii=False, separators=(",", ":"))
     return system, user
 
@@ -200,9 +135,24 @@ def parse_missing_response(raw_response: str) -> tuple[list[MissingDecision], li
     rejected = []
     try:
         payload = extract_json(raw_response)
-        rows = payload.get("decisions")
-        if not isinstance(rows, list):
-            raise TypeError("decisions must be a list")
+        if "additions" in payload:
+            additions = payload.get("additions")
+            unresolved = payload.get("unresolved_ids", [])
+            if not isinstance(additions, list) or not isinstance(unresolved, list):
+                raise TypeError("additions and unresolved_ids must be lists")
+            rows = [{
+                **row, "decision": "ADD_PROPOSAL", "confidence": "HIGH",
+                "reason_code": "VALID_MISSING_ENTITY",
+            } for row in additions]
+            rows.extend({
+                "proposal_id": proposal_id, "decision": "UNRESOLVED",
+                "type": None, "assertions": [], "confidence": "LOW",
+                "reason_code": "AMBIGUOUS",
+            } for proposal_id in unresolved)
+        else:
+            rows = payload.get("decisions")
+            if not isinstance(rows, list):
+                raise TypeError("decisions must be a list")
     except Exception as exc:
         return [], [{"reason": "invalid_json", "detail": str(exc)}]
     decisions = []
@@ -236,21 +186,36 @@ def apply_editor_response(
     *,
     context_start: int = 0,
     validation_candidates: list[CandidateEvidence] | None = None,
+    target_candidate_ids: list[str] | None = None,
 ) -> EditorResult:
-    """Validate/apply actions independently. Invalid JSON keeps every candidate."""
-    originals = [_to_entity(item) for item in candidates if item.pre_llm_selected]
+    """Apply change-only V3 responses; old full-action cache rows remain readable."""
+    target_ids = set(target_candidate_ids or [item.candidate_id for item in candidates])
+    originals = [
+        _to_entity(item) for item in candidates
+        if item.pre_llm_selected and item.candidate_id in target_ids
+    ]
     result = EditorResult(entities=originals, raw_response=raw_response)
     by_id = {item.candidate_id: item for item in candidates}
     validation_candidates = validation_candidates or candidates
     try:
         payload = extract_json(raw_response)
-        raw_actions = payload.get("actions")
+        change_only = "changes" in payload
+        raw_actions = payload.get("changes") if change_only else payload.get("actions")
         if not isinstance(raw_actions, list):
-            raise TypeError("actions must be a list")
+            raise TypeError("changes/actions must be a list")
+        unresolved_ids = payload.get("unresolved_ids", []) if change_only else []
+        if not isinstance(unresolved_ids, list) or not all(isinstance(item, str) for item in unresolved_ids):
+            raise TypeError("unresolved_ids must be list[str]")
     except Exception as exc:
         result.rejected.append({"reason": "invalid_json", "detail": str(exc)})
-        result.unresolved.extend(by_id)
+        result.unresolved.extend(sorted(target_ids))
         return result
+
+    for candidate_id in unresolved_ids:
+        if candidate_id not in target_ids:
+            result.rejected.append({"reason": "unknown_or_non_target_unresolved_id", "candidate_id": candidate_id})
+        elif candidate_id not in result.unresolved:
+            result.unresolved.append(candidate_id)
 
     parsed: list[EditOperation] = []
     for raw_action in raw_actions:
@@ -275,6 +240,8 @@ def apply_editor_response(
         errors = []
         if any(candidate_id not in by_id for candidate_id in ids):
             errors.append("unknown_candidate_id")
+        if not errors and not (set(ids) & target_ids):
+            errors.append("context_only_change_without_target")
         if any(counts.get(candidate_id, 0) > 1 for candidate_id in ids):
             errors.append("duplicate_actions_for_candidate")
         if errors:
@@ -361,8 +328,9 @@ def apply_editor_response(
             additions.append(replacement)
         result.applied.append({"action": name.value, "candidate_ids": ids})
 
-    covered = set(counts)
-    result.unresolved.extend(sorted(set(by_id) - covered))
+    if not change_only:
+        covered = set(counts)
+        result.unresolved.extend(sorted(target_ids - covered))
     final = [entity for candidate_id, entity in entity_map.items() if candidate_id not in consumed]
     final.extend(additions)
     unique = {(item.position[0], item.position[1], item.type): item for item in final}

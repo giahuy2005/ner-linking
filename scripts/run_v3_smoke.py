@@ -39,12 +39,7 @@ class SchemaValidLlmStub:
             request_id = payload["request_id"]
             if "candidates" in payload and "entity" not in payload:
                 self.request_types["editor"] += 1
-                actions = [{
-                    "action": "KEEP", "candidate_ids": [candidate["candidate_id"]],
-                    "text": None, "type": None, "assertions": [],
-                    "local_position": None, "confidence": "HIGH", "reason_code": "VALID_ENTITY",
-                } for candidate in payload["candidates"]]
-                response = {"request_id": request_id, "actions": actions}
+                response = {"request_id": request_id, "changes": [], "unresolved_ids": []}
             elif "proposals" in payload:
                 self.request_types["recovery"] += 1
                 response = {"request_id": request_id, "decisions": [{

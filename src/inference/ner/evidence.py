@@ -114,3 +114,32 @@ class NerDetailedResult:
             "logs": list(self.logs),
         }
 
+    @classmethod
+    def from_audit_dict(cls, value: dict[str, Any]) -> "NerDetailedResult":
+        """Restore a portable saved artifact for LLM-only benchmarking."""
+        def entity(row: dict[str, Any]) -> NerEntity:
+            return NerEntity(
+                row["text"], row["type"], list(row.get("assertions", [])),
+                tuple(row["position"]), float(row.get("score", 1.0)), row.get("flag"),
+            )
+
+        def word(row: dict[str, Any]) -> WordEvidence:
+            crf_row = row.get("crf")
+            crf = CrfMarginalEvidence(**crf_row) if isinstance(crf_row, dict) else None
+            restored = dict(row); restored["crf"] = crf
+            return WordEvidence(**restored)
+
+        return cls(
+            raw_text_length=int(value["raw_text_length"]),
+            clean_text_length=int(value["clean_text_length"]),
+            crf_entities=[entity(row) for row in value.get("crf_entities", [])],
+            span_candidates=[SpanCandidateEvidence(**row) for row in value.get("span_candidates", [])],
+            lattice_entities=[entity(row) for row in value.get("lattice_entities", [])],
+            final_entities=[entity(row) for row in value.get("final_entities", [])],
+            words=[word(row) for row in value.get("words", [])],
+            local_verifications=[LocalVerificationEvidence(**row) for row in value.get("local_verifications", [])],
+            thresholds={key: float(number) for key, number in value.get("thresholds", {}).items()},
+            logs=list(value.get("logs", [])),
+            span_head_enabled=bool(value.get("span_head_enabled", False)),
+            marginal_method=str(value.get("marginal_method", "exact_forward_backward")),
+        )

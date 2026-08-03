@@ -13,19 +13,29 @@ import sys
 import unicodedata
 import hashlib
 import json
+import math
 from dataclasses import asdict, is_dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...llm.batching import VersionedJsonlCache, generate_with_cache
 from ...llm.json_guard import extract_json
-from ...llm.prompts import build_candidate_selector_prompt
+from ...llm.prompts import build_candidate_selector_prompt, SELECTOR_PROMPT_VERSION
 from ...llm.response_schemas import CandidateSelection
 
 if TYPE_CHECKING:
     from ...llm.backend import LocalLLM
 
 LAST_SELECTION_AUDIT: list[dict] = []
+LAST_SELECTION_WORKLOAD: dict = {}
+
+
+def _pctl(values: list[int], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    return int(ordered[min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1)])
 
 
 def _display(cand, key_priority: tuple[str, ...] = ("code", "rxcui")) -> tuple[str, str] | None:
@@ -70,50 +80,29 @@ def _candidate_payload(candidate) -> dict:
     code, label = displayed
     if is_dataclass(candidate):
         raw = asdict(candidate)
-        return {
+        features = raw.get("features", {}) or {}
+        value = {
             "code": code, "name": raw.get("name", label), "tty": raw.get("tty"),
             "tier": raw.get("tier"), "active": raw.get("active"),
-            "historical": raw.get("historical"), "current_rxcuis": raw.get("current_rxcuis", []),
             "exact_flags": {"term": raw.get("exact_term_match"), "ingredient": raw.get("exact_ingredient_match")},
             "support_level": raw.get("support_level"), "score": raw.get("final_score"),
-            "features": raw.get("features", {}), "matched_terms": raw.get("matched_terms", []),
-            "query_sources": raw.get("retrieval_sources", []), "hard_conflicts": raw.get("rejection_reasons", []),
+            "relations": {key: features[key] for key in (
+                "ingredient_relation", "strength_relation", "form_relation", "release_relation",
+            ) if features.get(key)},
+            "hard_conflicts": raw.get("rejection_reasons", []),
         }
+        return {key: item for key, item in value.items() if item not in (None, "", [], {})}
     raw = candidate if isinstance(candidate, dict) else {}
-    return {
+    value = {
         "code": code, "preferred_or_matched_term": raw.get("matched_term", label),
-        "language": raw.get("language"), "term_type": raw.get("term_type"),
+        "term_type": raw.get("term_type"),
         "score": raw.get("score"), "matched_terms": raw.get("matched_terms", []),
-        "query_sources": raw.get("query_sources", []), "aggregate_components": raw.get("aggregate_components", {}),
+        "aggregate_components": raw.get("aggregate_components", {}),
         "exact_alias_source": raw.get("exact_alias_source"), "chapter_support": raw.get("chapter_support"),
         "lexical_coverage": raw.get("lexical_coverage"), "over_specific": raw.get("over_specific", False),
+        "hard_conflicts": raw.get("hard_conflicts", []),
     }
-
-
-class SelectorJsonlCache:
-    def __init__(self, path: str | Path):
-        self.path = Path(path); self.values = {}
-        if self.path.exists():
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line); self.values[str(row["key"])] = str(row["response"])
-                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-                    continue
-
-    @staticmethod
-    def key(model_id: str, prompt: tuple[str, str], config_hash: str = "") -> str:
-        value = json.dumps({"version": "selector_v2", "model": model_id, "prompt": prompt,
-                            "config": config_hash}, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-    def get(self, key): return self.values.get(key)
-
-    def put(self, key, response):
-        if key in self.values: return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n")
-        self.values[key] = response
+    return {key: item for key, item in value.items() if item not in (None, "", [], {}, False)}
 
 
 def _normalize_exact(text: str) -> str:
@@ -422,7 +411,7 @@ def select_candidates_many(
     model_id: str = "Qwen/Qwen3-8B",
 ) -> list[list[str]]:
     """Batch only ambiguous selections; exact matches return without 7B."""
-    global LAST_SELECTION_AUDIT
+    global LAST_SELECTION_AUDIT, LAST_SELECTION_WORKLOAD
     results: list[list[str] | None] = [None] * len(items)
     audit = [{"status": "pending", "cache_hit": False, "selected_codes": []} for _ in items]
     pending_indexes = []
@@ -450,30 +439,40 @@ def select_candidates_many(
             prompts.append(prepared["prompt"])
 
     if prompts:
-        cache = SelectorJsonlCache(cache_path) if cache_path is not None else None
-        pending_prompts, pending_meta, cached_rows = [], [], []
-        for position, prompt in enumerate(prompts):
-            key = SelectorJsonlCache.key(model_id, prompt)
-            value = cache.get(key) if cache else None
-            if value is None:
-                pending_prompts.append(prompt); pending_meta.append((position, key))
-            else:
-                cached_rows.append((position, value))
-                audit[pending_indexes[position]]["cache_hit"] = True
-        try:
-            if hasattr(llm, "generate_batch"):
-                generated = llm.generate_batch(pending_prompts, batch_size=batch_size) if pending_prompts else []
-            else:
-                generated = [llm.generate(*prompt) for prompt in pending_prompts]
-            if len(generated) != len(pending_prompts):
-                raise ValueError(
-                    f"batch returned {len(generated)} outputs for {len(pending_prompts)} prompts"
+        prompt_token_counts = (
+            llm.count_prompt_tokens(prompts)
+            if hasattr(llm, "count_prompt_tokens") else []
+        )
+        selector_events = []
+        LAST_SELECTION_WORKLOAD = {
+            "selector_count": len(prompts),
+            "selector_input_tokens_p50": _pctl(prompt_token_counts, 0.50),
+            "selector_input_tokens_p95": _pctl(prompt_token_counts, 0.95),
+            "selector_input_tokens_max": max(prompt_token_counts, default=0),
+        }
+        print(f"[Qwen:workload-before-selector] {LAST_SELECTION_WORKLOAD}", file=sys.stderr, flush=True)
+        cache = VersionedJsonlCache(cache_path) if cache_path is not None else None
+        if cache:
+            generation_config = {
+                "max_new_tokens": 128, "max_batch_tokens": None,
+                "batch_size": batch_size, "min_batch_size": 1,
+                "dynamic_batching": True,
+            }
+            for position, prompt in enumerate(prompts):
+                key = VersionedJsonlCache.make_key(
+                    model_id, "linking_selector", prompt,
+                    prompt_version=SELECTOR_PROMPT_VERSION,
+                    generation_config=generation_config,
                 )
-            raw_outputs = [""] * len(prompts)
-            for position, value in cached_rows: raw_outputs[position] = value
-            for (position, key), value in zip(pending_meta, generated):
-                raw_outputs[position] = value
-                if cache: cache.put(key, value)
+                audit[pending_indexes[position]]["cache_hit"] = cache.get(key) is not None
+        try:
+            raw_outputs = generate_with_cache(
+                llm, prompts, batch_size=batch_size, model_id=model_id,
+                task="linking_selector", prompt_version=SELECTOR_PROMPT_VERSION,
+                cache=cache, max_new_tokens=128,
+                prompt_token_counts=prompt_token_counts or None,
+                progress_callback=selector_events.append,
+            )
         except Exception as exc:
             print(f"[candidate_selector] batch lỗi: {exc} -> fallback", file=sys.stderr)
             raw_outputs = [""] * len(prompts)
@@ -483,6 +482,22 @@ def select_candidates_many(
                 "status": "selector_selected" if results[index] else "selector_abstained",
                 "selected_codes": list(results[index] or []), "raw_response": raw_output,
             })
+        output_tokens = [
+            int(value) for event in selector_events
+            for value in event.get("output_tokens_by_row", [])
+        ]
+        LAST_SELECTION_WORKLOAD.update({
+            "selector_microbatch_count": len(selector_events),
+            "selector_output_tokens_p50": _pctl(output_tokens, 0.50),
+            "selector_output_tokens_p95": _pctl(output_tokens, 0.95),
+        })
+        print(f"[Qwen:workload-after-selector] {LAST_SELECTION_WORKLOAD}", file=sys.stderr, flush=True)
+    else:
+        LAST_SELECTION_WORKLOAD = {
+            "selector_count": 0, "selector_microbatch_count": 0,
+            "selector_input_tokens_p50": 0, "selector_input_tokens_p95": 0,
+            "selector_output_tokens_p50": 0, "selector_output_tokens_p95": 0,
+        }
 
     LAST_SELECTION_AUDIT = audit
     select_candidates_many.last_audit = audit

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -45,8 +46,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-quantization", choices=("none", "4bit"), default="none",
     )
-    parser.add_argument("--llm-batch-size", type=int, default=4)
+    parser.add_argument("--llm-batch-size", type=int, default=12)
+    parser.add_argument("--llm-max-batch-tokens", type=int, default=16384)
+    parser.add_argument("--llm-min-batch-size", type=int, default=1)
+    parser.add_argument("--no-dynamic-llm-batching", action="store_true")
+    parser.add_argument("--llm-device-map", choices=("single_gpu", "auto"), default="single_gpu")
+    parser.add_argument("--require-full-gpu", action="store_true")
+    parser.add_argument("--llm-local-files-only", action="store_true")
     parser.add_argument("--llm-cache-path", type=Path)
+    parser.add_argument("--llm-cache-fsync", action="store_true")
+    parser.add_argument("--llm-progress-every", type=int, default=1)
+    parser.add_argument("--stage-cache-dir", type=Path)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--saved-detailed-ner-dir", type=Path,
+        help="bỏ qua hoàn toàn NER và load *.detailed.json để benchmark LLM-only",
+    )
+    parser.add_argument(
+        "--save-detailed-ner-dir", type=Path,
+        help="xuất detailed NER portable cho lần benchmark LLM-only sau",
+    )
+    parser.add_argument("--export-detailed-ner-only", action="store_true")
     parser.add_argument("--llm-audit-dir", type=Path)
     parser.add_argument("--linking-selector-cache-path", type=Path)
     parser.add_argument("--linking-selector-batch-size", type=int, default=4)
@@ -55,6 +75,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linking-audit-dir", type=Path)
     parser.add_argument("--no-llm-recovery", action="store_true")
     parser.add_argument("--review-only-auto-add-eligible", action="store_true")
+    parser.add_argument("--speed-profile", choices=("fast", "balanced", "full"), default="balanced")
+    parser.add_argument("--max-recovery-proposals-per-record", type=int, default=24)
+    parser.add_argument("--max-recovery-requests-per-record", type=int, default=4)
 
     parser.add_argument("--checkpoint", type=Path, default=cfg.DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--label-dicts", type=Path, default=cfg.DEFAULT_LABEL_DICTS_PATH)
@@ -96,8 +119,22 @@ def run(
     *,
     raw_texts_by_id: dict[str, str] | None = None,
 ) -> dict[str, list[dict]]:
-    print("[cli] Đang load NER engine...", file=sys.stderr)
-    pipeline = InferencePipeline.load(
+    run_started = time.perf_counter()
+    stage_times: dict[str, float] = {}
+    print(
+        f"[cli] speed_profile={args.speed_profile} batch={args.llm_batch_size} "
+        f"max_batch_tokens={args.llm_max_batch_tokens} dynamic={not args.no_dynamic_llm_batching}",
+        file=sys.stderr, flush=True,
+    )
+    stage_started = time.perf_counter()
+    print(
+        "[cli] Đang load saved detailed-NER artifacts (không load NER engine)..."
+        if args.saved_detailed_ner_dir is not None else "[cli] Đang load NER engine...",
+        file=sys.stderr,
+    )
+    pipeline = InferencePipeline.load_linking_only(
+        with_rxnorm=args.with_rxnorm, with_icd10=args.with_icd10,
+    ) if args.saved_detailed_ner_dir is not None else InferencePipeline.load(
         with_rxnorm=args.with_rxnorm,
         with_icd10=args.with_icd10,
         checkpoint_path=args.checkpoint,
@@ -108,28 +145,87 @@ def run(
         device=args.device,
     )
     raw_texts_by_id = raw_texts_by_id or _load_raw_texts(input_paths)
+    stage_times["load_ner"] = (
+        0.0 if args.saved_detailed_ner_dir is not None
+        else time.perf_counter() - stage_started
+    )
     predict_kwargs = {"apply_repair_gate": not args.no_repair_gate}
+    stage_cache_root = args.stage_cache_dir or (
+        args.output_dir / ".stages" if args.output_dir is not None else None
+    )
 
     use_editor = args.with_llm_8b or args.with_llm_ner_editor
     use_selector = (args.with_llm_8b or args.with_llm_linking_selector) and not args.deterministic_linking_only
+    if args.saved_detailed_ner_dir is not None and not use_editor:
+        raise ValueError("--saved-detailed-ner-dir requires --with-llm-8b or --with-llm-ner-editor")
+    if args.saved_detailed_ner_dir is not None:
+        print("[cli] LLM-only benchmark: NER engine/inference skipped", file=sys.stderr, flush=True)
     detailed_by_id = None
-    if use_editor:
-        detailed_by_id = pipeline.run_ner_stage_detailed(
-            raw_texts_by_id, **predict_kwargs,
+    if use_editor or args.export_detailed_ner_only:
+        stage_started = time.perf_counter()
+        detailed_cache = None
+        detailed_by_id = {}
+        if args.saved_detailed_ner_dir is not None:
+            from .detailed_artifacts import load_artifacts
+            detailed_by_id = load_artifacts(args.saved_detailed_ner_dir, raw_texts_by_id)
+        if stage_cache_root is not None:
+            from .stage_cache import StageCache
+            detailed_cache = StageCache(stage_cache_root, "detailed_ner", {
+                "checkpoint": str(args.checkpoint), "model_config": str(args.model_config),
+                "backbone": args.backbone, "predict": predict_kwargs,
+            })
+            if args.resume:
+                detailed_by_id = {
+                    record_id: cached for record_id, raw_text in raw_texts_by_id.items()
+                    if (cached := detailed_cache.load(record_id, raw_text)) is not None
+                }
+        missing_raw = {
+            record_id: raw_text for record_id, raw_text in raw_texts_by_id.items()
+            if record_id not in detailed_by_id
+        }
+        computed = pipeline.run_ner_stage_detailed(
+            missing_raw,
+            on_record_complete=(detailed_cache.put if detailed_cache else None),
+            **predict_kwargs,
         )
+        detailed_by_id.update(computed)
+        detailed_by_id = {record_id: detailed_by_id[record_id] for record_id in raw_texts_by_id}
+        if args.save_detailed_ner_dir is not None:
+            from .detailed_artifacts import save_artifact
+            for record_id, detail in detailed_by_id.items():
+                save_artifact(
+                    args.save_detailed_ner_dir, record_id,
+                    raw_texts_by_id[record_id], detail,
+                )
         entities_by_id = {
             record_id: list(detail.final_entities)
             for record_id, detail in detailed_by_id.items()
         }
+        stage_times["detailed_ner"] = time.perf_counter() - stage_started
     else:
+        stage_started = time.perf_counter()
         entities_by_id = pipeline.run_ner_stage(
             raw_texts_by_id, **predict_kwargs,
         )
+        stage_times["ner"] = time.perf_counter() - stage_started
+
+    if args.export_detailed_ner_only:
+        if args.save_detailed_ner_dir is None:
+            raise ValueError("--export-detailed-ner-only requires --save-detailed-ner-dir")
+        stage_times["total"] = time.perf_counter() - run_started
+        print("[cli] detailed-NER artifacts exported; LLM/linking skipped", file=sys.stderr, flush=True)
+        return pipeline.build_outputs(entities_by_id, {record_id: {} for record_id in entities_by_id})
 
     qwen_llm = None
     if use_editor or use_selector:
         from ..llm.backend import LocalLLM
+        from ..llm.batching import VersionedJsonlCache
         from ..llm.config import QWEN3_8B_EDITOR_CONFIG
+
+        for cache_path in (args.llm_cache_path, args.linking_selector_cache_path):
+            if cache_path is not None:
+                VersionedJsonlCache(cache_path, fsync=args.llm_cache_fsync)
+                print(f"[cli] cache ready: {cache_path}", file=sys.stderr, flush=True)
 
         llm_config = replace(
             QWEN3_8B_EDITOR_CONFIG,
@@ -137,22 +233,69 @@ def run(
             dtype=args.llm_dtype,
             load_in_4bit=args.llm_quantization == "4bit",
             batch_size=args.llm_batch_size,
+            max_batch_tokens=args.llm_max_batch_tokens,
+            min_batch_size=args.llm_min_batch_size,
+            dynamic_batching=not args.no_dynamic_llm_batching,
+            device_map_mode=args.llm_device_map,
+            require_full_gpu=args.require_full_gpu,
+            local_files_only=args.llm_local_files_only,
         )
-        pipeline.ner_engine.offload_to_cpu()
+        if pipeline.ner_engine is not None:
+            pipeline.ner_engine.offload_to_cpu()
         print(f"[cli] Đang load {llm_config.model_id}...", file=sys.stderr)
         qwen_llm = LocalLLM(llm_config)
         qwen_llm.load()
+        stage_times["load_llm"] = qwen_llm.load_stats.get("load_seconds", 0.0)
     if use_editor:
-        entities_by_id = pipeline.run_qwen8b_ner_editor_stage(
-            raw_texts_by_id,
-            detailed_by_id,
+        stage_started = time.perf_counter()
+        editor_cache = None
+        resumed_entities = {}
+        if stage_cache_root is not None:
+            from .stage_cache import StageCache
+            editor_cache = StageCache(stage_cache_root, "editor", {
+                "model": args.llm_model_id, "profile": args.speed_profile,
+                "recovery": not args.no_llm_recovery,
+                "prompt": "qwen3_locked_editor_v3_change_only_speed",
+            })
+            if args.resume:
+                resumed_entities = {
+                    record_id: cached for record_id, raw_text in raw_texts_by_id.items()
+                    if (cached := editor_cache.load(record_id, raw_text)) is not None
+                }
+        editor_raw = {key: value for key, value in raw_texts_by_id.items() if key not in resumed_entities}
+        editor_details = {key: detailed_by_id[key] for key in editor_raw}
+        computed_entities = pipeline.run_qwen8b_ner_editor_stage(
+            editor_raw,
+            editor_details,
             qwen_llm,
             batch_size=args.llm_batch_size,
             include_recovery=not args.no_llm_recovery,
             review_only_auto_add_eligible=args.review_only_auto_add_eligible,
             cache_path=args.llm_cache_path,
             model_id=args.llm_model_id,
+            max_batch_tokens=args.llm_max_batch_tokens,
+            min_batch_size=args.llm_min_batch_size,
+            dynamic_batching=not args.no_dynamic_llm_batching,
+            cache_fsync=args.llm_cache_fsync,
+            progress_every=args.llm_progress_every,
+            speed_profile=args.speed_profile,
+            max_recovery_proposals_per_record=args.max_recovery_proposals_per_record,
+            max_recovery_requests_per_record=args.max_recovery_requests_per_record,
         )
+        for record_id, value in computed_entities.items():
+            if editor_cache:
+                editor_cache.put(record_id, raw_texts_by_id[record_id], value)
+        if stage_cache_root is not None:
+            recovery_cache = StageCache(stage_cache_root, "recovery", {
+                "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+                "profile": args.speed_profile, "enabled": not args.no_llm_recovery,
+            })
+            for record_id, value in computed_entities.items():
+                recovery_cache.put(record_id, raw_texts_by_id[record_id], value)
+        resumed_entities.update(computed_entities)
+        entities_by_id = {record_id: resumed_entities[record_id] for record_id in raw_texts_by_id}
+        stage_times["editor_and_recovery"] = time.perf_counter() - stage_started
+        stage_times.update(pipeline.last_editor_stage_times)
         if args.llm_audit_dir is not None:
             args.llm_audit_dir.mkdir(parents=True, exist_ok=True)
             for record_id, audit in pipeline.last_editor_audit.items():
@@ -167,18 +310,73 @@ def run(
         for record_id, entities in entities_by_id.items()
     })
 
-    candidates_by_id = pipeline.run_linking_stage(
-        entities_by_id,
-        selector_llm=qwen_llm if use_selector else None,
-        raw_texts_by_id=raw_texts_by_id,
-        selector_batch_size=args.linking_selector_batch_size,
-        selector_cache_path=args.linking_selector_cache_path,
-        model_id=args.llm_model_id,
-        retrieval_k_by_linker={
+    stage_started = time.perf_counter()
+    linking_cache = None
+    candidates_by_id = {}
+    if stage_cache_root is not None:
+        from .stage_cache import StageCache
+        linking_cache = StageCache(stage_cache_root, "linking_selector", {
+            "rxnorm": args.with_rxnorm, "icd10": args.with_icd10,
+            "selector": use_selector, "model": args.llm_model_id,
+            "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
+            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "profile": args.speed_profile, "recovery": not args.no_llm_recovery,
+        })
+        if args.resume:
+            candidates_by_id = {
+                record_id: cached for record_id, raw_text in raw_texts_by_id.items()
+                if (cached := linking_cache.load(record_id, raw_text)) is not None
+            }
+    linking_entities = {key: value for key, value in entities_by_id.items() if key not in candidates_by_id}
+    linking_raw = {key: raw_texts_by_id[key] for key in linking_entities}
+    retrieval_cache = None
+    retrieval_by_id = {}
+    if stage_cache_root is not None:
+        retrieval_cache = StageCache(stage_cache_root, "linking_retrieval", {
+            "rxnorm": args.with_rxnorm, "icd10": args.with_icd10,
+            "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
+            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "profile": args.speed_profile, "recovery": not args.no_llm_recovery,
+        })
+        if args.resume:
+            retrieval_by_id = {
+                record_id: cached for record_id, raw_text in linking_raw.items()
+                if (cached := retrieval_cache.load(record_id, raw_text)) is not None
+            }
+    retrieval_entities = {
+        key: value for key, value in linking_entities.items() if key not in retrieval_by_id
+    }
+    retrieval_started = time.perf_counter()
+    computed_retrieval = pipeline.run_linking_retrieval_stage_batch(
+        retrieval_entities,
+        top_k_by_linker={
             "rxnorm": args.rxnorm_retrieval_k,
             "icd10": args.icd10_retrieval_k,
         },
     )
+    for record_id, value in computed_retrieval.items():
+        if retrieval_cache:
+            retrieval_cache.put(record_id, raw_texts_by_id[record_id], value)
+    retrieval_by_id.update(computed_retrieval)
+    pipeline.last_linking_retrieval = retrieval_by_id
+    stage_times["linking_retrieval"] = time.perf_counter() - retrieval_started
+    selector_started = time.perf_counter()
+    computed_candidates = pipeline.run_qwen8b_linking_selector_stage(
+        linking_entities,
+        retrieval_by_id,
+        selector_llm=qwen_llm if use_selector else None,
+        raw_texts_by_id=linking_raw,
+        batch_size=args.linking_selector_batch_size,
+        cache_path=args.linking_selector_cache_path,
+        model_id=args.llm_model_id,
+    )
+    stage_times["linking_selector"] = time.perf_counter() - selector_started
+    for record_id, value in computed_candidates.items():
+        if linking_cache:
+            linking_cache.put(record_id, raw_texts_by_id[record_id], value)
+    candidates_by_id.update(computed_candidates)
+    candidates_by_id = {record_id: candidates_by_id[record_id] for record_id in raw_texts_by_id}
+    stage_times["linking_retrieval_and_selector"] = time.perf_counter() - stage_started
     _write_stage_checkpoint(args.output_dir, "linking", candidates_by_id)
     if args.linking_audit_dir is not None:
         args.linking_audit_dir.mkdir(parents=True, exist_ok=True)
@@ -191,8 +389,30 @@ def run(
                            ensure_ascii=False, indent=2, default=str), encoding="utf-8",
             )
     if qwen_llm is not None:
+        _write_stage_checkpoint(args.output_dir, "llm_workload", pipeline.last_llm_workload)
+        _write_stage_checkpoint(args.output_dir, "llm_batch_telemetry", {
+            "load": qwen_llm.load_stats,
+            "microbatches": qwen_llm.batch_generation_stats,
+        })
         qwen_llm.unload()
-    return pipeline.build_outputs(entities_by_id, candidates_by_id)
+    outputs = pipeline.build_outputs(entities_by_id, candidates_by_id)
+    if stage_cache_root is not None:
+        from .stage_cache import StageCache
+        final_cache = StageCache(stage_cache_root, "final", {
+            "editor_prompt": "qwen3_locked_editor_v3_change_only_speed",
+            "profile": args.speed_profile, "selector": use_selector,
+            "rx_k": args.rxnorm_retrieval_k, "icd_k": args.icd10_retrieval_k,
+        })
+        for record_id, value in outputs.items():
+            final_cache.put(record_id, raw_texts_by_id[record_id], value)
+    stage_times["total"] = time.perf_counter() - run_started
+    print("[cli] stage_runtime_seconds=" + json.dumps(
+        {key: round(value, 3) for key, value in stage_times.items()},
+        ensure_ascii=False,
+    ), file=sys.stderr, flush=True)
+    if args.output_dir is not None:
+        _write_stage_checkpoint(args.output_dir, "runtime", stage_times)
+    return outputs
 
 
 def main() -> None:

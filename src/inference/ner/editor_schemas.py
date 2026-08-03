@@ -57,7 +57,8 @@ class ReviewRegion:
     context: str
     context_start: int
     context_end: int
-    candidate_ids: list[str]
+    target_candidate_ids: list[str]
+    context_candidate_ids: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     priority: int = 0
     must_review: bool = True
@@ -67,10 +68,16 @@ class ReviewRegion:
             raise ValueError("review region IDs cannot be empty")
         if not 0 <= self.context_start < self.context_end:
             raise ValueError("invalid review context span")
-        if not self.candidate_ids or len(self.candidate_ids) > 8:
-            raise ValueError("review region must contain 1..8 candidates")
+        if not self.target_candidate_ids or len(self.target_candidate_ids) > 6:
+            raise ValueError("review region must contain 1..6 targets")
+        if len(self.candidate_ids) > 8:
+            raise ValueError("review region must contain at most 8 total candidates")
         if len(self.candidate_ids) != len(set(self.candidate_ids)):
             raise ValueError("review region candidate IDs must be unique")
+
+    @property
+    def candidate_ids(self) -> list[str]:
+        return [*self.target_candidate_ids, *self.context_candidate_ids]
 
 
 def _string_list(value: Any, field_name: str) -> list[str]:
@@ -119,7 +126,7 @@ class EditOperation:
         assertions = _string_list(value.get("assertions", []), "assertions")
         if set(assertions) - VALID_ASSERTIONS:
             raise ValueError("invalid assertion")
-        confidence = value.get("confidence")
+        confidence = value.get("confidence", "HIGH")
         if confidence not in {"HIGH", "MEDIUM", "LOW"}:
             raise ValueError("invalid confidence")
         reason = ReasonCode(value.get("reason_code"))

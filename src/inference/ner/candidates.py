@@ -170,6 +170,11 @@ _TEST_EQUIPMENT_CUES = (
 def review_reasons(item: CandidateEvidence) -> list[str]:
     normalized = re.sub(r"\s+", " ", item.text.casefold()).strip()
     compact = "".join(char for char in normalized if char.isalnum())
+    # Weak span-head audit evidence is retained in the catalog but does not
+    # become an editor target. It can still be attached as context to a
+    # selected target with a structural relation.
+    if not item.pre_llm_selected:
+        return []
     reasons = list(item.negative_flags)
     if len(compact) <= 1 and any(char.isalpha() for char in compact):
         reasons.append("one_character_alphabetic")
@@ -192,7 +197,11 @@ def review_reasons(item: CandidateEvidence) -> list[str]:
     score = max(item.scores.values(), default=0.0)
     if item.pre_llm_selected and score < 0.80:
         reasons.append("low_confidence_preselected")
-    if "span_head" in item.sources and not ({"crf", "local_crf"} & set(item.sources)):
+    if (
+        item.pre_llm_selected
+        and "span_head" in item.sources
+        and not ({"crf", "local_crf"} & set(item.sources))
+    ):
         reasons.append("span_only_candidate")
     return list(dict.fromkeys(reasons))
 
@@ -226,7 +235,7 @@ def build_review_regions(
         while queue and len(group) < max_candidates:
             candidate_id = queue.pop(0)
             item = by_id.get(candidate_id)
-            if item is None or candidate_id in assigned:
+            if item is None or candidate_id in assigned or not reasons_by_id[candidate_id]:
                 continue
             group.append(item)
             assigned.add(candidate_id)
@@ -241,8 +250,19 @@ def build_review_regions(
                 group.append(item)
                 assigned.add(item.candidate_id)
         group.sort(key=lambda item: (*item.position, item.type))
-        core_start = min(item.position[0] for item in group)
-        core_end = max(item.position[1] for item in group)
+        context_items = []
+        target_ids = {item.candidate_id for item in group}
+        for target in group:
+            for candidate_id in target.related_candidate_ids:
+                item = by_id.get(candidate_id)
+                if item is None or candidate_id in target_ids or item in context_items:
+                    continue
+                if len(group) + len(context_items) >= hard_max_candidates:
+                    break
+                context_items.append(item)
+        all_items = [*group, *context_items]
+        core_start = min(item.position[0] for item in all_items)
+        core_end = max(item.position[1] for item in all_items)
         context_start = max(0, core_start - context_radius)
         context_end = min(len(raw_text), core_end + context_radius)
         if context_end - context_start > 900:
@@ -260,7 +280,8 @@ def build_review_regions(
             context=raw_text[context_start:context_end],
             context_start=context_start,
             context_end=context_end,
-            candidate_ids=[item.candidate_id for item in group],
+            target_candidate_ids=[item.candidate_id for item in group],
+            context_candidate_ids=[item.candidate_id for item in context_items],
             reasons=region_reasons,
             priority=max((100 if reason in {
                 "assertion_not_allowed_for_type", "boundary_disagreement",
