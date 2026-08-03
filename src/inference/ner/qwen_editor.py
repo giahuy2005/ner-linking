@@ -9,12 +9,23 @@ from pathlib import Path
 from typing import Any
 
 from ...llm.json_guard import extract_json
-from ..schemas import ASSERTION_ENTITY_TYPES, NerEntity
+from ..schemas import (
+    ASSERTION_ENTITY_TYPES,
+    NerEntity,
+    normalize_assertions_for_type,
+)
 from .candidates import CandidateEvidence, MissingProposal
-from .editor_schemas import EditAction, EditOperation, MissingDecision, MissingDecisionAction, ReasonCode
+from .editor_schemas import (
+    EditAction,
+    EditOperation,
+    MissingDecision,
+    MissingDecisionAction,
+    ReasonCode,
+    ReviewRegion,
+)
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v1"
+PROMPT_VERSION = "qwen3_locked_editor_v2_region"
 _EXPLICIT_DROP_REASONS = {
     ReasonCode.NON_ENTITY_ANATOMY, ReasonCode.NON_ENTITY_PERSON,
     ReasonCode.NON_ENTITY_SPECIALTY, ReasonCode.NON_ENTITY_SPECIMEN,
@@ -71,6 +82,7 @@ class VersionedJsonlCache:
 def generate_with_cache(
     llm, prompts: list[tuple[str, str]], *, batch_size: int, model_id: str,
     task: str, cache: VersionedJsonlCache | None = None,
+    max_new_tokens: int | None = None,
 ) -> list[str]:
     results: list[str | None] = [None] * len(prompts)
     pending_indexes, pending_prompts, keys = [], [], []
@@ -82,7 +94,10 @@ def generate_with_cache(
         else:
             results[index] = cached
     if pending_prompts:
-        generated = llm.generate_batch(pending_prompts, batch_size=batch_size)
+        generation_kwargs = {"batch_size": batch_size}
+        if max_new_tokens is not None:
+            generation_kwargs["max_new_tokens"] = max_new_tokens
+        generated = llm.generate_batch(pending_prompts, **generation_kwargs)
         if len(generated) != len(pending_prompts):
             generated = [""] * len(pending_prompts)
         for index, key, response in zip(pending_indexes, keys, generated):
@@ -92,28 +107,57 @@ def generate_with_cache(
     return [item or "" for item in results]
 
 
-def _candidate_payload(item: CandidateEvidence) -> dict[str, Any]:
+def _candidate_payload(item: CandidateEvidence, context_start: int = 0) -> dict[str, Any]:
     value = asdict(item)
-    value["position"] = list(item.position)
+    value["global_position"] = list(item.position)
+    value["local_position"] = [
+        item.position[0] - context_start, item.position[1] - context_start,
+    ]
+    value.pop("position", None)
     value["strong_consensus"] = item.strong_consensus
     return value
 
 
-def build_editor_request(request_id: str, context: str, context_start: int, candidates: list[CandidateEvidence]) -> tuple[str, str]:
-    system = (
-        "You are a locked Vietnamese medical NER candidate editor. Return one JSON object only. "
-        "Decide every supplied candidate exactly once. Never invent IDs, spans, text, types, or raw text. "
-        "Allowed actions: KEEP, DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS, FLAG_UNRESOLVED. "
-        "Non-target classes include anatomy-only, person, specialty, specimen, activity/lifestyle, "
-        "mechanism/etiology, generic biomedical concept, procedure-not-test, and function fragments."
-    )
+def build_editor_request(region: ReviewRegion, candidates: list[CandidateEvidence]) -> tuple[str, str]:
+    system = """Bạn là bộ biên tập NER y tế tiếng Việt bị khóa theo candidate.
+Ontology hợp lệ: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
+Assertion isNegated/isHistorical/isFamily chỉ hợp lệ với TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC.
+Action hợp lệ: KEEP, DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS, FLAG_UNRESOLVED.
+Phải quyết định đúng một lần cho mỗi candidate. candidate_ids LUÔN là list.
+KEEP cũng phải có confidence và reason_code. Field không dùng phải là null hoặc [].
+Không phát minh ID/text/span/type; span local [start,end) phải là exact substring và không qua newline/câu.
+Không phải entity: anatomy/person/specialty/specimen/activity/mechanism/device/procedure/equipment/function fragment.
+Không chắc chắn thì FLAG_UNRESOLVED. Không reasoning, markdown hay copy input payload.
+Reason code: VALID_ENTITY, WRONG_TYPE, WRONG_BOUNDARY, MERGE_REQUIRED, ASSERTION_ERROR,
+NON_ENTITY_ANATOMY, NON_ENTITY_PERSON, NON_ENTITY_SPECIALTY, NON_ENTITY_SPECIMEN,
+NON_ENTITY_ACTIVITY, NON_ENTITY_MECHANISM, GENERIC_BIOMEDICAL,
+FUNCTION_WORD_OR_FRAGMENT, PROCEDURE_NOT_TEST, AMBIGUOUS.
+Exact output schema:
+{"request_id":"...","actions":[{"action":"KEEP|DROP|RETYPE|REPAIR_SPAN|MERGE|UPDATE_ASSERTIONS|FLAG_UNRESOLVED","candidate_ids":["cand_id"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH|MEDIUM|LOW","reason_code":"VALID_ENTITY"}]}
+Ví dụ hợp lệ:
+{"request_id":"r","actions":[
+{"action":"KEEP","candidate_ids":["c1"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"VALID_ENTITY"},
+{"action":"DROP","candidate_ids":["c2"],"text":null,"type":null,"assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"FUNCTION_WORD_OR_FRAGMENT"},
+{"action":"RETYPE","candidate_ids":["c3"],"text":null,"type":"CHẨN_ĐOÁN","assertions":[],"local_position":null,"confidence":"HIGH","reason_code":"WRONG_TYPE"},
+{"action":"UPDATE_ASSERTIONS","candidate_ids":["c4"],"text":null,"type":null,"assertions":["isNegated"],"local_position":null,"confidence":"HIGH","reason_code":"ASSERTION_ERROR"}]}
+Chỉ xuất đúng một JSON object."""
     user = json.dumps({
         "schema_version": PROMPT_VERSION,
-        "request_id": request_id,
-        "context": context,
-        "context_global_start": context_start,
-        "candidates": [_candidate_payload(item) for item in candidates],
-        "response_schema": {"request_id": request_id, "actions": []},
+        "request_id": region.request_id,
+        "record_id": region.record_id,
+        "context": region.context,
+        "context_global_start": region.context_start,
+        "review_reasons": region.reasons,
+        "candidates": [_candidate_payload(item, region.context_start) for item in candidates],
+        "response_schema": {
+            "request_id": region.request_id,
+            "actions": [{
+                "action": "KEEP", "candidate_ids": ["cand_id"],
+                "text": None, "type": None, "assertions": [],
+                "local_position": None, "confidence": "HIGH",
+                "reason_code": "VALID_ENTITY",
+            }],
+        },
     }, ensure_ascii=False, separators=(",", ":"))
     return system, user
 
@@ -121,11 +165,15 @@ def build_editor_request(request_id: str, context: str, context_start: int, cand
 def build_missing_request(
     request_id: str, context: str, context_start: int, proposals: list[MissingProposal]
 ) -> tuple[str, str]:
-    system = (
-        "You are a locked missing-entity adjudicator. Return JSON only. "
-        "For every supplied proposal_id choose ADD_PROPOSAL, REJECT, or UNRESOLVED. "
-        "Never invent IDs, text, positions, types, or spans."
-    )
+    system = """Bạn là bộ duyệt proposal NER y tế tiếng Việt bị khóa.
+Chọn đúng một decision cho mỗi proposal_id: ADD_PROPOSAL, REJECT hoặc UNRESOLVED.
+Không phát minh ID/text/span/type. Assertion chỉ hợp lệ cho triệu chứng/chẩn đoán/thuốc.
+Không reasoning/markdown. Exact schema:
+{"request_id":"...","decisions":[{"proposal_id":"prop_id","decision":"ADD_PROPOSAL|REJECT|UNRESOLVED","type":"CHẨN_ĐOÁN|null","assertions":[],"confidence":"HIGH|MEDIUM|LOW","reason_code":"VALID_MISSING_ENTITY|NOT_AN_ENTITY|INSUFFICIENT_EVIDENCE|AMBIGUOUS"}]}
+Ví dụ: {"request_id":"r","decisions":[
+{"proposal_id":"p1","decision":"REJECT","type":null,"assertions":[],"confidence":"HIGH","reason_code":"NOT_AN_ENTITY"},
+{"proposal_id":"p2","decision":"ADD_PROPOSAL","type":"CHẨN_ĐOÁN","assertions":[],"confidence":"HIGH","reason_code":"VALID_MISSING_ENTITY"}]}
+Chỉ xuất đúng một JSON object."""
     payload = []
     for item in proposals:
         value = asdict(item)
@@ -140,7 +188,10 @@ def build_missing_request(
         "context": context,
         "context_global_start": context_start,
         "proposals": payload,
-        "response_schema": {"request_id": request_id, "decisions": []},
+        "response_schema": {"request_id": request_id, "decisions": [{
+            "proposal_id": "prop_id", "decision": "REJECT", "type": None,
+            "assertions": [], "confidence": "HIGH", "reason_code": "NOT_AN_ENTITY",
+        }]},
     }, ensure_ascii=False, separators=(",", ":"))
     return system, user
 
@@ -169,7 +220,13 @@ def _same_unit(raw_text: str, start: int, end: int) -> bool:
 
 
 def _to_entity(candidate: CandidateEvidence) -> NerEntity:
-    return NerEntity(candidate.text, candidate.type, list(candidate.assertions), candidate.position, max(candidate.scores.values(), default=1.0))
+    return NerEntity(
+        candidate.text,
+        candidate.type,
+        normalize_assertions_for_type(candidate.type, candidate.assertions),
+        candidate.position,
+        max(candidate.scores.values(), default=1.0),
+    )
 
 
 def apply_editor_response(
@@ -178,11 +235,13 @@ def apply_editor_response(
     raw_response: str,
     *,
     context_start: int = 0,
+    validation_candidates: list[CandidateEvidence] | None = None,
 ) -> EditorResult:
     """Validate/apply actions independently. Invalid JSON keeps every candidate."""
     originals = [_to_entity(item) for item in candidates if item.pre_llm_selected]
     result = EditorResult(entities=originals, raw_response=raw_response)
     by_id = {item.candidate_id: item for item in candidates}
+    validation_candidates = validation_candidates or candidates
     try:
         payload = extract_json(raw_response)
         raw_actions = payload.get("actions")
@@ -238,7 +297,12 @@ def apply_editor_response(
             elif target.strong_consensus and operation.type not in target.allowed_types:
                 errors.append("strong_candidate_retype_without_competing_evidence")
             else:
-                replacement = NerEntity(target.text, operation.type or target.type, list(target.assertions), target.position, max(target.scores.values(), default=1.0))
+                final_type = operation.type or target.type
+                replacement = NerEntity(
+                    target.text, final_type,
+                    normalize_assertions_for_type(final_type, target.assertions),
+                    target.position, max(target.scores.values(), default=1.0),
+                )
         elif name in {EditAction.REPAIR_SPAN, EditAction.MERGE}:
             assert operation.local_position is not None and operation.text is not None
             start = context_start + operation.local_position[0]
@@ -252,7 +316,7 @@ def apply_editor_response(
             elif name == EditAction.REPAIR_SPAN and any(
                 other.candidate_id not in ids
                 and start < other.position[1] and end > other.position[0]
-                for other in candidates
+                for other in validation_candidates
             ):
                 errors.append("repair_would_swallow_other_candidate_use_merge")
             elif name == EditAction.MERGE and not all(start <= item.position[0] and end >= item.position[1] for item in targets):
@@ -266,13 +330,22 @@ def apply_editor_response(
             ):
                 errors.append("merge_targets_not_adjacent")
             else:
-                replacement = NerEntity(operation.text, operation.type or targets[0].type, list(operation.assertions), (start, end), 1.0)
+                final_type = operation.type or targets[0].type
+                replacement = NerEntity(
+                    operation.text, final_type,
+                    normalize_assertions_for_type(final_type, operation.assertions),
+                    (start, end), 1.0,
+                )
         elif name == EditAction.UPDATE_ASSERTIONS:
             target = targets[0]
             if target.type not in ASSERTION_ENTITY_TYPES:
                 errors.append("assertions_not_allowed_for_type")
             else:
-                replacement = NerEntity(target.text, target.type, list(operation.assertions), target.position, max(target.scores.values(), default=1.0))
+                replacement = NerEntity(
+                    target.text, target.type,
+                    normalize_assertions_for_type(target.type, operation.assertions),
+                    target.position, max(target.scores.values(), default=1.0),
+                )
         elif name == EditAction.FLAG_UNRESOLVED:
             result.unresolved.extend(ids)
 
@@ -351,7 +424,12 @@ def apply_missing_decisions(
         if errors:
             result.rejected.append({"reason": errors, "proposal_id": proposal.proposal_id})
             continue
-        entity = NerEntity(proposal.text, decision.type or proposal.allowed_types[0], list(decision.assertions), proposal.position, 1.0)
+        final_type = decision.type or proposal.allowed_types[0]
+        entity = NerEntity(
+            proposal.text, final_type,
+            normalize_assertions_for_type(final_type, decision.assertions),
+            proposal.position, 1.0,
+        )
         result.entities.append(entity)
         result.applied.append({"action": "ADD_PROPOSAL", "proposal_id": proposal.proposal_id})
     result.unresolved.extend(sorted(set(by_id) - seen))

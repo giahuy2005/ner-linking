@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import re
+import time
 from typing import Any
 
 import torch
@@ -26,6 +27,7 @@ class LocalLLM:
         self.config = config
         self.model = None
         self.tokenizer = None
+        self.generation_stats: list[dict[str, Any]] = []
 
     @property
     def is_loaded(self) -> bool:
@@ -141,6 +143,7 @@ class LocalLLM:
         prompts: list[tuple[str, str]],
         *,
         batch_size: int = 4,
+        max_new_tokens: int | None = None,
     ) -> list[str]:
         """Generate multiple short JSON responses with left-padded batches."""
         if batch_size <= 0:
@@ -166,18 +169,29 @@ class LocalLLM:
                 truncation=True,
                 max_length=self.config.max_context_length,
             ).to(self.model.device)
+            started = time.perf_counter()
+            token_budget = int(max_new_tokens or self.config.max_new_tokens)
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.config.max_new_tokens,
+                max_new_tokens=token_budget,
                 do_sample=self.config.temperature > 0,
                 temperature=self.config.temperature if self.config.temperature > 0 else None,
                 top_p=None,
                 top_k=None,
             )
             prompt_width = inputs["input_ids"].shape[1]
-            for row in outputs:
-                text = self.tokenizer.decode(row[prompt_width:], skip_special_tokens=True)
+            for group_index, row in enumerate(outputs):
+                continuation = row[prompt_width:]
+                text = self.tokenizer.decode(continuation, skip_special_tokens=True)
                 if self.config.supports_thinking:
                     text = _strip_thinking_block(text)
                 responses.append(text.strip())
+                output_tokens = int(continuation.shape[0])
+                self.generation_stats.append({
+                    "input_tokens": int(inputs["attention_mask"][group_index].sum().item()),
+                    "output_tokens": output_tokens,
+                    "token_budget": token_budget,
+                    "finish_reason": "length" if output_tokens >= token_budget else "eos",
+                    "latency_seconds": time.perf_counter() - started,
+                })
         return responses

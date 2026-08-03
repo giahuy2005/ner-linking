@@ -11,7 +11,11 @@ from __future__ import annotations
 import re
 import sys
 import unicodedata
+import hashlib
+import json
+from dataclasses import asdict, is_dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...llm.json_guard import extract_json
@@ -20,6 +24,8 @@ from ...llm.response_schemas import CandidateSelection
 
 if TYPE_CHECKING:
     from ...llm.backend import LocalLLM
+
+LAST_SELECTION_AUDIT: list[dict] = []
 
 
 def _display(cand, key_priority: tuple[str, ...] = ("code", "rxcui")) -> tuple[str, str] | None:
@@ -55,6 +61,59 @@ def _display(cand, key_priority: tuple[str, ...] = ("code", "rxcui")) -> tuple[s
             if features.get(key):
                 details.append(f"{key}={features[key]}")
     return code, " | ".join(details)
+
+
+def _candidate_payload(candidate) -> dict:
+    displayed = _display(candidate)
+    if displayed is None:
+        return {}
+    code, label = displayed
+    if is_dataclass(candidate):
+        raw = asdict(candidate)
+        return {
+            "code": code, "name": raw.get("name", label), "tty": raw.get("tty"),
+            "tier": raw.get("tier"), "active": raw.get("active"),
+            "historical": raw.get("historical"), "current_rxcuis": raw.get("current_rxcuis", []),
+            "exact_flags": {"term": raw.get("exact_term_match"), "ingredient": raw.get("exact_ingredient_match")},
+            "support_level": raw.get("support_level"), "score": raw.get("final_score"),
+            "features": raw.get("features", {}), "matched_terms": raw.get("matched_terms", []),
+            "query_sources": raw.get("retrieval_sources", []), "hard_conflicts": raw.get("rejection_reasons", []),
+        }
+    raw = candidate if isinstance(candidate, dict) else {}
+    return {
+        "code": code, "preferred_or_matched_term": raw.get("matched_term", label),
+        "language": raw.get("language"), "term_type": raw.get("term_type"),
+        "score": raw.get("score"), "matched_terms": raw.get("matched_terms", []),
+        "query_sources": raw.get("query_sources", []), "aggregate_components": raw.get("aggregate_components", {}),
+        "exact_alias_source": raw.get("exact_alias_source"), "chapter_support": raw.get("chapter_support"),
+        "lexical_coverage": raw.get("lexical_coverage"), "over_specific": raw.get("over_specific", False),
+    }
+
+
+class SelectorJsonlCache:
+    def __init__(self, path: str | Path):
+        self.path = Path(path); self.values = {}
+        if self.path.exists():
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line); self.values[str(row["key"])] = str(row["response"])
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    continue
+
+    @staticmethod
+    def key(model_id: str, prompt: tuple[str, str], config_hash: str = "") -> str:
+        value = json.dumps({"version": "selector_v2", "model": model_id, "prompt": prompt,
+                            "config": config_hash}, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def get(self, key): return self.values.get(key)
+
+    def put(self, key, response):
+        if key in self.values: return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n")
+        self.values[key] = response
 
 
 def _normalize_exact(text: str) -> str:
@@ -151,7 +210,7 @@ def _candidate_supported(entity_text: str, entity_type: str, candidate) -> bool:
             default=(0.0, 0.0),
         )
         final_score = float(getattr(candidate, "final_score", 0.0) or 0.0)
-        no_conflict = all(features.get(key) not in {"mismatch", "order_dose_mismatch"}
+        no_conflict = all(features.get(key) not in {"mismatch", "order_dose_mismatch", "conflict"}
                           for key in ("strength_relation", "form_relation", "release_relation"))
         return bool(
             ingredient == "exact" and no_conflict and final_score >= 0.42
@@ -207,7 +266,7 @@ def _prepare_selection(
     for candidate in candidates[:top_k_context]:
         pair = _display(candidate)
         if pair is not None:
-            display_pairs.append(pair)
+            display_pairs.append(_candidate_payload(candidate))
             valid_codes.append(pair[0])
             candidates_by_code.setdefault(pair[0], candidate)
     if not display_pairs:
@@ -216,19 +275,43 @@ def _prepare_selection(
     if entity_type == "CHẨN_ĐOÁN" and max_choices >= 2 \
             and _explicitly_coordinated_diagnoses(entity_text):
         choice_limit = 2
+    supported_candidates = [candidate for candidate in candidates[:top_k_context]
+                            if _candidate_supported(entity_text, entity_type, candidate)]
     high_confidence = (
         _high_confidence_top(entity_text, entity_type, candidates[0])
         and _candidate_supported(entity_text, entity_type, candidates[0])
     )
+    if not high_confidence and supported_candidates:
+        top = supported_candidates[0]
+        support = getattr(top, "support_level", None) if not isinstance(top, dict) else top.get("support_level")
+        margin = getattr(top, "top1_margin", None) if not isinstance(top, dict) else top.get("top1_margin")
+        if len(supported_candidates) == 1 and support in {"exact", "strong"}:
+            high_confidence = True
+        elif len(supported_candidates) == 1 and isinstance(top, dict) and float(top.get("score", 0.0) or 0.0) >= .72:
+            high_confidence = True
+        elif support in {"exact", "strong"} and margin is not None and float(margin) >= .08:
+            high_confidence = True
+        elif isinstance(top, dict) and len(supported_candidates) >= 2:
+            first_score = float(top.get("aggregate_score", top.get("score", 0.0)) or 0.0)
+            second = supported_candidates[1]
+            second_score = float(second.get("aggregate_score", second.get("score", 0.0)) or 0.0)
+            if first_score >= .80 and first_score - second_score >= .08:
+                high_confidence = True
     fallback = valid_codes[:1] if high_confidence else []
     prompt = None
-    if not high_confidence:
+    request_id = hashlib.sha1(
+        f"{entity_type}|{entity_text}|{context}".encode("utf-8")
+    ).hexdigest()[:16]
+    # Qwen is only useful for a real ambiguity between at least two supported
+    # candidates. One weak candidate or an empty supported set must abstain.
+    if not high_confidence and len(supported_candidates) >= 2:
         prompt = build_candidate_selector_prompt(
             entity_text,
             entity_type,
             display_pairs,
             max_choices=choice_limit,
             context=context,
+            request_id=request_id,
         )
     return {
         "entity_text": entity_text,
@@ -238,6 +321,7 @@ def _prepare_selection(
         "choice_limit": choice_limit,
         "fallback": fallback,
         "prompt": prompt,
+        "request_id": request_id,
     }
 
 
@@ -253,6 +337,10 @@ def _finish_selection(raw_output: str, prepared: dict) -> list[str]:
     if selection is None:
         return prepared["fallback"]
     valid_set = set(prepared["valid_codes"])
+    if selection.request_id and selection.request_id != prepared.get("request_id", selection.request_id):
+        return prepared["fallback"]
+    if selection.request_id and len(selection.chosen_codes) > prepared["choice_limit"]:
+        return prepared["fallback"]
     chosen = list(dict.fromkeys(code for code in selection.chosen_codes if code in valid_set))
     supported = [
         code for code in chosen
@@ -330,9 +418,13 @@ def select_candidates_many(
     top_k_context: int = 10,
     max_choices: int = 2,
     batch_size: int = 4,
+    cache_path: str | Path | None = None,
+    model_id: str = "Qwen/Qwen3-8B",
 ) -> list[list[str]]:
     """Batch only ambiguous selections; exact matches return without 7B."""
+    global LAST_SELECTION_AUDIT
     results: list[list[str] | None] = [None] * len(items)
+    audit = [{"status": "pending", "cache_hit": False, "selected_codes": []} for _ in items]
     pending_indexes = []
     prepared_items = []
     prompts = []
@@ -347,27 +439,51 @@ def select_candidates_many(
         )
         if prepared is None:
             results[index] = []
+            audit[index]["status"] = "retrieval_empty"
         elif prepared["prompt"] is None:
             results[index] = prepared["fallback"][:1]
+            audit[index]["status"] = "deterministic_bypass" if prepared["fallback"] else "unsupported_abstain"
+            audit[index]["selected_codes"] = list(results[index])
         else:
             pending_indexes.append(index)
             prepared_items.append(prepared)
             prompts.append(prepared["prompt"])
 
     if prompts:
+        cache = SelectorJsonlCache(cache_path) if cache_path is not None else None
+        pending_prompts, pending_meta, cached_rows = [], [], []
+        for position, prompt in enumerate(prompts):
+            key = SelectorJsonlCache.key(model_id, prompt)
+            value = cache.get(key) if cache else None
+            if value is None:
+                pending_prompts.append(prompt); pending_meta.append((position, key))
+            else:
+                cached_rows.append((position, value))
+                audit[pending_indexes[position]]["cache_hit"] = True
         try:
             if hasattr(llm, "generate_batch"):
-                raw_outputs = llm.generate_batch(prompts, batch_size=batch_size)
+                generated = llm.generate_batch(pending_prompts, batch_size=batch_size) if pending_prompts else []
             else:
-                raw_outputs = [llm.generate(*prompt) for prompt in prompts]
-            if len(raw_outputs) != len(prompts):
+                generated = [llm.generate(*prompt) for prompt in pending_prompts]
+            if len(generated) != len(pending_prompts):
                 raise ValueError(
-                    f"batch returned {len(raw_outputs)} outputs for {len(prompts)} prompts"
+                    f"batch returned {len(generated)} outputs for {len(pending_prompts)} prompts"
                 )
+            raw_outputs = [""] * len(prompts)
+            for position, value in cached_rows: raw_outputs[position] = value
+            for (position, key), value in zip(pending_meta, generated):
+                raw_outputs[position] = value
+                if cache: cache.put(key, value)
         except Exception as exc:
             print(f"[candidate_selector] batch lỗi: {exc} -> fallback", file=sys.stderr)
             raw_outputs = [""] * len(prompts)
         for index, prepared, raw_output in zip(pending_indexes, prepared_items, raw_outputs):
             results[index] = _finish_selection(raw_output, prepared)
+            audit[index].update({
+                "status": "selector_selected" if results[index] else "selector_abstained",
+                "selected_codes": list(results[index] or []), "raw_response": raw_output,
+            })
 
+    LAST_SELECTION_AUDIT = audit
+    select_candidates_many.last_audit = audit
     return [result or [] for result in results]

@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-rxnorm", action="store_true")
     parser.add_argument("--with-icd10", action="store_true")
     parser.add_argument("--with-llm-8b", action="store_true")
+    parser.add_argument("--with-llm-ner-editor", action="store_true")
+    parser.add_argument("--with-llm-linking-selector", action="store_true")
+    parser.add_argument("--deterministic-linking-only", action="store_true")
     parser.add_argument("--llm-model-id", default="Qwen/Qwen3-8B")
     parser.add_argument(
         "--llm-dtype", choices=("auto", "bfloat16", "float16"),
@@ -45,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-batch-size", type=int, default=4)
     parser.add_argument("--llm-cache-path", type=Path)
     parser.add_argument("--llm-audit-dir", type=Path)
+    parser.add_argument("--linking-selector-cache-path", type=Path)
+    parser.add_argument("--linking-selector-batch-size", type=int, default=4)
+    parser.add_argument("--rxnorm-retrieval-k", type=int, default=50)
+    parser.add_argument("--icd10-retrieval-k", type=int, default=50)
+    parser.add_argument("--linking-audit-dir", type=Path)
     parser.add_argument("--no-llm-recovery", action="store_true")
     parser.add_argument("--review-only-auto-add-eligible", action="store_true")
 
@@ -71,6 +79,17 @@ def _load_raw_texts(paths: list[Path]) -> dict[str, str]:
     return {path.stem: inference_io.read_text_file(path) for path in paths}
 
 
+def _write_stage_checkpoint(output_dir: Path | None, stage: str, payload) -> None:
+    if output_dir is None:
+        return
+    stage_dir = output_dir / ".stages"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    path = stage_dir / f"{stage}.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+    temporary.replace(path)
+
+
 def run(
     args: argparse.Namespace,
     input_paths: list[Path],
@@ -91,8 +110,10 @@ def run(
     raw_texts_by_id = raw_texts_by_id or _load_raw_texts(input_paths)
     predict_kwargs = {"apply_repair_gate": not args.no_repair_gate}
 
+    use_editor = args.with_llm_8b or args.with_llm_ner_editor
+    use_selector = (args.with_llm_8b or args.with_llm_linking_selector) and not args.deterministic_linking_only
     detailed_by_id = None
-    if args.with_llm_8b:
+    if use_editor:
         detailed_by_id = pipeline.run_ner_stage_detailed(
             raw_texts_by_id, **predict_kwargs,
         )
@@ -106,7 +127,7 @@ def run(
         )
 
     qwen_llm = None
-    if args.with_llm_8b:
+    if use_editor or use_selector:
         from ..llm.backend import LocalLLM
         from ..llm.config import QWEN3_8B_EDITOR_CONFIG
 
@@ -117,10 +138,11 @@ def run(
             load_in_4bit=args.llm_quantization == "4bit",
             batch_size=args.llm_batch_size,
         )
+        pipeline.ner_engine.offload_to_cpu()
         print(f"[cli] Đang load {llm_config.model_id}...", file=sys.stderr)
         qwen_llm = LocalLLM(llm_config)
         qwen_llm.load()
-        pipeline.ner_engine.offload_to_cpu()
+    if use_editor:
         entities_by_id = pipeline.run_qwen8b_ner_editor_stage(
             raw_texts_by_id,
             detailed_by_id,
@@ -140,11 +162,34 @@ def run(
                     encoding="utf-8",
                 )
 
+    _write_stage_checkpoint(args.output_dir, "ner", {
+        record_id: [entity.to_btc_dict([]) for entity in entities]
+        for record_id, entities in entities_by_id.items()
+    })
+
     candidates_by_id = pipeline.run_linking_stage(
         entities_by_id,
-        selector_llm=qwen_llm,
+        selector_llm=qwen_llm if use_selector else None,
         raw_texts_by_id=raw_texts_by_id,
+        selector_batch_size=args.linking_selector_batch_size,
+        selector_cache_path=args.linking_selector_cache_path,
+        model_id=args.llm_model_id,
+        retrieval_k_by_linker={
+            "rxnorm": args.rxnorm_retrieval_k,
+            "icd10": args.icd10_retrieval_k,
+        },
     )
+    _write_stage_checkpoint(args.output_dir, "linking", candidates_by_id)
+    if args.linking_audit_dir is not None:
+        args.linking_audit_dir.mkdir(parents=True, exist_ok=True)
+        for record_id, rows in pipeline.last_linking_retrieval.items():
+            audit = {str(index): [
+                item if isinstance(item, dict) else item.__dict__ for item in candidates
+            ] for index, candidates in rows.items()}
+            (args.linking_audit_dir / f"{record_id}.linking_audit.json").write_text(
+                json.dumps({"retrieval": audit, "selection": pipeline.last_linking_audit.get(record_id, {})},
+                           ensure_ascii=False, indent=2, default=str), encoding="utf-8",
+            )
     if qwen_llm is not None:
         qwen_llm.unload()
     return pipeline.build_outputs(entities_by_id, candidates_by_id)

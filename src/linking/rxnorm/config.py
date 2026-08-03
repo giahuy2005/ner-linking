@@ -61,6 +61,9 @@ DEFAULT_HISTORICAL_K = 200
 DENSE_WEIGHT = 0.28
 LEXICAL_WEIGHT = 0.12
 INGREDIENT_EXACT_BONUS = 0.30
+DETERMINISTIC_MIN_SCORE = 0.58
+DETERMINISTIC_MIN_MARGIN = 0.035
+AMBIGUITY_MARGIN = 0.08
 
 # --------------------------------------------------------------------------
 # Chuẩn hoá text: alias thuốc, cụm từ Việt -> Anh, viết tắt
@@ -72,6 +75,7 @@ DRUG_ALIAS_MAP = {
     "kali clorid": "potassium chloride",
     "adrenalin": "epinephrine",
     "acid acetylsalicylic": "aspirin",
+    "senna": "sennosides",
 }
 
 # value là cụm dose-form chuẩn (không phải release-type đơn thuần)

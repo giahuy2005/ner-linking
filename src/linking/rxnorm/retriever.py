@@ -9,14 +9,23 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:  # Lightweight repository/path tests do not need inference deps.
+    torch = None
+    F = None
+_inference_mode = torch.inference_mode if torch is not None else (lambda: (lambda function: function))
 from rapidfuzz import fuzz
-from transformers import AutoModel, AutoTokenizer
+try:
+    from transformers import AutoModel, AutoTokenizer
+except ImportError:
+    AutoModel = AutoTokenizer = None
 
 from . import config
 from .repository import RxNormRepository
 from .schemas import ParsedDrugMention, RxNormCandidate
+from .parser import normalize_text
 from ..sapbert_encoder import resolve_model_source
 
 from pathlib import Path
@@ -41,6 +50,8 @@ class SentenceEncoder:
     """
 
     def __init__(self, index_config: dict[str, Any], device: str | None = None):
+        if torch is None or AutoModel is None:
+            raise RuntimeError("PyTorch and transformers are required for RxNorm dense retrieval")
         model_cfg = index_config["model"]
 
         self.model_id = resolve_project_path(model_cfg["model_id"])
@@ -62,7 +73,7 @@ class SentenceEncoder:
                 f"!= config dimension={self.dimension}"
             )
 
-    @torch.inference_mode()
+    @_inference_mode()
     def encode(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
         outputs: list[np.ndarray] = []
 
@@ -193,16 +204,31 @@ class RxNormRetriever:
         if not rxcuis:
             return []
 
-        results: list[dict[str, Any]] = []
+        return self._rows_for_rxcuis(rxcuis, exact_ingredient_match=True)
 
-        for tier, rows in self.repository.metadata.items():
-            for row in rows:
-                if row is not None and row["rxcui"] in rxcuis:
-                    results.append(
-                        {**row, "tier": tier, "dense_score": 0.0, "exact_ingredient_match": True}
-                    )
-
+    def _rows_for_rxcuis(self, rxcuis, **flags) -> list[dict[str, Any]]:
+        results = []
+        for rxcui in dict.fromkeys(str(value) for value in rxcuis):
+            for tier, vector_id in self.repository.rows_by_rxcui.get(rxcui, []):
+                row = self.repository.metadata[tier][vector_id]
+                if row is not None:
+                    results.append({**row, "tier": tier, "dense_score": 0.0, **flags})
         return results
+
+    def inject_structured(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
+        if not parsed.ingredient_core:
+            return []
+        rxcuis: list[str] = []
+        for strength in parsed.strengths:
+            key = normalize_text(f"{parsed.ingredient_core} {strength}")
+            rxcuis.extend(self.repository.ingredient_strength_lookup.get(key, []))
+        for form in parsed.dose_forms:
+            key = normalize_text(f"{parsed.ingredient_core} {form}")
+            rxcuis.extend(self.repository.ingredient_form_lookup.get(key, []))
+        for release in parsed.release_types:
+            key = normalize_text(f"{parsed.ingredient_core} {release}")
+            rxcuis.extend(self.repository.ingredient_release_lookup.get(key, []))
+        return self._rows_for_rxcuis(rxcuis, exact_structured_match=True)
 
     # ------------------------------------------------------------
     # Gộp theo rxcui, giữ candidate priority tốt nhất cho mỗi tier gặp
@@ -239,6 +265,10 @@ class RxNormRetriever:
             candidate.exact_ingredient_match = candidate.exact_ingredient_match or row.get(
                 "exact_ingredient_match", False
             )
+            candidate.features["exact_structured_match"] = bool(
+                candidate.features.get("exact_structured_match")
+                or row.get("exact_structured_match", False)
+            )
 
             if row["text"] not in candidate.matched_terms:
                 candidate.matched_terms.append(row["text"])
@@ -255,71 +285,57 @@ class RxNormRetriever:
         return best
 
     def retrieve(self, parsed: ParsedDrugMention) -> dict[str, RxNormCandidate]:
-        merged: dict[str, RxNormCandidate] = {}
-
-        sources = (
-            ("full_query", self.search_full_query(parsed)),
-            ("core_query", self.search_core_query(parsed)),
-            ("exact_term", self.inject_exact_term(parsed)),
-            ("exact_ingredient", self.inject_exact_ingredient(parsed)),
-        )
-
-        for source_name, raw_results in sources:
-            batch = self.aggregate_by_rxcui(raw_results, source_name)
-
-            for rxcui, candidate in batch.items():
-                if rxcui not in merged:
-                    merged[rxcui] = candidate
-                    continue
-
-                existing = merged[rxcui]
-                existing.dense_score = max(existing.dense_score, candidate.dense_score)
-                existing.exact_term_match = existing.exact_term_match or candidate.exact_term_match
-                existing.exact_ingredient_match = (
-                    existing.exact_ingredient_match or candidate.exact_ingredient_match
-                )
-
-                for term in candidate.matched_terms:
-                    if term not in existing.matched_terms:
-                        existing.matched_terms.append(term)
-
-                for src in candidate.retrieval_sources:
-                    if src not in existing.retrieval_sources:
-                        existing.retrieval_sources.append(src)
-
-        for candidate in merged.values():
-            candidate.lexical_score = self._lexical_score(parsed, candidate)
-
-        return merged
+        return self.retrieve_many([parsed])[0]
 
     def retrieve_many(self, parsed_mentions: list[ParsedDrugMention]) -> list[dict[str, RxNormCandidate]]:
-        """High-recall retrieval for many mentions without per-mention encoding."""
+        """High-recall multi-variant retrieval with one unique-query encoding."""
         if not parsed_mentions:
             return []
-        full_queries = [item.normalized_text for item in parsed_mentions]
-        tier_rows = {
-            "product": self.search_tier_many(full_queries, "product", config.DEFAULT_PRODUCT_K),
-            "support": self.search_tier_many(full_queries, "support", config.DEFAULT_SUPPORT_K),
-            "historical": self.search_tier_many(full_queries, "historical", config.DEFAULT_HISTORICAL_K),
-        }
-        core_indexes = [index for index, item in enumerate(parsed_mentions) if item.ingredient_core]
-        core_queries = [parsed_mentions[index].ingredient_core for index in core_indexes]
-        core_rows = {index: [] for index in range(len(parsed_mentions))}
-        if core_queries:
-            support = self.search_tier_many(core_queries, "support", config.DEFAULT_SUPPORT_K)
-            product = self.search_tier_many(core_queries, "product", config.DEFAULT_PRODUCT_K)
-            for index, left, right in zip(core_indexes, support, product):
-                core_rows[index] = left + right
+        variants_by_mention = [item.query_variants or [{
+            "text": item.normalized_text, "source": "full_normalized",
+        }] for item in parsed_mentions]
+        unique_queries = list(dict.fromkeys(
+            variant["text"] for variants in variants_by_mention for variant in variants
+        ))
+        query_index = {value: index for index, value in enumerate(unique_queries)}
+        vectors = self.encoder.encode(unique_queries)
+        tier_rows: dict[str, list[list[dict[str, Any]]]] = {}
+        for tier, k in (
+            ("product", config.DEFAULT_PRODUCT_K),
+            ("support", config.DEFAULT_SUPPORT_K),
+            ("historical", config.DEFAULT_HISTORICAL_K),
+        ):
+            index = self.repository.indexes[tier]
+            scores, ids = index.search(vectors, min(k, index.ntotal))
+            metadata = self.repository.metadata[tier]
+            tier_rows[tier] = []
+            for row_scores, row_ids in zip(scores, ids):
+                values = []
+                for score, vector_id in zip(row_scores, row_ids):
+                    if vector_id < 0:
+                        continue
+                    row = metadata[int(vector_id)]
+                    if row is not None:
+                        values.append({**row, "tier": tier, "dense_score": float(score)})
+                tier_rows[tier].append(values)
 
         outputs = []
         for index, parsed in enumerate(parsed_mentions):
             merged: dict[str, RxNormCandidate] = {}
-            sources = (
-                ("full_query", tier_rows["product"][index] + tier_rows["support"][index] + tier_rows["historical"][index]),
-                ("core_query", core_rows[index]),
+            sources = []
+            for variant in variants_by_mention[index]:
+                query_row = query_index[variant["text"]]
+                rows = (
+                    tier_rows["product"][query_row]
+                    + tier_rows["support"][query_row]
+                    + tier_rows["historical"][query_row]
+                )
+                sources.append((f"query:{variant['source']}", rows))
+            sources.extend((
                 ("exact_term", self.inject_exact_term(parsed)),
                 ("exact_ingredient", self.inject_exact_ingredient(parsed)),
-            )
+                ("exact_structured", self.inject_structured(parsed)),
+            ))
             for source_name, raw_results in sources:
                 for rxcui, candidate in self.aggregate_by_rxcui(raw_results, source_name).items():
                     if rxcui not in merged:
@@ -329,9 +345,24 @@ class RxNormRetriever:
                     existing.dense_score = max(existing.dense_score, candidate.dense_score)
                     existing.exact_term_match |= candidate.exact_term_match
                     existing.exact_ingredient_match |= candidate.exact_ingredient_match
+                    existing.features["exact_structured_match"] = bool(
+                        existing.features.get("exact_structured_match")
+                        or candidate.features.get("exact_structured_match")
+                    )
                     existing.matched_terms.extend(term for term in candidate.matched_terms if term not in existing.matched_terms)
                     existing.retrieval_sources.extend(src for src in candidate.retrieval_sources if src not in existing.retrieval_sources)
             for candidate in merged.values():
                 candidate.lexical_score = self._lexical_score(parsed, candidate)
+                candidate.query_variants = list(candidate.retrieval_sources)
+            historical_current = []
+            for candidate in list(merged.values()):
+                if candidate.historical and candidate.current_rxcuis:
+                    historical_current.extend(candidate.current_rxcuis)
+            if historical_current:
+                for rxcui, candidate in self.aggregate_by_rxcui(
+                    self._rows_for_rxcuis(historical_current),
+                    "historical_current_mapping",
+                ).items():
+                    merged.setdefault(rxcui, candidate)
             outputs.append(merged)
         return outputs

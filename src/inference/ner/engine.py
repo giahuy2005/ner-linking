@@ -24,7 +24,12 @@ from . import offset_mapper as om
 from . import postprocessor as pp
 from . import repair_gate
 from . import sectioner
-from ..schemas import NerEntity, SectionResult
+from ..schemas import (
+    ASSERTION_ENTITY_TYPES,
+    NerEntity,
+    SectionResult,
+    normalize_assertions_for_type,
+)
 from .evidence import CrfMarginalEvidence, NerDetailedResult, SpanCandidateEvidence, WordEvidence
 
 
@@ -560,6 +565,8 @@ class NerEngine:
             word_starts, word_lengths = cached["word_starts"], cached["word_lengths"]
             spans = []
             for entity in global_entities:
+                if entity["type"] not in ASSERTION_ENTITY_TYPES:
+                    continue
                 global_start, global_end = entity["word_start"], entity["word_end"]
                 if global_start < chunk_start or global_end > chunk_end:
                     continue
@@ -629,6 +636,9 @@ class NerEngine:
                         active_assertions.append(label)
             if single_assertion:
                 active_assertions = pp.collapse_assertions(active_assertions)
+            active_assertions = normalize_assertions_for_type(
+                entity_type, active_assertions,
+            )
             confidences = [
                 global_tag_choices.get(index, (-1, "O", 0.0))[2]
                 for index in range(global_start, global_end)

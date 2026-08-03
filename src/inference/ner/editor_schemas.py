@@ -50,6 +50,29 @@ class MissingReasonCode(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
+@dataclass(frozen=True)
+class ReviewRegion:
+    request_id: str
+    record_id: str
+    context: str
+    context_start: int
+    context_end: int
+    candidate_ids: list[str]
+    reasons: list[str] = field(default_factory=list)
+    priority: int = 0
+    must_review: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.request_id or not self.record_id:
+            raise ValueError("review region IDs cannot be empty")
+        if not 0 <= self.context_start < self.context_end:
+            raise ValueError("invalid review context span")
+        if not self.candidate_ids or len(self.candidate_ids) > 8:
+            raise ValueError("review region must contain 1..8 candidates")
+        if len(self.candidate_ids) != len(set(self.candidate_ids)):
+            raise ValueError("review region candidate IDs must be unique")
+
+
 def _string_list(value: Any, field_name: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise TypeError(f"{field_name} must be list[str]")

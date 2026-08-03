@@ -7,6 +7,7 @@ Validation fail-fast trước output nằm trong ``io.validate_record_output``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Iterable
 
 
 VALID_ENTITY_TYPES = frozenset({
@@ -40,6 +41,24 @@ MAX_CANDIDATES_BY_TYPE = {
     "THUỐC": 1,
     "CHẨN_ĐOÁN": 2,
 }
+
+
+def normalize_assertions_for_type(entity_type: str, assertions: Iterable[str]) -> list[str]:
+    """Return schema-valid, deduplicated assertions for ``entity_type``."""
+    if entity_type not in ASSERTION_ENTITY_TYPES:
+        return []
+    return list(dict.fromkeys(
+        value for value in assertions if value in VALID_ASSERTIONS
+    ))
+
+
+def normalize_entity_schema(entity: "NerEntity") -> "NerEntity":
+    assertions = normalize_assertions_for_type(entity.type, entity.assertions)
+    if assertions == entity.assertions:
+        return entity
+    return NerEntity(
+        entity.text, entity.type, assertions, entity.position, entity.score, entity.flag,
+    )
 
 
 @dataclass

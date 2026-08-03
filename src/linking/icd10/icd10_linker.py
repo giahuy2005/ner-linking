@@ -27,7 +27,7 @@ def aggregate_term_results(
     top_k_codes: int,
     min_score: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep the maximum-scoring matched term for each ICD code."""
+    """Aggregate independent term/query evidence by ICD code."""
     if top_k_codes <= 0:
         raise ValueError("top_k_codes must be positive")
 
@@ -38,29 +38,48 @@ def aggregate_term_results(
             continue
         code = result["code"]
         current = by_code.get(code)
-        if current is None or score > current["score"]:
-            previous_evidence = list(current.get("matched_terms", [])) if current else []
-            by_code[code] = {
+        evidence = {
+            "text": result["text"], "score": score,
+            "language": result["language"], "term_type": result["term_type"],
+            "term_id": result["term_id"], "query_source": result.get("query_source", "raw"),
+        }
+        if current is None:
+            current = by_code[code] = {
                 "code": code,
                 "score": score,
                 "matched_term": result["text"],
                 "language": result["language"],
                 "term_type": result["term_type"],
                 "term_id": result["term_id"],
-                "matched_terms": [{
-                    "text": result["text"], "score": score,
-                    "language": result["language"], "term_type": result["term_type"],
-                }] + previous_evidence,
+                "matched_terms": [], "matched_term_details": [], "query_sources": [],
+                "exact_alias_source": result.get("exact_alias_source"),
             }
-        elif current is not None:
-            evidence = {
-                "text": result["text"], "score": score,
-                "language": result["language"], "term_type": result["term_type"],
-            }
-            if evidence not in current["matched_terms"]:
-                current["matched_terms"].append(evidence)
+        if score > current["score"]:
+            current.update(score=score, matched_term=result["text"], language=result["language"],
+                           term_type=result["term_type"], term_id=result["term_id"])
+        if result.get("exact_alias_source"):
+            current["exact_alias_source"] = result["exact_alias_source"]
+        if evidence not in current["matched_term_details"]:
+            current["matched_term_details"].append(evidence)
+            current["matched_terms"].append(evidence)
+        source = evidence["query_source"]
+        if source not in current["query_sources"]:
+            current["query_sources"].append(source)
 
-    ranked = sorted(by_code.values(), key=lambda item: (-item["score"], item["code"]))
+    for item in by_code.values():
+        top_scores = sorted((row["score"] for row in item["matched_term_details"]), reverse=True)[:3]
+        item["top_n_mean"] = sum(top_scores) / len(top_scores)
+        item["independent_term_count"] = len({row["term_id"] for row in item["matched_term_details"]})
+        item["query_variant_count"] = len(item["query_sources"])
+        item["aggregate_components"] = {
+            "max_dense": item["score"], "top_n_mean": item["top_n_mean"],
+            "term_count": item["independent_term_count"], "query_count": item["query_variant_count"],
+        }
+        item["aggregate_score"] = item["score"] + min(
+            .025, .005 * (item["independent_term_count"] - 1)
+        )
+
+    ranked = sorted(by_code.values(), key=lambda item: (-item["aggregate_score"], item["code"]))
     return ranked[:top_k_codes]
 
 
@@ -98,6 +117,22 @@ def _build_metadata_alias_codes(metadata: Iterable[dict[str, Any]]) -> dict[str,
     }
 
 
+def _build_metadata_alias_index(metadata: Iterable[dict[str, Any]]) -> dict[str, set[str]]:
+    aliases: dict[str, set[str]] = {}
+    for row in metadata:
+        normalized = _normalize_alias(str(row.get("text", "")))
+        if not normalized:
+            continue
+        forms = {normalized}
+        if row.get("term_type") == "preferred":
+            shortened = re.sub(r"^(?:b\u1ec7nh|h\u1ed9i ch\u1ee9ng|ch\u1ee9ng)\s+", "", normalized).strip()
+            if len(shortened) >= 3:
+                forms.add(shortened)
+        for form in forms:
+            aliases.setdefault(form, set()).add(str(row["code"]))
+    return aliases
+
+
 def _exact_alias_result(
     mention: str,
     metadata_alias_codes: dict[str, str] | None = None,
@@ -113,6 +148,7 @@ def _exact_alias_result(
     return [{
         "code": code,
         "score": 1.0,
+        "text": mention,
         "matched_term": mention,
         "language": "vi",
         "term_type": source,
@@ -142,7 +178,15 @@ def _query_variants(mention: str) -> list[str]:
     ).strip()
     if len(suffix_trimmed) >= 3 and suffix_trimmed not in variants:
         variants.append(suffix_trimmed)
-    return variants
+    parenthetical = re.search(r"\(([^()]{2,80})\)", raw)
+    if parenthetical:
+        variants.extend([parenthetical.group(1), re.sub(r"\s*\([^()]+\)\s*", " ", raw).strip()])
+    punctuation = re.sub(r"[-_/]+", " ", normalized)
+    variants.append(re.sub(r"\s+", " ", punctuation).strip())
+    folded = "".join(char for char in unicodedata.normalize("NFD", normalized)
+                     if unicodedata.category(char) != "Mn")
+    variants.append(folded)
+    return list(dict.fromkeys(value for value in variants if len(value) >= 2))
 
 
 def _finalize_term_results(
@@ -208,6 +252,7 @@ class Icd10Linker:
         self.index = faiss.read_index(str(index_path))
         self.metadata = self._load_metadata(metadata_path)
         self.metadata_alias_codes = _build_metadata_alias_codes(self.metadata)
+        self.metadata_alias_index = _build_metadata_alias_index(self.metadata)
         expected_count = int(self.config["embedding"]["count"])
         expected_dimension = int(self.config["model"]["dimension"])
         if self.index.ntotal != expected_count or len(self.metadata) != expected_count:
@@ -325,7 +370,8 @@ class Icd10Linker:
         if not cleaned:
             return []
         variants_by_mention = [_query_variants(mention) for mention in cleaned]
-        flat_variants = [variant for variants in variants_by_mention for variant in variants]
+        flat_variants = list(dict.fromkeys(variant for variants in variants_by_mention for variant in variants))
+        variant_index = {value: index for index, value in enumerate(flat_variants)}
         queries = self.encoder.encode(
             flat_variants,
             batch_size=self.query_batch_size,
@@ -335,19 +381,20 @@ class Icd10Linker:
         count = min(top_k_terms, int(self.index.ntotal))
         scores, indices = self.index.search(queries, count)
         output = []
-        cursor = 0
         for mention, variants in zip(cleaned, variants_by_mention):
             exact = _exact_alias_result(mention, self.metadata_alias_codes)
-            if exact is not None:
-                output.append(exact)
-                cursor += len(variants)
-                continue
             term_results = []
-            for row_scores, row_indices in zip(
-                scores[cursor:cursor + len(variants)], indices[cursor:cursor + len(variants)],
-            ):
-                term_results.extend(self._term_results_from_search(row_scores, row_indices))
-            cursor += len(variants)
+            for variant in variants:
+                row_index = variant_index[variant]
+                rows = self._term_results_from_search(scores[row_index], indices[row_index])
+                for row in rows:
+                    row["query_source"] = variant
+                term_results.extend(rows)
+            if exact is not None:
+                for row in exact:
+                    row["query_source"] = "exact_unique_metadata_alias"
+                    row["exact_alias_source"] = row["term_type"]
+                term_results.extend(exact)
             output.append(
                 _finalize_term_results(
                     mention,
@@ -358,20 +405,51 @@ class Icd10Linker:
             )
         return output
 
+    def retrieve_many(self, mentions: Iterable[str], **kwargs) -> list[list[dict[str, Any]]]:
+        return self.link_many(mentions, **kwargs)
+
+    def rank_many(self, mentions: Iterable[str], **kwargs) -> list[list[dict[str, Any]]]:
+        return self.link_many(mentions, **kwargs)
+
+    def predict_many(self, mentions: Iterable[str], **kwargs) -> list[list[dict[str, Any]]]:
+        outputs = []
+        mention_list = list(mentions)
+        ranked_many = self.link_many(mention_list, top_k_codes=max(10, kwargs.pop("top_k_codes", 10)), **kwargs)
+        for mention, ranked in zip(mention_list, ranked_many):
+            exact = _exact_alias_result(mention, self.metadata_alias_codes)
+            if exact is not None:
+                outputs.append(exact[:1]); continue
+            if not ranked:
+                outputs.append([]); continue
+            top = ranked[0]
+            second_score = float(ranked[1]["score"]) if len(ranked) > 1 else 0.0
+            mention_tokens = set(re.findall(r"\w+", _normalize_alias(mention)))
+            label_tokens = set(re.findall(r"\w+", _normalize_alias(top["matched_term"])))
+            lexical_coverage = len(mention_tokens & label_tokens) / max(1, len(mention_tokens))
+            unsupported = label_tokens - mention_tokens
+            top["lexical_coverage"] = lexical_coverage
+            top["over_specific"] = bool(unsupported and lexical_coverage < 1.0)
+            top["top1_margin"] = float(top["score"]) - second_score
+            if float(top["score"]) >= .78 and lexical_coverage >= .75 and not top["over_specific"] and top["top1_margin"] >= .04:
+                outputs.append([top])
+            else:
+                outputs.append([])
+        return outputs
+
     def predict(
         self,
         mention: str,
         *,
         top_k_terms: int = config.DEFAULT_TOP_K_TERMS,
         min_score: float | None = config.DEFAULT_MIN_SCORE,
+        retrieval_k_codes: int = 10,
+        max_candidates: int = 1,
     ) -> list[dict[str, Any]]:
         """Conservative non-LLM final policy, distinct from high-recall link()."""
-        exact = _exact_alias_result(mention, self.metadata_alias_codes)
-        if exact is not None:
-            return exact[:1]
-        # Dense rank alone is not calibrated enough for a final code. Ambiguous
-        # cases are intentionally left for the whitelisted selector or abstain.
-        return []
+        return self.predict_many(
+            [mention], top_k_terms=top_k_terms,
+            top_k_codes=max(retrieval_k_codes, max_candidates), min_score=min_score,
+        )[0][:max_candidates]
 
 
 def parse_args() -> argparse.Namespace:

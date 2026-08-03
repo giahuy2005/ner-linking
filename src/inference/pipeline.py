@@ -67,6 +67,8 @@ class InferencePipeline:
         self.last_detailed_results = {}
         self.last_editor_audit = {}
         self.last_linking_retrieval = {}
+        self.last_linking_audit = {}
+        self.last_schema_normalization = {}
 
     @classmethod
     def load(
@@ -189,7 +191,18 @@ class InferencePipeline:
                 if not body.strip():
                     continue
                 block_start = int(block["start"])
-                detail = self.ner_engine.predict_text_detailed(body, **predict_kwargs)
+                try:
+                    detail = self.ner_engine.predict_text_detailed(body, **predict_kwargs)
+                except Exception as exc:
+                    combined.logs.append({
+                        "level": "error", "event": "section_inference_failed",
+                        "block_id": block_id, "error": str(exc),
+                    })
+                    print(
+                        f"[pipeline] NER section failed record={record_id} block={block_id}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
 
                 def shift_entity(entity):
                     start, end = entity.position
@@ -237,75 +250,169 @@ class InferencePipeline:
         cache_path: str | Path | None = None,
         model_id: str = "Qwen/Qwen3-8B",
     ) -> dict[str, list[NerEntity]]:
-        """Build stable catalogs and run one locked-editor batch."""
-        from .ner.candidates import build_candidate_catalog, build_missing_proposals
+        """Run bounded region reviews; failures fall back only for that region."""
+        from .ner.candidates import (
+            build_candidate_catalog,
+            build_missing_proposals,
+            build_review_regions,
+        )
         from .ner.qwen_editor import (
             apply_editor_response, apply_missing_decisions, build_editor_request,
             build_missing_request, parse_missing_response,
             generate_with_cache, VersionedJsonlCache,
         )
+        from .schemas import normalize_entity_schema
 
-        record_ids, catalogs, prompts = [], {}, []
+        catalogs, regions_by_id = {}, {}
+        prompt_entries: list[tuple[str, object, list, tuple[str, str]]] = []
         for record_id, detailed in detailed_by_id.items():
             raw_text = raw_texts_by_id[record_id]
             catalog = build_candidate_catalog(record_id, raw_text, detailed)
             catalogs[record_id] = catalog
-            if catalog:
-                record_ids.append(record_id)
-                prompts.append(build_editor_request(record_id, raw_text, 0, catalog))
+            by_id = {item.candidate_id: item for item in catalog}
+            regions = build_review_regions(record_id, raw_text, catalog)
+            regions_by_id[record_id] = regions
+            for region in regions:
+                targets = [by_id[candidate_id] for candidate_id in region.candidate_ids]
+                prompt_entries.append((record_id, region, targets, build_editor_request(region, targets)))
         cache = VersionedJsonlCache(cache_path) if cache_path is not None else None
-        raw_outputs = generate_with_cache(
-            qwen_llm, prompts, batch_size=batch_size, model_id=model_id,
-            task="ner_editor", cache=cache,
-        )
+        raw_outputs = [""] * len(prompt_entries)
+        for token_budget in (256, 384, 512):
+            indexes = [index for index, item in enumerate(prompt_entries) if (
+                256 if len(item[2]) <= 2 else 384 if len(item[2]) <= 4 else 512
+            ) == token_budget]
+            generated = generate_with_cache(
+                qwen_llm, [prompt_entries[index][3] for index in indexes],
+                batch_size=batch_size, model_id=model_id,
+                task=f"ner_editor:max{token_budget}", cache=cache,
+                max_new_tokens=token_budget,
+            )
+            for index, response in zip(indexes, generated):
+                raw_outputs[index] = response
         outputs = {
-            record_id: list(detailed.final_entities)
+            record_id: [normalize_entity_schema(item) for item in detailed.final_entities]
             for record_id, detailed in detailed_by_id.items()
         }
-        audit = {}
-        proposals_by_id = {}
-        for record_id, raw_output in zip(record_ids, raw_outputs):
-            result = apply_editor_response(
-                raw_texts_by_id[record_id], catalogs[record_id], raw_output,
-            )
-            outputs[record_id] = result.entities
-            proposals = build_missing_proposals(
-                record_id, raw_texts_by_id[record_id], catalogs[record_id],
-            )
-            if review_only_auto_add_eligible:
-                proposals = [item for item in proposals if item.auto_add_eligible]
-            proposals_by_id[record_id] = proposals
-            audit[record_id] = {
+        audit = {
+            record_id: {
                 "candidate_catalog": [item.__dict__ for item in catalogs[record_id]],
-                "missing_proposals": [item.__dict__ for item in proposals],
+                "regions": [],
+                "summary": {
+                    "catalog_count": len(catalogs[record_id]),
+                    "region_count": len(regions_by_id[record_id]),
+                    "reviewed_candidate_count": sum(
+                        len(region.candidate_ids) for region in regions_by_id[record_id]
+                    ),
+                    "applied": 0, "rejected": 0, "unresolved": 0,
+                    "parse_success": 0, "parse_failure": 0,
+                },
+            }
+            for record_id in detailed_by_id
+        }
+        for (record_id, region, targets, _prompt), raw_output in zip(prompt_entries, raw_outputs):
+            result = apply_editor_response(
+                raw_texts_by_id[record_id], targets, raw_output,
+                context_start=region.context_start,
+                validation_candidates=catalogs[record_id],
+            )
+            target_keys = {
+                (item.position[0], item.position[1], item.type)
+                for item in targets if item.pre_llm_selected
+            }
+            retained = [
+                entity for entity in outputs[record_id]
+                if (entity.position[0], entity.position[1], entity.type) not in target_keys
+            ]
+            retained.extend(normalize_entity_schema(item) for item in result.entities)
+            dedup = {(item.position[0], item.position[1], item.type): item for item in retained}
+            outputs[record_id] = sorted(dedup.values(), key=lambda item: (*item.position, item.type))
+            parse_failed = any(item.get("reason") == "invalid_json" for item in result.rejected)
+            audit[record_id]["regions"].append({
+                "request_id": region.request_id,
+                "context_start": region.context_start,
+                "context_end": region.context_end,
+                "candidate_ids": list(region.candidate_ids),
+                "reasons": list(region.reasons),
                 "raw_response": raw_output,
                 "applied": result.applied,
                 "rejected": result.rejected,
                 "unresolved": result.unresolved,
-            }
-        if include_recovery:
-            missing_ids = [record_id for record_id in record_ids if proposals_by_id.get(record_id)]
-            missing_prompts = [
-                build_missing_request(
-                    f"{record_id}:missing", raw_texts_by_id[record_id], 0,
-                    proposals_by_id[record_id],
-                )
-                for record_id in missing_ids
-            ]
-            missing_outputs = generate_with_cache(
-                qwen_llm, missing_prompts, batch_size=batch_size, model_id=model_id,
-                task="missing_proposal", cache=cache,
+                "parse_success": not parse_failed,
+            })
+            summary = audit[record_id]["summary"]
+            summary["applied"] += len(result.applied)
+            summary["rejected"] += len(result.rejected)
+            summary["unresolved"] += len(result.unresolved)
+            summary["parse_failure" if parse_failed else "parse_success"] += 1
+
+        proposals_by_id = {}
+        missing_entries: list[tuple[str, list, int, tuple[str, str]]] = []
+        for record_id, catalog in catalogs.items():
+            proposals = build_missing_proposals(
+                record_id, raw_texts_by_id[record_id], catalog,
             )
-            for record_id, raw_output in zip(missing_ids, missing_outputs):
+            if review_only_auto_add_eligible or include_recovery:
+                proposals = [item for item in proposals if item.auto_add_eligible]
+            proposals_by_id[record_id] = proposals
+            audit[record_id]["missing_proposals"] = [item.__dict__ for item in proposals]
+            proposal_groups: list[list] = []
+            for proposal in proposals:
+                if (
+                    not proposal_groups
+                    or len(proposal_groups[-1]) >= 6
+                    or proposal.position[0] - proposal_groups[-1][-1].position[1] > 80
+                ):
+                    proposal_groups.append([])
+                proposal_groups[-1].append(proposal)
+            for chunk_index, chunk in enumerate(proposal_groups):
+                if not chunk:
+                    continue
+                core_start = min(item.position[0] for item in chunk)
+                core_end = max(item.position[1] for item in chunk)
+                context_start = max(0, core_start - 240)
+                context_end = min(len(raw_texts_by_id[record_id]), core_end + 240)
+                request_id = f"{record_id}:missing:{chunk_index:04d}"
+                prompt = build_missing_request(
+                    request_id,
+                    raw_texts_by_id[record_id][context_start:context_end],
+                    context_start,
+                    chunk,
+                )
+                missing_entries.append((record_id, chunk, context_start, prompt))
+        if include_recovery:
+            missing_outputs = [""] * len(missing_entries)
+            for token_budget in (224, 352, 480):
+                indexes = [index for index, item in enumerate(missing_entries) if (
+                    224 if len(item[1]) <= 2 else 352 if len(item[1]) <= 4 else 480
+                ) == token_budget]
+                generated = generate_with_cache(
+                    qwen_llm, [missing_entries[index][3] for index in indexes],
+                    batch_size=batch_size, model_id=model_id,
+                    task=f"missing_proposal:max{token_budget}", cache=cache,
+                    max_new_tokens=token_budget,
+                )
+                for index, response in zip(indexes, generated):
+                    missing_outputs[index] = response
+            for (record_id, proposals, _context_start, _prompt), raw_output in zip(
+                missing_entries, missing_outputs,
+            ):
                 decisions, rejected = parse_missing_response(raw_output)
                 missing_result = apply_missing_decisions(
                     raw_texts_by_id[record_id], outputs[record_id],
-                    proposals_by_id[record_id], decisions,
+                    proposals, decisions,
                 )
-                outputs[record_id] = missing_result.entities
-                audit[record_id]["missing_raw_response"] = raw_output
-                audit[record_id]["missing_applied"] = missing_result.applied
-                audit[record_id]["missing_rejected"] = rejected + missing_result.rejected
+                outputs[record_id] = [
+                    normalize_entity_schema(item) for item in missing_result.entities
+                ]
+                audit[record_id].setdefault("missing_regions", []).append({
+                    "proposal_ids": [item.proposal_id for item in proposals],
+                    "raw_response": raw_output,
+                    "applied": missing_result.applied,
+                    "rejected": rejected + missing_result.rejected,
+                    "unresolved": missing_result.unresolved,
+                })
+        for record_id, entities in outputs.items():
+            outputs[record_id] = [normalize_entity_schema(item) for item in entities]
         self.last_editor_audit = audit
         return outputs
 
@@ -396,6 +503,7 @@ class InferencePipeline:
         entities_by_id: dict[str, list[NerEntity]],
         *,
         top_k: int | None = None,
+        top_k_by_linker: dict[str, int] | None = None,
     ) -> dict[str, dict[int, list]]:
         """Retrieve all mentions by ontology, using one encoder batch when supported."""
         from .rule.clinical import is_linkable_entity
@@ -413,13 +521,14 @@ class InferencePipeline:
             if not items:
                 continue
             linker = self._linkers[linker_name]
+            linker_top_k = (top_k_by_linker or {}).get(linker_name, top_k)
             mentions = [item[2].text for item in items]
             try:
                 if hasattr(linker, "link_many"):
                     if linker_name == "icd10":
-                        batches = linker.link_many(mentions, top_k_codes=top_k)
+                        batches = linker.link_many(mentions, top_k_codes=linker_top_k)
                     else:
-                        batches = linker.link_many(mentions, top_k=top_k)
+                        batches = linker.link_many(mentions, top_k=linker_top_k)
                 else:
                     batches = []
                     for mention in mentions:
@@ -442,6 +551,9 @@ class InferencePipeline:
         *,
         selector_llm=None,
         raw_texts_by_id: dict[str, str] | None = None,
+        batch_size: int = 4,
+        cache_path: str | Path | None = None,
+        model_id: str = "Qwen/Qwen3-8B",
     ) -> dict[str, dict[int, list[str]]]:
         from .selection.candidate_selector import select_candidates_many, select_supported_top_candidates
 
@@ -468,14 +580,26 @@ class InferencePipeline:
                     "candidates": candidates, "context": context,
                 })
         if selector_llm is None:
+            self.last_linking_audit = {
+                rid: {index: {"status": "deterministic_only", "selected_codes": codes}
+                      for index, codes in rows.items()}
+                for rid, rows in results.items()
+            }
             return results
         selected_batches = select_candidates_many(
             selector_items,
             selector_llm,
             top_k_context=self.top_k_candidates,
+            batch_size=batch_size,
+            cache_path=cache_path,
+            model_id=model_id,
         )
         for (rid, index), selected in zip(destinations, selected_batches):
             results[rid][index] = selected
+        selector_audit = getattr(select_candidates_many, "last_audit", [])
+        self.last_linking_audit = {rid: {} for rid in entities_by_id}
+        for (rid, index), row in zip(destinations, selector_audit):
+            self.last_linking_audit[rid][index] = row
         return results
 
     def run_linking_stage(
@@ -484,11 +608,21 @@ class InferencePipeline:
         *,
         selector_llm=None,
         raw_texts_by_id: dict[str, str] | None = None,
+        selector_batch_size: int = 4,
+        selector_cache_path: str | Path | None = None,
+        model_id: str = "Qwen/Qwen3-8B",
+        retrieval_k: int | None = None,
+        retrieval_k_by_linker: dict[str, int] | None = None,
     ) -> dict[str, dict[int, list[str]]]:
-        retrieval = self.run_linking_retrieval_stage_batch(entities_by_id)
+        retrieval = self.run_linking_retrieval_stage_batch(
+            entities_by_id, top_k=retrieval_k, top_k_by_linker=retrieval_k_by_linker,
+        )
         return self.run_qwen8b_linking_selector_stage(
             entities_by_id, retrieval, selector_llm=selector_llm,
             raw_texts_by_id=raw_texts_by_id,
+            batch_size=selector_batch_size,
+            cache_path=selector_cache_path,
+            model_id=model_id,
         )
 
     # ------------------------------------------------------------
@@ -499,10 +633,31 @@ class InferencePipeline:
         entities_by_id: dict[str, list[NerEntity]],
         candidates_by_id: dict[str, dict[int, list[str]]],
     ) -> dict[str, list[dict]]:
-        return {
-            rid: inference_io.build_record_output(entities, candidates_by_id.get(rid, {}))
-            for rid, entities in entities_by_id.items()
-        }
+        from .schemas import normalize_entity_schema
+
+        outputs = {}
+        normalization_audit = {}
+        for rid, entities in entities_by_id.items():
+            normalized = []
+            changes = []
+            for index, entity in enumerate(entities):
+                safe = normalize_entity_schema(entity)
+                if safe.assertions != entity.assertions:
+                    changes.append({
+                        "entity_index": index,
+                        "type": entity.type,
+                        "position": list(entity.position),
+                        "old_assertions": list(entity.assertions),
+                        "new_assertions": list(safe.assertions),
+                        "reason": "assertion_not_allowed_for_type",
+                    })
+                normalized.append(safe)
+            outputs[rid] = inference_io.build_record_output(
+                normalized, candidates_by_id.get(rid, {}),
+            )
+            normalization_audit[rid] = changes
+        self.last_schema_normalization = normalization_audit
+        return outputs
 
     # ------------------------------------------------------------
     # Tiện ích test nhanh 1 record/file — load/unload LLM (nếu có) NGAY

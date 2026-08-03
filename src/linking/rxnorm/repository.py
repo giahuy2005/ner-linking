@@ -144,6 +144,10 @@ class RxNormRepository:
 
         self.exact_term_lookup: dict[str, list[tuple[str, int]]] = {}
         self.core_lookup: dict[str, list[str]] = {}
+        self.rows_by_rxcui: dict[str, list[tuple[str, int]]] = {}
+        self.ingredient_strength_lookup: dict[str, list[str]] = {}
+        self.ingredient_form_lookup: dict[str, list[str]] = {}
+        self.ingredient_release_lookup: dict[str, list[str]] = {}
         self._build_exact_lookups()
 
     # ----------------------------------------------------------------
@@ -389,6 +393,9 @@ class RxNormRepository:
 
                 term_key = normalize_text(row["text"])
                 self.exact_term_lookup.setdefault(term_key, []).append((tier, row["vector_id"]))
+                self.rows_by_rxcui.setdefault(row["rxcui"], []).append(
+                    (tier, row["vector_id"])
+                )
 
         for rxcui, record in self.clean_by_rxcui.items():
             for ingredient in record.get("ingredients", []):
@@ -398,3 +405,21 @@ class RxNormRepository:
 
                 key = normalize_text(str(name))
                 self.core_lookup.setdefault(key, []).append(rxcui)
+                for strength in record.get("strengths", []):
+                    composite = normalize_text(f"{name} {strength}")
+                    self.ingredient_strength_lookup.setdefault(composite, []).append(rxcui)
+                for dose_form in record.get("dose_forms", []):
+                    composite = normalize_text(f"{name} {dose_form}")
+                    self.ingredient_form_lookup.setdefault(composite, []).append(rxcui)
+                for release in record.get("release_types", []):
+                    composite = normalize_text(f"{name} {release}")
+                    self.ingredient_release_lookup.setdefault(composite, []).append(rxcui)
+
+        for lookup in (
+            self.core_lookup,
+            self.ingredient_strength_lookup,
+            self.ingredient_form_lookup,
+            self.ingredient_release_lookup,
+        ):
+            for key, values in lookup.items():
+                lookup[key] = list(dict.fromkeys(values))

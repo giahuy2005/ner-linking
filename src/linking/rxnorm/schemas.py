@@ -19,6 +19,10 @@ class ParsedDrugMention:
     route: str | None = None
     frequency: str | None = None
     interval_hours: int | None = None
+    ingredient_aliases: list[str] = field(default_factory=list)
+    parse_warnings: list[str] = field(default_factory=list)
+    token_spans: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    query_variants: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -45,3 +49,8 @@ class RxNormCandidate:
 
     structured: dict[str, Any] = field(default_factory=dict)
     features: dict[str, Any] = field(default_factory=dict)
+    query_variants: list[str] = field(default_factory=list)
+    support_level: str = "weak"
+    rejection_reasons: list[str] = field(default_factory=list)
+    evidence_completeness: float = 0.0
+    top1_margin: float | None = None

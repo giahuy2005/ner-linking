@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import config
 from .parser import parse_drug_mention
 from .reranker import RxNormRuleReranker
 from .repository import RxNormRepository
@@ -34,28 +35,38 @@ class RxNormLinker:
 
     def link_many(self, mentions: list[str], top_k: int = 10) -> list[list]:
         """Parse, encode, retrieve, and rerank a mention batch."""
+        return self.rank_many(mentions, top_k=top_k)
+
+    def retrieve_many(self, mentions: list[str]):
         parsed_mentions = [parse_drug_mention(mention) for mention in mentions]
         retrieved = self.retriever.retrieve_many(parsed_mentions)
+        return parsed_mentions, retrieved
+
+    def rank_many(self, mentions: list[str], top_k: int = 50) -> list[list]:
+        parsed_mentions, retrieved = self.retrieve_many(mentions)
         return [
             self.reranker.rerank(parsed, list(candidates.values()))[:top_k]
             for parsed, candidates in zip(parsed_mentions, retrieved)
         ]
 
+    def predict_many(self, mentions: list[str]) -> list[list]:
+        outputs = []
+        for candidates in self.rank_many(mentions, top_k=10):
+            if not candidates:
+                outputs.append([])
+                continue
+            top = candidates[0]
+            unique_exact = top.support_level == "exact" and not any(
+                item.support_level == "exact" for item in candidates[1:]
+            )
+            if top.support_level in {"exact", "strong"} and not top.rejection_reasons and (
+                unique_exact or (top.top1_margin or 0.0) >= config.DETERMINISTIC_MIN_MARGIN
+            ):
+                outputs.append([top])
+            else:
+                outputs.append([])
+        return outputs
+
     def predict(self, mention: str) -> list:
         """Conservative final RxNorm result; ambiguous retrieval abstains."""
-        result = self.link(mention, top_k=10)
-        candidates = result["candidates"]
-        if not candidates:
-            return []
-        top = candidates[0]
-        features = top.features or {}
-        no_conflict = all(
-            features.get(name) not in {"mismatch", "order_dose_mismatch"}
-            for name in ("strength_relation", "form_relation", "release_relation")
-        )
-        if no_conflict and (
-            top.exact_term_match
-            or features.get("ingredient_relation") == "exact" and top.final_score >= 0.60
-        ):
-            return [top]
-        return []
+        return self.predict_many([mention])[0]

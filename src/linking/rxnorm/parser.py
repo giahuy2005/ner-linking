@@ -219,6 +219,14 @@ def extract_drug_core(text: str) -> str | None:
     """Lấy phần tên hoạt chất/thuốc, trước khi gặp số liều/dose form đầu tiên."""
 
     normalized = _semantic_normalize(text)
+    # Route/frequency/PRN are administration instructions, never ingredients.
+    for pattern in config.NOISE_PATTERNS:
+        normalized = re.sub(pattern, " ", normalized)
+    normalized = re.sub(r"\b(?:iv|im|sc|sq|top|ophth|sl|prn)\b", " ", normalized)
+    # A bare liquid unit ("guaifenesin ml") is a form hint, not part of the
+    # ingredient and not a measurable quantity without a number.
+    normalized = re.sub(r"\b(?:ml|l)\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
 
     cut_positions = []
 
@@ -233,7 +241,7 @@ def extract_drug_core(text: str) -> str | None:
             cut_positions.append(idx)
 
     core = normalized if not cut_positions else normalized[: min(cut_positions)]
-    core = core.strip()
+    core = core.strip(" \t\r\n:;,.-/")
 
     return core or None
 
@@ -255,10 +263,16 @@ def parse_drug_mention(mention: str) -> ParsedDrugMention:
     strengths = parse_strengths(mention)
     dose_forms = parse_dose_forms(mention)
 
-    return ParsedDrugMention(
+    core = extract_drug_core(mention)
+    warnings = []
+    semantic = _semantic_normalize(mention)
+    if re.search(r"(?<!\d)\b(?:ml|l)\b", semantic) and not parse_quantity(mention):
+        warnings.append("bare_liquid_unit_without_quantity")
+    parsed = ParsedDrugMention(
         raw_text=mention,
         normalized_text=normalize_text(mention),
-        ingredient_core=extract_drug_core(mention),
+        ingredient_core=core,
+        ingredient_aliases=[core] if core else [],
         strengths=strengths,
         strength_role=classify_strength_role(strengths),
         dose_forms=dose_forms,
@@ -267,4 +281,45 @@ def parse_drug_mention(mention: str) -> ParsedDrugMention:
         route=parse_route(mention),
         frequency=parse_frequency(mention)[0],
         interval_hours=parse_frequency(mention)[1],
+        parse_warnings=warnings,
     )
+    parsed.query_variants = build_query_variants(parsed)
+    return parsed
+
+
+def build_query_variants(parsed: ParsedDrugMention) -> list[dict[str, str]]:
+    """Return deduplicated, auditable retrieval interpretations."""
+    values: list[tuple[str, str]] = [("full_normalized", parsed.normalized_text)]
+    core = parsed.ingredient_core or ""
+    if core:
+        values.append(("ingredient_core", core))
+        for strength in parsed.strengths:
+            values.append(("ingredient_strength", f"{core} {strength}"))
+        for form in parsed.dose_forms:
+            values.append(("ingredient_form", f"{core} {form}"))
+        for release in parsed.release_types:
+            values.append(("ingredient_release", f"{core} {release}"))
+        for strength in parsed.strengths:
+            for form in parsed.dose_forms:
+                values.append(("ingredient_strength_form", f"{core} {strength} {form}"))
+        if "bare_liquid_unit_without_quantity" in parsed.parse_warnings:
+            values.extend([
+                ("liquid_form_hint", f"{core} oral solution"),
+                ("liquid_form_hint", f"{core} oral suspension"),
+            ])
+        if parsed.strength_role == "range" and parsed.strengths:
+            match = re.match(r"([0-9.]+)-([0-9.]+)\s+(.+)", parsed.strengths[0])
+            if match:
+                low, high, unit = match.groups()
+                values.extend([
+                    ("range_lower_endpoint", f"{core} {low} {unit}"),
+                    ("range_upper_endpoint", f"{core} {high} {unit}"),
+                ])
+    output, seen = [], set()
+    for source, text in values:
+        normalized = normalize_text(text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append({"text": normalized, "source": source})
+    return output

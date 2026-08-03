@@ -1,13 +1,9 @@
-"""Rule-based reranker: dense/lexical score + feature so khớp mention <-> candidate.
-
-Khi clonazepam bị phạt sai -> sửa compare_strength().
-Khi nystatin bị ép sang SCD -> sửa tty_prior() / TTY_BONUS_TABLE.
-Khi felodipine chen vào amlodipine -> sửa ingredient_gate().
-"""
+"""Structured RxNorm reranking with hard conflicts and calibrated support."""
 
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from rapidfuzz import fuzz
@@ -18,204 +14,197 @@ from .schemas import ParsedDrugMention, RxNormCandidate
 
 
 class RxNormRuleReranker:
-    # ------------------------------------------------------------
-    # Specificity của mention (dùng để chọn TTY_BONUS_TABLE phù hợp)
-    # ------------------------------------------------------------
+    _STRENGTH_RE = re.compile(
+        r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>mcg|mg|g|meq|iu|units?|unit)\b", re.I
+    )
+    _UNIT_FACTOR = {
+        "mcg": Decimal("0.001"), "mg": Decimal("1"), "g": Decimal("1000"),
+        "meq": Decimal("1"), "iu": Decimal("1"), "unit": Decimal("1"),
+        "units": Decimal("1"),
+    }
 
     @staticmethod
     def mention_specificity(parsed: ParsedDrugMention) -> str:
-        has_strength = bool(parsed.strengths)
-        has_form = bool(parsed.dose_forms)
-
-        if has_strength and has_form:
+        if parsed.strengths and parsed.dose_forms:
             return "full_product"
-        if has_strength:
+        if parsed.strengths:
             return "ingredient_strength"
-        if has_form:
+        if parsed.dose_forms:
             return "ingredient_form"
         return "ingredient_only"
 
-    # ------------------------------------------------------------
-    # Ingredient gate: candidate có đúng hoạt chất với mention không
-    # ------------------------------------------------------------
+    @classmethod
+    def _strength_values(cls, values: list[str]) -> list[tuple[Decimal, str]]:
+        output = []
+        for item in values:
+            for match in cls._STRENGTH_RE.finditer(normalize_text(str(item))):
+                unit = match.group("unit").lower()
+                try:
+                    number = Decimal(match.group("value")) * cls._UNIT_FACTOR[unit]
+                except (InvalidOperation, KeyError):
+                    continue
+                family = "mass" if unit in {"mcg", "mg", "g"} else unit.rstrip("s")
+                output.append((number, family))
+        return output
 
     def ingredient_gate(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> str:
-        names: list[str] = []
-
-        for ingredient in candidate.structured.get("ingredients", []):
-            name = ingredient.get("name") if isinstance(ingredient, dict) else ingredient
-            if name:
-                names.append(str(name))
-
-        for precise in candidate.structured.get("precise_ingredients", []):
-            name = precise.get("name") if isinstance(precise, dict) else precise
-            if name:
-                names.append(str(name))
-
-        for brand in candidate.structured.get("brands", []):
-            name = brand.get("name") if isinstance(brand, dict) else brand
-            if name:
-                names.append(str(name))
-
+        names = []
+        for key in ("ingredients", "precise_ingredients", "brands"):
+            for value in candidate.structured.get(key, []):
+                name = value.get("name") if isinstance(value, dict) else value
+                if name:
+                    names.append(str(name))
         if not names and candidate.name:
             names.append(candidate.name)
-
         if not parsed.ingredient_core:
             return "unknown"
-
         core = parsed.ingredient_core
         best = 0.0
-
+        aliases = [core, *parsed.ingredient_aliases]
         for name in names:
-            normalized_name = normalize_text(name)
-
-            # Token-boundary match only.  Plain substring matching promoted
-            # short unrelated names (e.g. a 3-letter ingredient hidden inside
-            # a Vietnamese adjective) to an exact drug match.
-            if normalized_name and re.search(
-                rf"(?<!\w){re.escape(normalized_name)}(?!\w)", core
-            ):
-                return "exact"
-
-            if len(normalized_name) >= 4 and len(core) >= 4:
-                best = max(best, fuzz.partial_ratio(normalized_name, core) / 100.0)
-
-        if best >= 0.9:
-            return "exact"
-        if best >= 0.6:
-            return "partial"
-
-        return "mismatch"
-
-    def ingredient_match_score(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> float:
-        relation = self.ingredient_gate(parsed, candidate)
-
-        return {"exact": 1.0, "partial": 0.6, "unknown": 0.5, "mismatch": 0.0}[relation]
-
-    # ------------------------------------------------------------
-    # So khớp strength / dose form / release type
-    # ------------------------------------------------------------
+            normalized = normalize_text(name)
+            for alias in aliases:
+                if normalized and re.search(rf"(?<!\w){re.escape(normalized)}(?!\w)", alias):
+                    return "exact"
+                if len(normalized) >= 4 and len(alias) >= 4:
+                    best = max(best, fuzz.partial_ratio(normalized, alias) / 100.0)
+        return "exact" if best >= .9 else "partial" if best >= .6 else "mismatch"
 
     def compare_strength(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> str:
-        candidate_strengths = candidate.structured.get("strengths", [])
-        candidate_display = [normalize_text(str(s)) for s in candidate_strengths]
-
-        if not parsed.strengths and not candidate_display:
+        candidate_strengths = [str(value) for value in candidate.structured.get("strengths", [])]
+        if not parsed.strengths and not candidate_strengths:
             return "both_missing"
         if not parsed.strengths:
             return "candidate_more_specific"
-        if not candidate_display:
+        if not candidate_strengths:
             return "mention_more_specific"
-
-        mention_display = [normalize_text(s) for s in parsed.strengths]
-
-        if set(mention_display) & set(candidate_display):
+        mention_values = self._strength_values(parsed.strengths)
+        candidate_values = self._strength_values(candidate_strengths)
+        if set(mention_values) & set(candidate_values):
             return "exact"
+        if parsed.strength_role == "range" and len(mention_values) >= 2:
+            lower, upper = sorted(value for value, _family in mention_values[:2])
+            families = {family for _value, family in mention_values[:2]}
+            if any(family in families and lower <= value <= upper for value, family in candidate_values):
+                return "range_contains"
+        if parsed.strength_role == "range":
+            match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(mcg|mg|g|meq|iu|units?|unit)", parsed.strengths[0], re.I)
+            if match:
+                unit = match.group(3).lower()
+                factor = self._UNIT_FACTOR.get(unit)
+                if factor is not None:
+                    lower = Decimal(match.group(1)) * factor
+                    upper = Decimal(match.group(2)) * factor
+                    family = "mass" if unit in {"mcg", "mg", "g"} else unit.rstrip("s")
+                    if any(candidate_family == family and lower <= value <= upper
+                           for value, candidate_family in candidate_values):
+                        return "range_contains"
+        if not parsed.dose_forms and any(
+            mf == cf and cv > 0 and cv <= mv
+            for mv, mf in mention_values for cv, cf in candidate_values
+        ):
+            return "dose_interpretation"
+        return "conflict"
 
-        return "order_dose_mismatch"
-
-    def compare_dose_form(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> str:
-        candidate_forms = [
-            normalize_text(str(f)) for f in candidate.structured.get("dose_forms", [])
-        ]
-        mention_forms = [normalize_text(f) for f in parsed.dose_forms]
-
-        if not mention_forms and not candidate_forms:
+    @staticmethod
+    def _compare_terms(mention: list[str], candidate: list[str]) -> str:
+        mention_values = {normalize_text(value) for value in mention}
+        candidate_values = {normalize_text(value) for value in candidate}
+        if not mention_values and not candidate_values:
             return "both_missing"
-        if not mention_forms:
+        if not mention_values:
             return "candidate_more_specific"
-        if not candidate_forms:
+        if not candidate_values:
             return "mention_more_specific"
-        if set(mention_forms) & set(candidate_forms):
-            return "exact"
+        return "exact" if mention_values & candidate_values else "conflict"
 
-        return "mismatch"
-
-    def compare_release(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> str:
-        candidate_release = [
-            normalize_text(str(r)) for r in candidate.structured.get("release_types", [])
-        ]
-        mention_release = [normalize_text(r) for r in parsed.release_types]
-
-        if not mention_release and not candidate_release:
-            return "both_missing"
-        if set(mention_release) & set(candidate_release):
-            return "exact"
-        if mention_release and not candidate_release:
-            return "mention_more_specific"
-        if candidate_release and not mention_release:
-            return "candidate_more_specific"
-
-        return "mismatch"
-
-    # ------------------------------------------------------------
-    # TTY prior theo specificity
-    # ------------------------------------------------------------
-
-    def tty_prior(self, specificity: str, tty: str) -> float:
-        return config.TTY_BONUS_TABLE.get(specificity, {}).get(tty, 0.0)
-
-    # ------------------------------------------------------------
-    # Feature extraction + score
-    # ------------------------------------------------------------
-
-    def extract_features(
-        self, parsed: ParsedDrugMention, candidate: RxNormCandidate
-    ) -> dict[str, Any]:
+    def extract_features(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> dict[str, Any]:
+        previous = candidate.features or {}
+        dose_forms = [normalize_text(str(value)) for value in candidate.structured.get("dose_forms", [])]
+        route_support = "unknown"
+        if parsed.route == "PO":
+            route_support = "exact" if any("oral" in value for value in dose_forms) else "conflict" if dose_forms else "unknown"
+        strength_endpoint = None
+        if parsed.strength_role == "range" and parsed.strengths:
+            match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(mcg|mg|g|meq|iu|units?|unit)", parsed.strengths[0], re.I)
+            candidate_values = self._strength_values(candidate.structured.get("strengths", []))
+            if match:
+                unit = match.group(3).lower(); factor = self._UNIT_FACTOR.get(unit)
+                if factor is not None:
+                    low, high = Decimal(match.group(1)) * factor, Decimal(match.group(2)) * factor
+                    values = {value for value, _family in candidate_values}
+                    strength_endpoint = "lower" if low in values else "upper" if high in values else None
         return {
             "ingredient_relation": self.ingredient_gate(parsed, candidate),
             "strength_relation": self.compare_strength(parsed, candidate),
-            "form_relation": self.compare_dose_form(parsed, candidate),
-            "release_relation": self.compare_release(parsed, candidate),
+            "form_relation": self._compare_terms(parsed.dose_forms, candidate.structured.get("dose_forms", [])),
+            "release_relation": self._compare_terms(parsed.release_types, candidate.structured.get("release_types", [])),
             "specificity": self.mention_specificity(parsed),
+            "exact_structured_match": bool(previous.get("exact_structured_match")),
+            "query_source_count": len(candidate.retrieval_sources),
+            "matched_term_count": len(candidate.matched_terms),
+            "active": candidate.active,
+            "historical": candidate.historical,
+            "route_support": route_support,
+            "strength_endpoint": strength_endpoint,
         }
 
     def score_candidate(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> float:
         features = self.extract_features(parsed, candidate)
         candidate.features = features
-
-        ingredient_score = self.ingredient_match_score(parsed, candidate)
-
-        if features["ingredient_relation"] == "mismatch":
-            # gate cứng: sai hoạt chất thì không cho lên top dù dense cao
-            candidate.final_score = candidate.dense_score * 0.05
+        conflicts = []
+        if features["ingredient_relation"] == "mismatch": conflicts.append("ingredient_mismatch")
+        if parsed.release_types and features["release_relation"] == "conflict": conflicts.append("explicit_release_conflict")
+        if parsed.dose_forms and features["form_relation"] == "conflict": conflicts.append("explicit_form_conflict")
+        if parsed.strengths and parsed.dose_forms and features["strength_relation"] == "conflict": conflicts.append("explicit_strength_conflict")
+        if not candidate.active and not candidate.current_rxcuis: conflicts.append("inactive_without_current_mapping")
+        candidate.rejection_reasons = conflicts
+        if conflicts:
+            candidate.support_level = "rejected"
+            candidate.final_score = -1.0 + candidate.dense_score * .01
             return candidate.final_score
 
-        score = (
-            config.DENSE_WEIGHT * candidate.dense_score
-            + config.LEXICAL_WEIGHT * candidate.lexical_score
-        )
-
-        if candidate.exact_term_match or features["ingredient_relation"] == "exact":
-            score += config.INGREDIENT_EXACT_BONUS * ingredient_score
-
-        if features["strength_relation"] == "exact":
-            score += 0.10
-        elif features["strength_relation"] == "order_dose_mismatch":
-            score -= 0.15
-
-        if features["form_relation"] == "exact":
-            score += 0.05
-        elif features["form_relation"] == "mismatch":
-            score -= 0.05
-
-        if features["release_relation"] == "exact":
-            score += 0.03
-        elif features["release_relation"] == "mismatch":
-            score -= 0.03
-
-        score += self.tty_prior(features["specificity"], candidate.tty)
-
-        if candidate.historical:
-            score -= 0.02  # ưu tiên nhẹ cho active/current trước historical
-
+        score = config.DENSE_WEIGHT * candidate.dense_score + config.LEXICAL_WEIGHT * candidate.lexical_score
+        if candidate.exact_term_match or features["ingredient_relation"] == "exact": score += config.INGREDIENT_EXACT_BONUS
+        score += {"exact": .10, "range_contains": .075, "dose_interpretation": .025, "conflict": -.15}.get(features["strength_relation"], 0)
+        score += {"exact": .05, "conflict": -.05}.get(features["form_relation"], 0)
+        score += {"exact": .03, "conflict": -.03}.get(features["release_relation"], 0)
+        if parsed.route == "PO":
+            forms = [normalize_text(str(value)) for value in candidate.structured.get("dose_forms", [])]
+            if any("oral tablet" in value for value in forms): score += .08
+            elif any("oral" in value for value in forms): score += .025
+            elif forms: score -= .12
+        if features.get("strength_endpoint") == "lower": score += .04
+        elif features.get("strength_endpoint") == "upper": score -= .01
+        score += config.TTY_BONUS_TABLE.get(features["specificity"], {}).get(candidate.tty, 0.0)
+        if candidate.historical: score -= .02
+        if features["exact_structured_match"]: score += .05
+        brand_exact = any(normalize_text(str(brand)) in parsed.normalized_text for brand in candidate.structured.get("brands", []))
+        if candidate.tty == "SBD" and not brand_exact: score -= .08
+        candidate.evidence_completeness = sum((
+            features["ingredient_relation"] == "exact",
+            features["strength_relation"] in {"exact", "range_contains", "dose_interpretation", "both_missing"},
+            features["form_relation"] in {"exact", "both_missing", "candidate_more_specific"},
+            features["release_relation"] in {"exact", "both_missing", "candidate_more_specific"},
+        )) / 4.0
+        if candidate.exact_term_match and candidate.evidence_completeness >= .75:
+            candidate.support_level = "exact"
+        elif features["ingredient_relation"] == "exact" and candidate.evidence_completeness >= .75:
+            candidate.support_level = "strong"
+        elif features["ingredient_relation"] in {"exact", "partial"} and score >= .45:
+            candidate.support_level = "medium"
+        else:
+            candidate.support_level = "weak"
+        if "bare_liquid_unit_without_quantity" in parsed.parse_warnings:
+            candidate.support_level = "medium" if candidate.support_level in {"exact", "strong"} else candidate.support_level
         candidate.final_score = score
         return score
 
-    def rerank(
-        self, parsed: ParsedDrugMention, candidates: list[RxNormCandidate]
-    ) -> list[RxNormCandidate]:
+    def rerank(self, parsed: ParsedDrugMention, candidates: list[RxNormCandidate]) -> list[RxNormCandidate]:
         for candidate in candidates:
             self.score_candidate(parsed, candidate)
-
-        return sorted(candidates, key=lambda c: c.final_score, reverse=True)
+        ranked = sorted(candidates, key=lambda item: item.final_score, reverse=True)
+        margin = ranked[0].final_score - ranked[1].final_score if len(ranked) > 1 else float("inf")
+        for candidate in ranked:
+            candidate.top1_margin = margin
+        return ranked
