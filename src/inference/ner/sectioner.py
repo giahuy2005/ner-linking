@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from bisect import bisect_right
 from typing import Any
 
 SECTION_TITLES = {
@@ -115,3 +117,223 @@ def split_sections_by_header(raw_text: str) -> dict[int, dict[str, Any]]:
             "body": raw_text[start:end],
         })
     return {block_id: block for block_id, block in enumerate(blocks)}
+
+
+# ---------------------------------------------------------------------------
+# Assertion-only section resolver
+# ---------------------------------------------------------------------------
+# This resolver is intentionally separate from ``split_sections_by_header``.
+# It never changes NER chunk boundaries; it only supplies deterministic scope
+# metadata to the assertion validator.
+ASSERTION_SECTION_UNKNOWN = "unknown"
+ASSERTION_SECTION_HISTORICAL = "historical"
+ASSERTION_SECTION_CURRENT = "current"
+ASSERTION_SECTION_FAMILY = "family_history"
+ASSERTION_SECTION_GENERAL = "general"
+
+_ASSERTION_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?:(?P<number>\d{1,2})[.)][ \t]*)?"
+    r"(?P<body>[^\r\n]{1,5000})$"
+)
+_ASSERTION_NUMBERED_CONTENT_RE = re.compile(
+    r"(?iu)\b(?:\d+(?:[.,]\d+)?\s*(?:mg|mcg|g|ml|l|iu|đơn\s+vị)|"
+    r"po|iv|im|sc|sq|prn|bid|tid|qid|qhs|qam|daily)\b"
+)
+_INLINE_ASSERTION_HEADING_RE = re.compile(
+    r"(?iu)(?:[.:][ \t]*|[ \t]{2,})"
+    r"(?P<body>(?:\d{1,2}[.)][ \t]*)?(?:"
+    r"tiền\s+sử\s+bệnh\s+hiện\s+tại|tiền\s+sử\s+bệnh(?:\s+lý)?|"
+    r"tiền\s+sử\s+phẫu\s+thuật(?:\s*/\s*thủ\s+thuật)?|"
+    r"thuốc\s+trước\s+(?:khi\s+)?nhập\s+viện|"
+    r"bệnh\s+sử(?:\s+hiện\s+tại)?|diễn\s+biến\s+bệnh|"
+    r"triệu\s+chứng\s+(?:hiện\s+tại|khi\s+nhập\s+viện)|"
+    r"tình\s+trạng\s+(?:hiện\s+tại|ngay\s+trước\s+khi\s+nhập\s+viện)|"
+    r"câu\s+hỏi(?:\s+từ\s+người\s+dùng)?|câu\s+trả\s+lời\s+của\s+bác\s+sĩ"
+    r"))"
+)
+
+
+def _normalize_assertion_heading(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = re.sub(r"^[ \t]*[-•*]+[ \t]*", "", normalized)
+    normalized = re.sub(r"[ \t]+", " ", normalized).strip()
+    return normalized.strip(" \t.:;,-–—()[]{}")
+
+
+def _classify_assertion_heading(body: str, *, numbered: bool) -> str | None:
+    heading = _normalize_assertion_heading(body)
+    if not heading:
+        return None
+
+    # Current-state headings must be tested before the broader historical
+    # prefixes because "tiền sử bệnh hiện tại" starts with "tiền sử bệnh".
+    current_patterns = (
+        r"^tiền sử bệnh hiện tại(?:\b|$)",
+        r"^bệnh sử(?: hiện tại)?(?:\b|$)",
+        r"^diễn biến(?: bệnh)?(?: hiện tại)?(?:\b|$)",
+        r"^quá trình bệnh lý hiện tại(?:\b|$)",
+        r"^lý do (?:vào|nhập) viện(?:\b|$)",
+        r"^thời điểm khởi phát(?: triệu chứng)?(?:\b|$)",
+        r"^(?:các )?triệu chứng (?:hiện tại|khi nhập viện)(?:\b|$)",
+        r"^đặc điểm triệu chứng(?:\b|$)",
+        r"^tình trạng (?:hiện tại|khi nhập viện|ngay trước khi nhập viện)(?:\b|$)",
+        r"^(?:đánh giá|khám|thăm khám) tại bệnh viện(?:\b|$)",
+        r"^kết quả đánh giá ban đầu(?:\b|$)",
+        r"^kết quả (?:xét nghiệm|chẩn đoán hình ảnh)(?:\b|$)",
+        r"^các phát hiện chẩn đoán khác(?:\b|$)",
+    )
+    if any(re.search(pattern, heading, flags=re.I) for pattern in current_patterns):
+        return ASSERTION_SECTION_CURRENT
+
+    family_exact = {
+        "tiền sử gia đình", "bệnh sử gia đình", "family history",
+    }
+    if (
+        heading in family_exact
+        or re.match(r"^(?:tiền sử|bệnh sử) gia đình\s*:", body.casefold().strip())
+    ):
+        return ASSERTION_SECTION_FAMILY
+
+    historical_patterns = (
+        r"^tiền sử bệnh(?: lý)?(?:\b|$)",
+        r"^tiền sử y khoa(?:\b|$)",
+        r"^bệnh sử trước đây(?:\b|$)",
+        r"^tiền sử bản thân(?:\b|$)",
+        r"^tiền sử phẫu thuật(?:\b|$)",
+        r"^(?:các )?bệnh lý mạn tính(?:\b|$)",
+        r"^(?:các )?bệnh lý mãn tính(?:\b|$)",
+        r"^thuốc trước (?:khi )?nhập viện(?:\b|$)",
+        r"^danh sách thuốc trước nhập viện(?:\b|$)",
+        r"^(?:các )?sự kiện trước khi nhập viện(?:\b|$)",
+        r"^các tập (?:phát bệnh )?tương tự trước đây(?:\b|$)",
+    )
+    if any(re.search(pattern, heading, flags=re.I) for pattern in historical_patterns):
+        return ASSERTION_SECTION_HISTORICAL
+
+    general_patterns = (
+        r"^(?:yếu tố nguy cơ|nguyên nhân|cơ chế|dịch tễ|tiền sử dịch tễ)(?:\b|$)",
+        r"^(?:chẩn đoán|tiêu chuẩn chẩn đoán|điều trị|phòng ngừa|biến chứng)(?:\b|$)",
+        r"^(?:không thay đổi được|có thể thay đổi)(?:\b|$)",
+        r"^(?:cần làm gì|lưu ý|khuyến cáo|tổng quan|định nghĩa)(?:\b|$)",
+        r"^(?:câu hỏi|câu trả lời|bác sĩ trả lời|trả lời|lời khuyên)(?:\b|$)",
+        r"^(?:chào bạn|như bạn đã mô tả|cảm ơn bạn đã gửi câu hỏi)(?:\b|$)",
+        r"^lưu ý quan trọng(?:\b|$)",
+    )
+    if any(re.search(pattern, heading, flags=re.I) for pattern in general_patterns):
+        return ASSERTION_SECTION_GENERAL
+
+    # A numbered line usually starts a new top-level section and therefore
+    # safely resets a prior historical scope. Do not treat medication list
+    # rows such as "1. amlodipine 10 mg po daily" as headings.
+    if numbered and not _ASSERTION_NUMBERED_CONTENT_RE.search(heading):
+        return ASSERTION_SECTION_GENERAL
+    return None
+
+
+_ASSERTION_GENERAL_BULLET_RE = re.compile(
+    r"(?iu)^[ \t]*[-•*][ \t]*(?:"
+    r"(?:không\s+nên|nên|cần|hãy|khuyến\s+cáo)\b|"
+    r"(?:uống|thực\s+hiện|ghép|súc|chải|tái\s+khám|đi\s+khám)\b"
+    r"(?=[^\n]{0,180}\b(?:để|giúp|nhằm|hỗ\s+trợ|ngăn|phòng|"
+    r"loại\s+bỏ|khử|làm\s+dịu|tái\s+tạo)\b)|"
+    r"trà\s+[^:;,.]{1,80}\b(?:giúp|để|nhằm)\b"
+    r")"
+)
+
+
+def build_assertion_section_blocks(raw_text: str) -> list[dict[str, Any]]:
+    """Build offset-preserving assertion scope blocks.
+
+    The output is independent from inference sectioning and therefore cannot
+    change tokenization, model chunks, or entity offsets.
+    """
+    headings: list[dict[str, Any]] = []
+    cursor = 0
+    for line in raw_text.splitlines(keepends=True):
+        visible = line.rstrip("\r\n")
+        match = _ASSERTION_LINE_RE.match(visible)
+        line_heading_added = False
+        if _ASSERTION_GENERAL_BULLET_RE.search(visible):
+            headings.append({
+                "start": cursor,
+                "heading_end": cursor + len(visible),
+                "kind": ASSERTION_SECTION_GENERAL,
+                "heading": visible,
+            })
+            line_heading_added = True
+        if match is not None and not line_heading_added:
+            # Bullet rows are content, not section headings. Known unbulleted
+            # subheadings and numbered top-level headings are considered.
+            stripped = visible.lstrip()
+            if not stripped.startswith(("-", "•", "*")):
+                numbered = match.group("number") is not None
+                body = match.group("body")
+                kind = _classify_assertion_heading(body, numbered=numbered)
+                if kind is not None:
+                    headings.append({
+                        "start": cursor,
+                        "heading_end": cursor + len(visible),
+                        "kind": kind,
+                        "heading": visible,
+                    })
+                    line_heading_added = True
+
+        # Some synthetic/dirty records concatenate the next heading onto the
+        # preceding sentence. Detect only a closed set of heading prefixes
+        # after punctuation or a wide whitespace gap; ordinary prose such as
+        # "bệnh nhân có tiền sử..." is not treated as a section boundary.
+        for inline in (() if line_heading_added else _INLINE_ASSERTION_HEADING_RE.finditer(visible)):
+            body = inline.group("body")
+            body_start = inline.start("body")
+            if body_start == 0:
+                continue
+            numbered = bool(re.match(r"\d{1,2}[.)]", body))
+            kind = _classify_assertion_heading(body, numbered=numbered)
+            if kind is None:
+                continue
+            headings.append({
+                "start": cursor + body_start,
+                "heading_end": cursor + body_start + len(body),
+                "kind": kind,
+                "heading": body,
+            })
+        cursor += len(line)
+
+    if headings:
+        deduplicated: dict[tuple[int, str], dict[str, Any]] = {}
+        for item in headings:
+            deduplicated[(int(item["start"]), str(item["kind"]))] = item
+        headings = sorted(deduplicated.values(), key=lambda item: (item["start"], item["heading_end"]))
+
+    if not headings:
+        return [{
+            "start": 0, "end": len(raw_text),
+            "kind": ASSERTION_SECTION_UNKNOWN,
+            "heading": None, "heading_end": None,
+        }]
+
+    blocks: list[dict[str, Any]] = []
+    if headings[0]["start"] > 0:
+        blocks.append({
+            "start": 0, "end": headings[0]["start"],
+            "kind": ASSERTION_SECTION_UNKNOWN,
+            "heading": None, "heading_end": None,
+        })
+    for index, heading in enumerate(headings):
+        end = headings[index + 1]["start"] if index + 1 < len(headings) else len(raw_text)
+        blocks.append({**heading, "end": end})
+    return blocks
+
+
+def assertion_section_at(
+    blocks: list[dict[str, Any]], position: int,
+) -> dict[str, Any]:
+    """Return the assertion block containing ``position``."""
+    if not blocks:
+        return {
+            "start": 0, "end": 0, "kind": ASSERTION_SECTION_UNKNOWN,
+            "heading": None, "heading_end": None,
+        }
+    starts = [int(block["start"]) for block in blocks]
+    index = max(0, bisect_right(starts, int(position)) - 1)
+    return blocks[index]

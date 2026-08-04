@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v5_rxnorm_structured"
+SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v6_immutable_multicode"
 
 _SYSTEM = """Bạn chọn mã RxNorm hoặc ICD-10 chỉ từ whitelist đã được retrieval/reranker hỗ trợ.
 Không phát minh mã. Không dùng mã có hard_conflicts.

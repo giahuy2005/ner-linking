@@ -13,6 +13,15 @@ import math
 import re
 
 from ..schemas import NerEntity
+from ..ner.sectioner import (
+    ASSERTION_SECTION_CURRENT,
+    ASSERTION_SECTION_FAMILY,
+    ASSERTION_SECTION_GENERAL,
+    ASSERTION_SECTION_HISTORICAL,
+    ASSERTION_SECTION_UNKNOWN,
+    assertion_section_at,
+    build_assertion_section_blocks,
+)
 
 ALLOWED_TYPES = {
     "TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "THUỐC",
@@ -21,6 +30,8 @@ ALLOWED_TYPES = {
 ALLOWED_ASSERTIONS = {"isHistorical", "isNegated", "isFamily"}
 ASSERTION_ENTITY_TYPES = {"TRIỆU_CHỨNG", "CHẨN_ĐOÁN", "THUỐC"}
 LAB_ENTITY_TYPES = {"TÊN_XÉT_NGHIỆM", "KẾT_QUẢ_XÉT_NGHIỆM"}
+
+ASSERTION_POLICY_VERSION = "assertion_scope_v3_section_subject_safe"
 
 _DEVICE_PREFIXES = (
     "stent", "catheter", "picc", "foley", "ống dẫn mật", "ống dẫn lưu",
@@ -51,7 +62,7 @@ _NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\.\s+", re.M)
 _CLAUSE_BOUNDARY_RE = re.compile(
     r"(?iu)(?:[\r\n,;:.!?]+|\b(?:nhưng|tuy\s+nhiên|song|trong\s+khi|ngoại\s+trừ)\b)"
 )
-_NEGATION_CUE_RE = re.compile(r"(?iu)\b(?:không|chưa|phủ\s+nhận)\b")
+_NEGATION_CUE_RE = re.compile(r"(?iu)\b(?:không|chưa|phủ\s+nhận|k|ko)\b")
 
 # After the last cue, only grammatical bridge phrases are allowed before the
 # entity. This intentionally prefers precision over blanket negation scope.
@@ -68,6 +79,8 @@ _DIRECT_NEGATION_SEGMENT_RE = re.compile(
 _NON_ASSERTION_NEGATION_SEGMENT_RE = re.compile(
     r"(?iu)^không\s+(?:"
     r"thể|nhấc|nâng|đứng|đi|vận\s+động|cử\s+động|đáp\s+ứng|cải\s+thiện|"
+    r"nhớ|điều\s+trị|theo\s+dõi|chăm\s+sóc|"
+    r"được\s+(?:điều\s+trị|theo\s+dõi|chăm\s+sóc)|"
     r"dùng|sử\s+dụng|uống|tiêm|truyền|tuân\s+thủ|ăn|nuốt|ngủ|nói|"
     r"nghe|nghe\s+thấy|nhìn|nhìn\s+thấy|thở|tự\s+chủ"
     r")\b"
@@ -182,7 +195,224 @@ def _negation_separated_by_boundary(
     return bool(boundaries and boundaries[-1].start() > cues[-1].start())
 
 
-def _repair_assertion_scope(raw_text: str, entity: NerEntity) -> NerEntity:
+def _sentence_prefix(raw_text: str, entity_start: int, *, max_chars: int = 360) -> str:
+    window = raw_text[max(0, entity_start - max_chars):entity_start]
+    boundaries = list(re.finditer(r"[\r\n;.!?]+", window))
+    if boundaries:
+        window = window[boundaries[-1].end():]
+    return " ".join(window.casefold().split()).strip()
+
+
+_STRONG_LIST_NEGATION_RE = re.compile(
+    r"(?iu)\b(?:không\s+(?:có|ghi\s+nhận|thấy|còn)|"
+    r"chưa\s+(?:ghi\s+nhận|thấy|có)|phủ\s+nhận)\b"
+)
+_DIRECT_NEGATION_BRIDGE_RE = re.compile(
+    r"(?iu)^(?:không|chưa|phủ\s+nhận|k|ko)"
+    r"(?:\s+(?:có|còn|hề|từng|hoàn\s+toàn|ghi\s+nhận|thấy|"
+    r"bất\s+kỳ|dấu\s+hiệu|triệu\s+chứng|biểu\s+hiện|bằng\s+chứng|"
+    r"tình\s+trạng|tiền\s+sử|bị|mắc|xuất\s+hiện|phải|được|coi|là|"
+    r"thực\s+sự|ai|gây)){0,7}$"
+)
+_NEGATION_RESET_RE = re.compile(
+    r"(?iu)\b(?:nhưng|tuy\s+nhiên|song|ngoại\s+trừ|sau\s+đó|"
+    r"bệnh\s+nhân|người\s+bệnh|bn|trẻ|dùng|sử\s+dụng|uống|"
+    r"tiêm|truyền|điều\s+trị|theo\s+dõi|chăm\s+sóc|"
+    r"kèm\s+theo|đồng\s+thời|rồi)\b"
+)
+_INTERNAL_NEGATION_RE = re.compile(r"(?iu)\b(?:không|chưa|phủ\s+nhận)\b")
+_LEXICAL_NON_NEGATION_RE = re.compile(
+    r"(?iu)\bkhông\s+(?:tự\s+chủ|đặc\s+hiệu|dung\s+nạp)\b"
+)
+_CLASSIFICATION_NEGATION_RE = re.compile(
+    r"(?iu)^không\s+được\s+(?:xem|coi|xếp)\s+(?:là|thành)"
+    r"(?:\s+một\s+loại)?$"
+)
+_DRUG_NEGATION_BRIDGE_RE = re.compile(
+    r"(?iu)^(?:(?:không|chưa)\s+(?:dùng|sử\s+dụng|uống|tiêm|truyền)|"
+    r"(?:đã\s+)?ngừng\s+(?:dùng|sử\s+dụng|uống|tiêm|truyền)?)"
+    r"(?:\s+(?:bất\s+kỳ|thuốc|loại\s+thuốc))?$"
+)
+_FAMILY_HISTORY_CUE_RE = re.compile(
+    r"(?iu)\b(?:tiền\s+sử|bệnh\s+sử)\s+gia\s+đình\b"
+)
+
+_HISTORY_CUE_RE = re.compile(
+    r"(?iu)\b(?:trước\s+đây|đã\s+từng|từng|hồi\s+trước|"
+    r"cách\s+đây(?:\s+\d+)?|từ\s+năm\s+\d{2,4}|"
+    r"trước\s+khi\s+nhập\s+viện|trước\s+nhập\s+viện|"
+    r"nhập\s+viện\s+trước\s+đó|trong\s+quá\s+khứ|"
+    r"tiền\s+sử|sau\s+khi\s+dùng|đã\s+được\s+chẩn\s+đoán|"
+    r"đã\s+(?:dùng|sử\s+dụng|uống|tiêm|truyền|ngừng))\b"
+)
+_CURRENT_CUE_RE = re.compile(
+    r"(?iu)\b(?:hiện\s+tại|hiện\s+đang|đang|hôm\s+nay|nay|vẫn|"
+    r"quanh\s+năm|mọi\s+lúc|liên\s+tục|thường\s+xuyên|"
+    r"đang\s+có|đang\s+bị)\b"
+)
+_FAMILY_RELATION_RE = re.compile(
+    r"(?iu)\b(?:mẹ|má|cha|bố|ba|ông|bà|anh\s+trai|chị\s+gái|"
+    r"em\s+trai|em\s+gái|anh\s+ruột|chị\s+ruột|em\s+ruột|"
+    r"bố\s+mẹ|cha\s+mẹ|người\s+thân)"
+    r"(?:\s+của\s+(?:bệnh\s+nhân|người\s+bệnh|bn|bạn\s+ấy))?"
+    r"(?:\s+cũng)?\s+(?:bị|mắc|có|từng|được\s+chẩn\s+đoán)\b"
+)
+_PATIENT_SUBJECT_RE = re.compile(
+    r"(?iu)\b(?:bệnh\s+nhân|người\s+bệnh|bn|em|tôi|bạn\s+ấy|trẻ)\b"
+)
+
+
+def _negation_evidence(raw_text: str, entity: NerEntity) -> str:
+    """Return direct, blocked, submention, or absent for this exact entity."""
+    normalized_entity = _normalize(entity.text)
+    if _POSITIVE_DEFICIT_ENTITY_RE.match(normalized_entity):
+        return "blocked"
+
+    internal = [
+        match for match in _INTERNAL_NEGATION_RE.finditer(normalized_entity)
+        if not _LEXICAL_NON_NEGATION_RE.match(normalized_entity, match.start())
+    ]
+    if internal:
+        # A cue after a positive head only negates a submention, e.g.
+        # "viêm kết mạc hai bên không ghèn". It must not negate the full span.
+        if internal[0].start() > 0:
+            return "submention"
+        if _NON_ASSERTION_NEGATION_SEGMENT_RE.match(normalized_entity):
+            return "blocked"
+        return "direct"
+
+    prefix = _sentence_prefix(raw_text, entity.position[0])
+    if re.search(r"(?iu)\b(?:đã\s+)?hết(?:\s+(?:hẳn|hoàn\s+toàn))?$", prefix):
+        return "direct"
+    if entity.type == "THUỐC" and _DRUG_NEGATION_BRIDGE_RE.search(prefix):
+        return "direct"
+    cues = list(_NEGATION_CUE_RE.finditer(prefix))
+    if not cues:
+        return "absent"
+    cue = cues[-1]
+    segment = prefix[cue.start():].strip()
+    if entity.type == "THUỐC" and _DRUG_NEGATION_BRIDGE_RE.fullmatch(segment):
+        return "direct"
+    if _NON_ASSERTION_NEGATION_SEGMENT_RE.match(segment):
+        return "blocked"
+    if _NEGATION_RESET_RE.search(segment[cue.end() - cue.start():]):
+        return "blocked"
+
+    if _DIRECT_NEGATION_BRIDGE_RE.fullmatch(segment):
+        return "direct"
+    if _CLASSIFICATION_NEGATION_RE.fullmatch(segment):
+        return "direct"
+
+    # Strong list cues may scope comma/conjunction-separated atomic mentions, as in
+    # "không ghi nhận co giật, cứng đờ, cắn lưỡi". Bare "không" does not
+    # propagate past a comma because "không sốt, đau ngực" is contrastive.
+    strong = _STRONG_LIST_NEGATION_RE.search(segment)
+    linked_list = re.search(r"(?iu),|\b(?:và|hoặc|hay)\b", segment)
+    if strong is not None and linked_list:
+        suffix = segment[strong.end():]
+        if not _NEGATION_RESET_RE.search(suffix) and len(suffix.split()) <= 18:
+            return "direct"
+    # A bare cue can scope a short list when an explicit conjunction links the
+    # mentions ("không buồn nôn, hay nôn, đổ mồ hôi"). Comma alone is not
+    # enough, so "không sốt, đau ngực" still negates only the first item.
+    if (
+        not prefix[:cue.start()].strip(" \t-•*")
+        and re.match(r"(?iu)^(?:không|chưa|k|ko)\b", segment)
+        and re.search(r"(?iu)\b(?:và|hoặc|hay)\b", segment)
+        and not _NEGATION_RESET_RE.search(segment)
+        and len(segment.split()) <= 18
+    ):
+        return "direct"
+    return "blocked"
+
+
+def _family_evidence(
+    raw_text: str,
+    entity: NerEntity,
+    section: dict,
+) -> bool:
+    if section.get("kind") == ASSERTION_SECTION_FAMILY:
+        return True
+    sentence = _sentence_prefix(raw_text, entity.position[0])
+    return bool(
+        _FAMILY_RELATION_RE.search(sentence)
+        or _FAMILY_HISTORY_CUE_RE.search(sentence)
+    )
+
+
+def _history_evidence(
+    raw_text: str,
+    entity: NerEntity,
+    section: dict,
+) -> tuple[bool, bool]:
+    """Return ``(historical, explicitly_current)``."""
+    kind = section.get("kind", ASSERTION_SECTION_UNKNOWN)
+    if kind == ASSERTION_SECTION_HISTORICAL:
+        return True, False
+    if kind == ASSERTION_SECTION_FAMILY:
+        return True, False
+
+    sentence = _sentence_prefix(raw_text, entity.position[0])
+    local_clause = _local_clause_prefix(raw_text, entity.position[0])
+    entity_text = _normalize(entity.text)
+    family_history = bool(_FAMILY_HISTORY_CUE_RE.search(sentence))
+    history = bool(
+        _HISTORY_CUE_RE.search(sentence)
+        or family_history
+        or re.search(r"(?iu)\b(?:sau|hậu)\s*$", local_clause)
+    )
+    current = bool(
+        _CURRENT_CUE_RE.search(local_clause)
+        or _CURRENT_CUE_RE.search(entity_text)
+    )
+
+    if kind == ASSERTION_SECTION_CURRENT:
+        heading = _normalize(str(section.get("heading") or ""))
+        strict_current = any(marker in heading for marker in (
+            "lý do vào viện", "lý do nhập viện",
+            "triệu chứng hiện tại", "triệu chứng khi nhập viện",
+            "tình trạng hiện tại", "tình trạng khi nhập viện",
+            "tình trạng ngay trước khi nhập viện",
+            "đánh giá tại bệnh viện", "khám tại bệnh viện",
+        ))
+        if strict_current:
+            past_event = history or bool(re.search(
+                r"(?iu)\b(?:trước\s+đây|đã\s+từng|từng|cách\s+đây|"
+                r"(?:khoảng\s+)?\d+(?:[.,]\d+)?\s+"
+                r"(?:ngày|tuần|tháng|năm)\s+trước(?:\s+khi)?\s+nhập\s+viện|"
+                r"(?:có\s+)?tiền\s+sử\s+nhập\s+viện(?:\s+gần\s+đây)?|"
+                r"nhập\s+viện\s+trước\s+đó|trong\s+quá\s+khứ|"
+                r"đã\s+(?:dùng|sử\s+dụng|uống|tiêm|truyền|ngừng)|"
+                r"đã\s+được\s+chẩn\s+đoán)\b",
+                sentence,
+            ))
+            history = past_event
+        return history, current or (strict_current and not history)
+    if kind == ASSERTION_SECTION_GENERAL:
+        heading = _normalize(str(section.get("heading") or ""))
+        question_narrative = heading.startswith((
+            "câu hỏi", "hỏi", "câu hỏi từ người dùng",
+            "câu hỏi của người dùng",
+        ))
+        # Educational answers/risk-factor lists do not describe a patient
+        # unless a local subject and an explicit temporal cue are both present.
+        if history and not family_history and not _PATIENT_SUBJECT_RE.search(sentence):
+            history = False
+        # A user-question block is patient narrative. Preserve a model
+        # historical assertion when deterministic local evidence is neutral;
+        # explicit current cues such as "hiện tại/quanh năm" still remove it.
+        if question_narrative and not current and not history:
+            return False, False
+        return history, current or not history
+    return history, current
+
+
+def _repair_assertion_scope(
+    raw_text: str,
+    entity: NerEntity,
+    *,
+    section_blocks: list[dict] | None = None,
+) -> NerEntity:
     assertions = list(dict.fromkeys(
         item for item in entity.assertions if item in ALLOWED_ASSERTIONS
     ))
@@ -191,50 +421,25 @@ def _repair_assertion_scope(raw_text: str, entity: NerEntity) -> NerEntity:
     if entity.type in LAB_ENTITY_TYPES:
         return _copy(entity, assertions=[], flag=entity.flag)
 
-    start, _end = entity.position
-    heading = _numbered_section_heading(raw_text, start)
-    local_prefix = _local_clause_prefix(raw_text, start)
-    normalized_entity = _normalize(entity.text)
+    blocks = section_blocks or build_assertion_section_blocks(raw_text)
+    section = assertion_section_at(blocks, entity.position[0])
 
-    negated_history = bool(re.search(
-        r"(?iu)\bphủ\s+nhận\s+tiền\s+sử(?:\s+\S+){0,4}\s*$",
-        local_prefix,
-    ))
-    exception_scope = bool(re.search(r"(?iu)\bngoại\s+trừ\s*$", local_prefix))
-    positive_deficit = bool(_POSITIVE_DEFICIT_ENTITY_RE.match(normalized_entity))
-    negation_decision = _negation_scope_decision(local_prefix)
-    scope_reset = _negation_separated_by_boundary(raw_text, start)
-
-    # Remove a false model assertion only when the grammar clearly describes a
-    # positive deficit/action or an explicit exception. Otherwise preserve the
-    # model prediction and add an assertion only for a direct local cue.
-    if (
-        exception_scope
-        or positive_deficit
-        or negation_decision == "blocked"
-        or scope_reset
-    ):
-        assertions = [item for item in assertions if item != "isNegated"]
-
-    if negated_history:
-        if "isNegated" not in assertions:
-            assertions.append("isNegated")
-        if "isHistorical" not in assertions:
-            assertions.append("isHistorical")
-    elif negation_decision == "direct" and "isNegated" not in assertions:
+    negation = _negation_evidence(raw_text, entity)
+    assertions = [item for item in assertions if item != "isNegated"]
+    if negation == "direct":
         assertions.append("isNegated")
 
-    current_cue = re.search(
-        r"(?iu)\b(?:hiện\s+đang|nay\s+.*?đang|hiện\s+tại|đang\s+có)\b",
-        raw_text[max(0, start - 100):start],
-    )
-    current_section = any(marker in heading for marker in (
-        "hiện tại", "đánh giá tại bệnh viện", "tình trạng hiện tại",
-    ))
-    if (current_cue or current_section) and not negated_history:
+    family = _family_evidence(raw_text, entity, section)
+    assertions = [item for item in assertions if item != "isFamily"]
+    if family:
+        assertions.append("isFamily")
+
+    historical, explicitly_current = _history_evidence(raw_text, entity, section)
+    if historical:
+        if "isHistorical" not in assertions:
+            assertions.append("isHistorical")
+    elif explicitly_current:
         assertions = [item for item in assertions if item != "isHistorical"]
-    elif heading == "tiền sử bệnh" and "isHistorical" not in assertions:
-        assertions.append("isHistorical")
 
     return _copy(
         entity,
@@ -242,6 +447,34 @@ def _repair_assertion_scope(raw_text: str, entity: NerEntity) -> NerEntity:
         flag=entity.flag,
     )
 
+
+def repair_assertions_only(
+    raw_text: str,
+    entities: list[NerEntity],
+) -> tuple[list[NerEntity], list[dict]]:
+    """Revalidate assertions without changing text, type, score, or offsets."""
+    blocks = build_assertion_section_blocks(raw_text)
+    output: list[NerEntity] = []
+    logs: list[dict] = []
+    for entity in entities:
+        repaired = _repair_assertion_scope(
+            raw_text, entity, section_blocks=blocks,
+        )
+        if repaired.assertions != entity.assertions:
+            section = assertion_section_at(blocks, entity.position[0])
+            logs.append({
+                "status": "repair",
+                "reason": "assertion_scope_finalization",
+                "text": entity.text,
+                "type": entity.type,
+                "position": list(entity.position),
+                "before": list(entity.assertions),
+                "after": list(repaired.assertions),
+                "section_kind": section.get("kind"),
+                "section_heading": section.get("heading"),
+            })
+        output.append(repaired)
+    return output, logs
 
 def _is_token_char(char: str) -> bool:
     """Return True for characters that belong to one unsplittable raw token.
@@ -587,6 +820,7 @@ def pre_llm_cleanup(
     """
     logs: list[dict] = []
     cleaned: list[NerEntity] = []
+    section_blocks = build_assertion_section_blocks(raw_text)
     for entity in entities:
         if not _exact(raw_text, entity):
             logs.append({"status": "drop", "reason": "invalid_exact_span", "text": entity.text})
@@ -599,7 +833,9 @@ def pre_llm_cleanup(
         if repaired.position != entity.position:
             logs.append({"status": "repair", "reason": "deterministic_boundary", "before": entity.text,
                          "after": repaired.text, "position": list(repaired.position)})
-        repaired = _repair_assertion_scope(raw_text, repaired)
+        repaired = _repair_assertion_scope(
+            raw_text, repaired, section_blocks=section_blocks,
+        )
         cleaned.append(repaired)
     # Re-check repaired candidates before overlap resolution.
     cleaned = [entity for entity in cleaned if _exact(raw_text, entity)

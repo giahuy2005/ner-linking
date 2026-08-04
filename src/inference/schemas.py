@@ -38,7 +38,7 @@ LINKING_TYPES = frozenset({
 })
 
 MAX_CANDIDATES_BY_TYPE = {
-    "THUỐC": 1,
+    "THUỐC": 2,
     "CHẨN_ĐOÁN": 2,
 }
 

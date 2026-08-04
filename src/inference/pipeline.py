@@ -25,7 +25,7 @@ TYPE_TO_LINKER = {
 }
 
 MAX_OUTPUT_CANDIDATES = {
-    "THUỐC": 1,
+    "THUỐC": 2,
     "CHẨN_ĐOÁN": 2,
 }
 
@@ -136,6 +136,40 @@ class InferencePipeline:
                 index_dir=cfg.ICD10_INDEX_DIR, device=cfg.LINKER_DEVICE,
             )
         return pipeline
+
+    @staticmethod
+    def _repair_one_detailed_assertions(raw_text: str, detail):
+        """Repair assertion scope on portable detail without changing spans."""
+        from .rule.clinical import ASSERTION_POLICY_VERSION, repair_assertions_only
+
+        total_changes = 0
+        for field_name in ("crf_entities", "lattice_entities", "final_entities"):
+            entities = list(getattr(detail, field_name, []))
+            repaired, logs = repair_assertions_only(raw_text, entities)
+            setattr(detail, field_name, repaired)
+            total_changes += len(logs)
+            if logs:
+                detail.logs.extend({
+                    "event": "assertion_scope_repaired",
+                    "policy_version": ASSERTION_POLICY_VERSION,
+                    "field": field_name,
+                    **row,
+                } for row in logs)
+        detail.validate_offsets(raw_text)
+        return detail, total_changes
+
+    def repair_detailed_assertions(
+        self,
+        raw_texts_by_id: dict[str, str],
+        detailed_by_id: dict,
+    ) -> dict:
+        """Normalize new or previously saved detailed artifacts."""
+        repaired = {}
+        for record_id, detail in detailed_by_id.items():
+            repaired[record_id], _count = self._repair_one_detailed_assertions(
+                raw_texts_by_id[record_id], detail,
+            )
+        return repaired
 
     # ------------------------------------------------------------
     # Stage 1: NER (không LLM) — an toàn chạy cho cả batch bất kỳ lúc nào
@@ -265,6 +299,14 @@ class InferencePipeline:
                 combined.span_head_enabled = combined.span_head_enabled or detail.span_head_enabled
             for field_name in ("crf_entities", "lattice_entities", "final_entities"):
                 getattr(combined, field_name).sort(key=lambda item: (*item.position, item.type))
+            combined, assertion_change_count = self._repair_one_detailed_assertions(
+                raw_text, combined,
+            )
+            if assertion_change_count:
+                combined.logs.append({
+                    "event": "assertion_scope_summary",
+                    "changed": assertion_change_count,
+                })
             combined.validate_offsets(raw_text)
             outputs[record_id] = combined
             if on_record_complete is not None:
@@ -320,6 +362,9 @@ class InferencePipeline:
         from .ner.editor_schemas import ReviewRegion
         from .schemas import normalize_entity_schema
 
+        detailed_by_id = self.repair_detailed_assertions(
+            raw_texts_by_id, detailed_by_id,
+        )
         catalogs, regions_by_id = {}, {}
         prompt_entries: list[tuple[str, object, list, tuple[str, str]]] = []
         for record_id, detailed in detailed_by_id.items():

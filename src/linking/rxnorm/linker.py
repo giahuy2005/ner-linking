@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from . import config
@@ -19,14 +20,80 @@ class RxNormLinker:
         self.reranker = RxNormRuleReranker()
         self.last_errors: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _has_supported_true_combination(candidates: list) -> bool:
+        return any(
+            not item.rejection_reasons
+            and item.support_level in {"exact", "strong"}
+            and (item.features or {}).get("ingredient_relation") == "exact"
+            for item in candidates
+        )
+
+    def _constituent_union_candidates(self, parsed) -> list:
+        """Return one exact/strong RxCUI per recovered concatenated drug.
+
+        This path is restricted to spans whose missing separator was recovered
+        from the exact repository lexicon.  The BTC text/offset remains one
+        immutable entity while candidates may contain up to two constituent
+        RxCUIs.  A genuine combination product still wins when available.
+        """
+        if (
+            "concatenated_components_recovered" not in parsed.parse_warnings
+            or not 2 <= len(parsed.ingredient_components) <= 2
+        ):
+            return []
+        output = []
+        seen_codes: set[str] = set()
+        expected = len(parsed.ingredient_components)
+        for component_index, component in enumerate(parsed.ingredient_components):
+            child = parse_drug_mention(component)
+            retrieved = self.retriever.retrieve(child)
+            ranked = self.reranker.rerank(child, list(retrieved.values()))
+            supported = [
+                item for item in ranked
+                if not item.rejection_reasons
+                and item.support_level in {"exact", "strong"}
+            ]
+            if not supported:
+                return []
+            top = supported[0]
+            if top.support_level == "strong" and len(supported) > 1:
+                margin = float(top.top1_margin or 0.0)
+                if margin < config.DETERMINISTIC_MIN_MARGIN:
+                    return []
+            if top.rxcui in seen_codes:
+                return []
+            clone = copy.deepcopy(top)
+            clone.features = {
+                **(clone.features or {}),
+                "immutable_span_constituent": True,
+                "constituent_surface": component,
+                "constituent_index": component_index,
+                "constituent_count": expected,
+            }
+            clone.rejection_reasons = []
+            clone.top1_margin = 1.0
+            seen_codes.add(clone.rxcui)
+            output.append(clone)
+        return output if len(output) == expected else []
+
+    def _rank_one_parsed(self, parsed, candidates: dict, top_k: int) -> list:
+        ranked = self.reranker.rerank(parsed, list(candidates.values()))
+        if not self._has_supported_true_combination(ranked):
+            union = self._constituent_union_candidates(parsed)
+            if union:
+                union_codes = {item.rxcui for item in union}
+                ranked = [*union, *(item for item in ranked if item.rxcui not in union_codes)]
+        return ranked[:top_k]
+
     def link(self, mention: str, top_k: int = 10) -> dict[str, Any]:
         parsed = parse_drug_mention(mention)
         candidates = self.retriever.retrieve(parsed)
-        ranked = self.reranker.rerank(parsed, list(candidates.values()))
+        ranked = self._rank_one_parsed(parsed, candidates, top_k)
         return {
             "mention": mention,
             "parsed": parsed,
-            "candidates": ranked[:top_k],
+            "candidates": ranked,
         }
 
     def retrieve_many(self, mentions: list[str]):
@@ -42,7 +109,7 @@ class RxNormLinker:
         try:
             parsed_mentions, retrieved = self.retrieve_many(mentions)
             return [
-                self.reranker.rerank(parsed, list(candidates.values()))[:top_k]
+                self._rank_one_parsed(parsed, candidates, top_k)
                 for parsed, candidates in zip(parsed_mentions, retrieved)
             ]
         except Exception as batch_exc:

@@ -202,8 +202,11 @@ class RxNormRetriever:
         parsed.ingredient_components = recovered
         parsed.ingredient_core = " / ".join(recovered)
         parsed.ingredient_aliases = list(dict.fromkeys([*recovered, *parsed.brand_hints]))
-        if len(recovered) >= 2 and "multi_ingredient_mention" not in parsed.parse_warnings:
-            parsed.parse_warnings.append("multi_ingredient_mention")
+        if len(recovered) >= 2:
+            if "multi_ingredient_mention" not in parsed.parse_warnings:
+                parsed.parse_warnings.append("multi_ingredient_mention")
+            if "concatenated_components_recovered" not in parsed.parse_warnings:
+                parsed.parse_warnings.append("concatenated_components_recovered")
         parsed.query_variants = build_query_variants(parsed)
 
     def search_full_query(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:

@@ -258,6 +258,11 @@ def run(
         )
         detailed_by_id.update(computed)
         detailed_by_id = {record_id: detailed_by_id[record_id] for record_id in raw_texts_by_id}
+        # Saved artifacts from an older run may contain stale model assertions.
+        # Revalidate scope before saving, fingerprinting, editor prompting, or linking.
+        detailed_by_id = pipeline.repair_detailed_assertions(
+            raw_texts_by_id, detailed_by_id,
+        )
         if args.save_detailed_ner_dir is not None:
             from .detailed_artifacts import save_artifact
             for record_id, detail in detailed_by_id.items():

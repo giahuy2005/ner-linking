@@ -99,6 +99,14 @@ def _candidate_payload(candidate) -> dict[str, Any]:
                 )
                 if features.get(key)
             },
+            "constituent": {
+                key: features[key]
+                for key in (
+                    "immutable_span_constituent", "constituent_surface",
+                    "constituent_index", "constituent_count",
+                )
+                if features.get(key) is not None
+            },
             "hard_conflicts": list(raw.get("rejection_reasons", []) or []),
         }
         return {key: item for key, item in value.items() if item not in (None, "", [], {})}
@@ -274,7 +282,12 @@ def _hierarchy_related(left: str, right: str) -> bool:
     return bool(a != b and (a.startswith(b) or b.startswith(a)))
 
 
-def _deterministic_decision(entity_type: str, supported: list[tuple[int, Any]]) -> tuple[list[str], str]:
+def _deterministic_decision(
+    entity_type: str,
+    supported: list[tuple[int, Any]],
+    *,
+    max_choices: int = 1,
+) -> tuple[list[str], str]:
     if not supported:
         return [], "no_supported_candidate"
     top = supported[0][1]
@@ -327,6 +340,38 @@ def _deterministic_decision(entity_type: str, supported: list[tuple[int, Any]]) 
             return [], "single_medium_abstain"
         return [], "ambiguous_supported_candidates"
 
+    # Immutable concatenated drug spans may carry one exact/strong RxCUI per
+    # lexicon-recovered constituent while preserving one BTC text/start/end.
+    constituent_rows = []
+    expected_constituents = 0
+    for _raw_rank, candidate in supported:
+        features = getattr(candidate, "features", {}) or {}
+        if not features.get("immutable_span_constituent"):
+            continue
+        expected_constituents = max(
+            expected_constituents,
+            int(features.get("constituent_count", 0) or 0),
+        )
+        displayed = _display(candidate)
+        if displayed is None:
+            continue
+        constituent_rows.append((
+            int(features.get("constituent_index", 99) or 0),
+            displayed[0],
+            str(features.get("constituent_surface", "")),
+            str(getattr(candidate, "support_level", "weak")),
+        ))
+    if expected_constituents and expected_constituents <= max_choices:
+        constituent_rows.sort(key=lambda row: row[0])
+        codes = list(dict.fromkeys(row[1] for row in constituent_rows))
+        surfaces = {row[2] for row in constituent_rows if row[2]}
+        if (
+            len(codes) == expected_constituents
+            and len(surfaces) == expected_constituents
+            and all(row[3] in {"exact", "strong"} for row in constituent_rows)
+        ):
+            return codes, "rxnorm_immutable_span_constituent_union"
+
     # RxNorm deterministic bypass follows the structured reranker only.
     level = str(getattr(top, "support_level", "weak"))
     margin = float(getattr(top, "top1_margin", 0.0) or 0.0)
@@ -375,9 +420,24 @@ def _prepare_selection(
     choice_limit = 1
     if entity_type == "CHẨN_ĐOÁN" and max_choices >= 2 and _explicitly_coordinated_diagnoses(entity_text):
         choice_limit = 2
+    if entity_type == "THUỐC" and max_choices >= 2:
+        expected = max(
+            (
+                int((getattr(candidate, "features", {}) or {}).get("constituent_count", 0) or 0)
+                for candidate in candidates
+                if (getattr(candidate, "features", {}) or {}).get("immutable_span_constituent")
+            ),
+            default=0,
+        )
+        if expected == 2:
+            choice_limit = 2
 
     supported_ranked = _rank_supported_candidates(entity_text, entity_type, candidates)
-    fallback, decision_reason = _deterministic_decision(entity_type, supported_ranked)
+    fallback, decision_reason = _deterministic_decision(
+        entity_type,
+        supported_ranked,
+        max_choices=choice_limit,
+    )
     shortlist_pairs = supported_ranked[: max(1, top_k_context)]
     shortlist = [candidate for _rank, candidate in shortlist_pairs]
     valid_codes: list[str] = []
@@ -442,7 +502,18 @@ def _prepare_selection(
     }
 
 
-def _apply_hierarchy_guard(codes: list[str]) -> list[str]:
+def _apply_hierarchy_guard(
+    codes: list[str],
+    entity_type: str | None = None,
+) -> list[str]:
+    # Backward-compatible default: alphanumeric ICD-like codes receive the
+    # hierarchy guard, while numeric-only RxCUIs never do.
+    if entity_type == "THUỐC" or (
+        entity_type is None and all(str(code).isdigit() for code in codes)
+    ):
+        return list(dict.fromkeys(codes))
+    if entity_type not in {None, "CHẨN_ĐOÁN"}:
+        return list(dict.fromkeys(codes))
     output: list[str] = []
     for code in codes:
         if any(_hierarchy_related(code, kept) for kept in output):
@@ -488,7 +559,7 @@ def _finish_selection(raw_output: str, prepared: dict) -> list[str]:
         for code in chosen
         if not _hard_candidate_conflict(prepared["candidates_by_code"][code])
     ]
-    chosen = _apply_hierarchy_guard(chosen)
+    chosen = _apply_hierarchy_guard(chosen, prepared["entity_type"])
     return chosen[: prepared["choice_limit"]]
 
 
@@ -500,8 +571,12 @@ def select_supported_top_candidates(
     max_choices: int = 2,
 ) -> list[str]:
     supported = _rank_supported_candidates(entity_text, entity_type, candidates)
-    selected, _reason = _deterministic_decision(entity_type, supported)
-    return _apply_hierarchy_guard(selected)[:max_choices]
+    selected, _reason = _deterministic_decision(
+        entity_type,
+        supported,
+        max_choices=max_choices,
+    )
+    return _apply_hierarchy_guard(selected, entity_type)[:max_choices]
 
 
 def select_candidates(

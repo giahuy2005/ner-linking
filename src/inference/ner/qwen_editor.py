@@ -10,6 +10,7 @@ from typing import Any
 
 from ...llm.batching import VersionedJsonlCache, generate_with_cache
 from ...llm.json_guard import extract_json
+from ..rule.clinical import repair_assertions_only
 from ..schemas import (
     ASSERTION_ENTITY_TYPES,
     NerEntity,
@@ -26,7 +27,7 @@ from .editor_schemas import (
 )
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v7_rxnorm_safe_finalization"
+PROMPT_VERSION = "qwen3_locked_editor_v9_final_ner_scope_safe"
 _EDITOR_RESPONSE_FIELDS = frozenset({"request_id", "changes", "unresolved_ids"})
 _MISSING_RESPONSE_FIELDS = frozenset({"request_id", "additions", "unresolved_ids"})
 
@@ -89,6 +90,11 @@ Không chắc chắn: chỉ đưa ID selected_target vào unresolved_ids.
 Mỗi change phải có đúng 7 field: action,candidate_ids,text,type,assertions,local_position,reason_code.
 Field không dùng phải là null hoặc []. REPAIR_SPAN/MERGE phải trả type và assertions cuối cùng.
 assertions BẮT BUỘC là JSON list[str], chỉ được chứa đúng các chuỗi "isNegated", "isHistorical", "isFamily"; không được chứa object, boolean hoặc key type/text. Không có assertion thì dùng [].
+Assertion scope:
+- isNegated chỉ khi phủ định trực tiếp đúng entity; "không thể/không nhấc/không đáp ứng" mô tả thiếu hụt dương tính, không phải phủ định entity.
+- Cue phủ định nằm sau một phần dương tính như "viêm kết mạc ... không ghèn" không được phủ định toàn span.
+- isHistorical chỉ cho tình trạng/thuốc quá khứ của bệnh nhân hoặc section tiền sử; danh sách kiến thức/yếu tố nguy cơ không phải tiền sử bệnh nhân.
+- isFamily chỉ khi entity thuộc người thân hoặc section tiền sử gia đình; bạn bè, đồng nghiệp, người cùng đơn vị không phải gia đình.
 reason_code bắt buộc: RETYPE=WRONG_TYPE; REPAIR_SPAN=WRONG_BOUNDARY; MERGE=MERGE_REQUIRED; UPDATE_ASSERTIONS=ASSERTION_ERROR;
 DROP chỉ dùng một trong: {drop_reasons}.
 Ontology duy nhất: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
@@ -543,6 +549,29 @@ def _span_validation_errors(
         ):
             errors.append("merge_independent_strong_drugs")
         final_type = operation.type or targets[0].type
+        if final_type != "THUỐC":
+            strong_atomic = []
+            for item in ordered:
+                item_score = max((float(value) for value in item.scores.values()), default=0.0)
+                temporary = NerEntity(item.text, item.type, [], item.position, item_score)
+                if (
+                    item.type == final_type
+                    and item_score >= 0.88
+                    and _unsafe_fragment_reason(temporary) is None
+                ):
+                    strong_atomic.append(item)
+            non_overlapping = []
+            for item in strong_atomic:
+                if not non_overlapping or item.position[0] >= non_overlapping[-1].position[1]:
+                    non_overlapping.append(item)
+            if len(non_overlapping) >= 2 and all(
+                re.fullmatch(
+                    r"(?iu)[\s,;/]*(?:(?:và|va|hay|hoặc|hoac|kèm|kem)[\s,;/]*)?",
+                    raw_text[left.position[1]:right.position[0]],
+                )
+                for left, right in zip(non_overlapping, non_overlapping[1:])
+            ):
+                errors.append("merge_independent_strong_concepts")
         for other in validation_candidates:
             other_score = max((float(value) for value in other.scores.values()), default=0.0)
             is_numeric_measurement = bool(re.search(
@@ -704,6 +733,7 @@ def _plan_operation(
                 normalize_assertions_for_type(final_type, operation.assertions),
                 (start, end),
                 1.0,
+                "qwen_merge" if operation.action == EditAction.MERGE else "qwen_repair",
             )
     elif operation.action == EditAction.UPDATE_ASSERTIONS:
         current = entity_map[ids[0]]
@@ -943,11 +973,11 @@ _FOLD_TOKEN_RE = re.compile(r"[^a-z0-9]+")
 _FUNCTION_FRAGMENTS = frozenset({
     "cac", "co", "con", "cua", "duoc", "hang", "hay", "it", "la",
     "mot", "nhieu", "nhung", "phai", "sau", "tai", "theo", "trong",
-    "tu", "va", "voi", "hoac",
+    "tu", "va", "voi", "hoac", "khong",
 })
 _DIAGNOSIS_FRAGMENTS = frozenset({
     "benh", "viem", "ton", "mien", "xoang", "gan", "tuy", "da", "chi",
-    "virus", "fibrin", "gen", "enzyme", "hong cau",
+    "virus", "fibrin", "gen", "enzyme", "hong cau", "da day", "phe nang", "ho",
 })
 _TEST_FRAGMENTS = frozenset({
     "xet", "chup", "do", "duong", "mau", "phan", "dich", "chi", "gan", "tuy",
@@ -1000,6 +1030,8 @@ def _unsafe_fragment_reason(entity: NerEntity) -> str | None:
             return "incomplete_test_name"
         if entity.type == "TRIỆU_CHỨNG" and token in _SYMPTOM_FRAGMENTS:
             return "non_symptom_single_token"
+    if entity.type == "CHẨN_ĐOÁN" and folded in _DIAGNOSIS_FRAGMENTS:
+        return "generic_or_anatomical_diagnosis_fragment"
     if entity.type == "THUỐC":
         meaningful = [
             token
@@ -1011,6 +1043,465 @@ def _unsafe_fragment_reason(entity: NerEntity) -> str | None:
         if _DRUG_PROCEDURE_PREFIX_RE.match(folded):
             return "procedure_or_supportive_care_not_drug"
     return None
+
+
+
+def _candidate_max_score(item: CandidateEvidence | None) -> float:
+    if item is None:
+        return 0.0
+    return max((float(value) for value in item.scores.values()), default=0.0)
+
+
+def _line_bounds_for_span(raw_text: str, start: int, end: int) -> tuple[int, int]:
+    left = raw_text.rfind("\n", 0, start) + 1
+    right = raw_text.find("\n", end)
+    if right < 0:
+        right = len(raw_text)
+    return left, right
+
+
+def _clause_bounds_for_span(raw_text: str, start: int, end: int) -> tuple[int, int]:
+    line_start, line_end = _line_bounds_for_span(raw_text, start, end)
+    left_part = raw_text[line_start:start]
+    right_part = raw_text[end:line_end]
+    left_matches = list(re.finditer(r"[;:.!?]", left_part))
+    clause_start = line_start + (left_matches[-1].end() if left_matches else 0)
+    right_match = re.search(r"[;:.!?]", right_part)
+    clause_end = end + (right_match.start() if right_match else len(right_part))
+    return clause_start, clause_end
+
+
+def _recover_single_boundary_expansions(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Expand one short boundary fragment to a stronger exact catalogue span.
+
+    The replacement must share a boundary, stay inside one clause, have clearly
+    stronger evidence, and must not swallow another selected entity.  This is
+    intended for cases such as a generic head word followed by its complement;
+    it does not use a private vocabulary or fuzzy offsets.
+    """
+    selected = list(entities)
+    selected_keys = {_entity_key(item) for item in selected}
+    evidence_by_key = {
+        (item.position[0], item.position[1], item.type): item for item in catalogue
+    }
+    output: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    used_replacements: set[tuple[int, int, str]] = set()
+    for entity in selected:
+        entity_tokens = _surface_tokens(entity.text)
+        base_evidence = evidence_by_key.get(_entity_key(entity))
+        # Prefer original model evidence when available.  Entities restored
+        # from JSON/editor may carry score=1.0 as a placeholder, which must
+        # not block a clearly stronger span-head boundary candidate.
+        base_score = (
+            _candidate_max_score(base_evidence)
+            if base_evidence is not None
+            else float(entity.score or 0.0)
+        )
+        if len(entity_tokens) > 2 or _medical_abbreviation(entity.text):
+            output.append(entity)
+            continue
+        candidates = []
+        for candidate in catalogue:
+            if candidate.type != entity.type or candidate.position == entity.position:
+                continue
+            if not (
+                candidate.position[0] <= entity.position[0]
+                and candidate.position[1] >= entity.position[1]
+                and (
+                    candidate.position[0] == entity.position[0]
+                    or candidate.position[1] == entity.position[1]
+                )
+            ):
+                continue
+            if candidate.position[1] - candidate.position[0] > 72:
+                continue
+            if any(ch in candidate.text for ch in "\r\n,;"):
+                continue
+            candidate_score = _candidate_max_score(candidate)
+            if candidate_score < max(0.88, base_score + 0.06):
+                continue
+            if "boundary_disagreement" not in candidate.negative_flags:
+                continue
+            if not _same_unit(raw_text, candidate.position[0], candidate.position[1]):
+                continue
+            if any(
+                other is not entity
+                and other.position[0] < candidate.position[1]
+                and other.position[1] > candidate.position[0]
+                and not (
+                    candidate.position[0] <= other.position[0]
+                    and candidate.position[1] >= other.position[1]
+                    and len(_surface_tokens(other.text)) <= 1
+                )
+                for other in selected
+            ):
+                continue
+            candidates.append((candidate_score, candidate))
+        if not candidates:
+            output.append(entity)
+            continue
+        _score, winner = max(candidates, key=lambda row: (row[0], len(row[1].text)))
+        key = (winner.position[0], winner.position[1], winner.type)
+        if key in used_replacements or key in selected_keys:
+            output.append(entity)
+            continue
+        replacement = NerEntity(
+            winner.text,
+            winner.type,
+            normalize_assertions_for_type(winner.type, entity.assertions),
+            winner.position,
+            max(float(entity.score or 0.0), _candidate_max_score(winner)),
+        )
+        used_replacements.add(key)
+        output.append(replacement)
+        audit.append({
+            "reason": "single_fragment_boundary_expansion",
+            "entity_before": _entity_audit(entity),
+            "entity_after": _entity_audit(replacement),
+            "candidate_id": winner.candidate_id,
+        })
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
+
+
+def _restore_dominant_contained_mention(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Trim a weak wrapper around one dominant exact medical mention."""
+    by_key = {(item.position[0], item.position[1], item.type): item for item in catalogue}
+    wrapper_tokens = {
+        "ho", "chu quan", "co", "bi", "tinh trang", "dau hieu", "trieu chung",
+    }
+    output: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    for outer in entities:
+        outer_evidence = by_key.get(_entity_key(outer))
+        outer_score = _candidate_max_score(outer_evidence)
+        weak_wrapper = bool(
+            outer.flag == "qwen_merge"
+            or (
+                outer_evidence is not None
+                and not outer_evidence.pre_llm_selected
+                and outer_score < 0.84
+            )
+        )
+        if not weak_wrapper or outer.type not in {"CHẨN_ĐOÁN", "TRIỆU_CHỨNG"}:
+            output.append(outer)
+            continue
+        candidates = []
+        for item in catalogue:
+            if item.type != outer.type or item.position == outer.position:
+                continue
+            if not (
+                outer.position[0] <= item.position[0]
+                and outer.position[1] >= item.position[1]
+            ):
+                continue
+            score = _candidate_max_score(item)
+            if score < 0.90 or _unsafe_fragment_reason(
+                NerEntity(item.text, item.type, [], item.position, score)
+            ) is not None:
+                continue
+            candidates.append((score, item))
+        if not candidates:
+            output.append(outer)
+            continue
+        _score, winner = max(
+            candidates,
+            key=lambda row: (
+                sum(char.isalnum() for char in row[1].text),
+                row[0],
+            ),
+        )
+        before = _fold_surface(raw_text[outer.position[0]:winner.position[0]])
+        after = _fold_surface(raw_text[winner.position[1]:outer.position[1]])
+        leftovers = " ".join(value for value in (before, after) if value).strip(" ,;/")
+        outer_alnum = sum(char.isalnum() for char in outer.text)
+        winner_alnum = sum(char.isalnum() for char in winner.text)
+        if (
+            outer_alnum <= 0
+            or winner_alnum / outer_alnum < 0.58
+            or leftovers not in wrapper_tokens
+        ):
+            output.append(outer)
+            continue
+        replacement = NerEntity(
+            winner.text,
+            winner.type,
+            normalize_assertions_for_type(winner.type, outer.assertions),
+            winner.position,
+            max(float(outer.score or 0.0), _candidate_max_score(winner)),
+        )
+        output.append(replacement)
+        audit.append({
+            "reason": "restore_dominant_contained_mention",
+            "entity_before": _entity_audit(outer),
+            "entity_after": _entity_audit(replacement),
+        })
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
+
+
+def _restore_independent_catalogue_mentions(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Undo only evidence-backed Qwen merges of independent atomic mentions.
+
+    The fallback is deliberately conservative.  For symptoms it requires the
+    in-memory ``qwen_merge`` flag.  For diagnoses, a weak span-only outer may be
+    repaired from two complete strong inner diagnoses.  THUỐC is excluded
+    because immutable concatenated medication spans may carry multiple RxCUIs.
+    """
+    catalogue_by_key = {
+        (item.position[0], item.position[1], item.type): item for item in catalogue
+    }
+    diagnosis_head = re.compile(
+        r"(?iu)^(?:viem|nhiem|ung thu|u|suy|roi loan|hoi chung|ap xe|"
+        r"tang huyet ap|ha huyet ap|thieu mau|xuat huyet|loet|nang|"
+        r"nhồi mau|nhoi mau|tram cam|stress)\b"
+    )
+    output: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    for outer in entities:
+        if outer.type not in {"CHẨN_ĐOÁN", "TRIỆU_CHỨNG"}:
+            output.append(outer)
+            continue
+        outer_evidence = catalogue_by_key.get(_entity_key(outer))
+        outer_score = _candidate_max_score(outer_evidence)
+        eligible_outer = outer.flag == "qwen_merge"
+        if outer.type == "CHẨN_ĐOÁN":
+            eligible_outer = eligible_outer or bool(
+                outer_evidence is not None
+                and not outer_evidence.pre_llm_selected
+                and outer_score < 0.84
+                and "boundary_disagreement" in outer_evidence.negative_flags
+            )
+        if not eligible_outer:
+            output.append(outer)
+            continue
+
+        rows: list[tuple[float, CandidateEvidence]] = []
+        for item in catalogue:
+            if item.type != outer.type or item.position == outer.position:
+                continue
+            if not (
+                outer.position[0] <= item.position[0]
+                and outer.position[1] >= item.position[1]
+            ):
+                continue
+            score = _candidate_max_score(item)
+            temporary = NerEntity(item.text, item.type, [], item.position, score)
+            if score < 0.88 or _unsafe_fragment_reason(temporary) is not None:
+                continue
+            if _medical_abbreviation(item.text) and len(item.text.strip()) <= 3:
+                continue
+            if outer.type == "TRIỆU_CHỨNG":
+                if not (item.pre_llm_selected or item.strong_consensus):
+                    continue
+            else:
+                if not (item.pre_llm_selected or item.strong_consensus):
+                    if score < 0.95 or diagnosis_head.search(_fold_surface(item.text)) is None:
+                        continue
+            rows.append((score, item))
+
+        chosen: list[CandidateEvidence] = []
+        for _score, item in sorted(rows, key=lambda row: (row[1].position[0], -row[0], row[1].position[1])):
+            if any(
+                item.position[0] < old.position[1] and item.position[1] > old.position[0]
+                for old in chosen
+            ):
+                continue
+            chosen.append(item)
+        if len(chosen) < 2:
+            output.append(outer)
+            continue
+        chosen.sort(key=lambda item: item.position)
+        gaps = [raw_text[left.position[1]:right.position[0]] for left, right in zip(chosen, chosen[1:])]
+        if not all(
+            re.fullmatch(
+                r"(?iu)[\s,;/]*(?:(?:và|va|hay|hoặc|hoac|kèm|kem)[\s,;/]*)?",
+                gap,
+            )
+            for gap in gaps
+        ):
+            output.append(outer)
+            continue
+        outer_alnum = sum(char.isalnum() for char in outer.text)
+        covered_alnum = sum(sum(char.isalnum() for char in item.text) for item in chosen)
+        if outer_alnum <= 0 or covered_alnum / outer_alnum < 0.74:
+            output.append(outer)
+            continue
+        replacements = [
+            NerEntity(
+                item.text,
+                item.type,
+                normalize_assertions_for_type(item.type, outer.assertions),
+                item.position,
+                max(float(outer.score or 0.0), _candidate_max_score(item)),
+                "restored_atomic_mention",
+            )
+            for item in chosen
+        ]
+        output.extend(replacements)
+        audit.append({
+            "reason": "restore_independent_catalogue_mentions",
+            "entity_before": _entity_audit(outer),
+            "entities_after": [_entity_audit(item) for item in replacements],
+        })
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
+
+
+def _contextual_role_cleanup(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Drop/retype role-confused entities using local grammatical evidence."""
+    catalogue_by_key = {
+        (item.position[0], item.position[1], item.type): item for item in catalogue
+    }
+    output: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    for entity in entities:
+        start, end = entity.position
+        line_start, line_end = _line_bounds_for_span(raw_text, start, end)
+        clause_start, clause_end = _clause_bounds_for_span(raw_text, start, end)
+        line = _fold_surface(raw_text[line_start:line_end])
+        clause = _fold_surface(raw_text[clause_start:clause_end])
+        left = _fold_surface(raw_text[max(line_start, start - 72):start])
+        right = _fold_surface(raw_text[end:min(line_end, end + 96)])
+        folded = _fold_surface(entity.text)
+        evidence = catalogue_by_key.get(_entity_key(entity))
+        # Editor-created/restored entities may carry score=1.0 as a neutral
+        # placeholder.  For contextual role decisions, prefer the original
+        # catalogue confidence whenever it exists; otherwise that placeholder
+        # would suppress low-confidence retyping such as CK-MB -> test.
+        score = (
+            _candidate_max_score(evidence)
+            if evidence is not None
+            else float(entity.score or 0.0)
+        )
+
+        if entity.type == "KẾT_QUẢ_XÉT_NGHIỆM":
+            if folded == "khong":
+                audit.append({"reason": "result_function_word", "entity": _entity_audit(entity)})
+                continue
+            if folded in {"tang", "giam", "thay doi"}:
+                nearby_test = any(
+                    item.type == "TÊN_XÉT_NGHIỆM"
+                    and item.position[0] < clause_end
+                    and item.position[1] > clause_start
+                    for item in entities
+                )
+                explicit_test = bool(re.search(
+                    r"\b(?:xet nghiem|ket qua|dinh luong|do nong do|chi so|men|troponin|creatinin|ure|huyet)",
+                    clause,
+                ))
+                numeric = bool(re.search(r"\d", clause))
+                if not nearby_test and not explicit_test and not numeric:
+                    audit.append({"reason": "result_modifier_without_test", "entity": _entity_audit(entity)})
+                    continue
+
+        if entity.type == "TÊN_XÉT_NGHIỆM":
+            test_cue = bool(re.search(
+                r"\b(?:xet nghiem|test|dinh luong|kiem tra|sang loc|ket qua|"
+                r"cay|chup|sieu am|noi soi|dien tam do|ecg|mri|ct|phan tich)\b",
+                clause,
+            ))
+            tight_context = _fold_surface(
+                raw_text[max(clause_start, start - 44):min(clause_end, end + 36)]
+            )
+            tight_test_cue = bool(re.search(
+                r"\b(?:xet nghiem|test|dinh luong|kiem tra|sang loc|ket qua|"
+                r"cay|chup|sieu am|noi soi|dien tam do|ecg|mri|ct)\b",
+                tight_context,
+            ))
+            numeric_surrounding = _fold_surface(
+                raw_text[max(clause_start, start - 44):start]
+                + " "
+                + raw_text[end:min(clause_end, end + 36)]
+            )
+            numeric_near = bool(re.search(
+                r"(?:[:=<>]\s*\d|\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|g|ml|l|"
+                r"mmol|meq|iu|%|mmhg|bpm|u/l|ng/ml|pg/ml)\b)",
+                numeric_surrounding,
+            ))
+            person_role = bool(re.search(
+                r"\b(?:bac si|bs|doctor|primary care|cham soc chinh)\b",
+                clause,
+            ))
+            specimen_pattern = bool(
+                re.search(r"\b(?:lay|thu|mau)\b", left)
+                and re.search(r"\b(?:de|cho)\s+(?:phan tich|xet nghiem)\b", right)
+            )
+            mechanism_pattern = bool(re.search(
+                r"\b(?:dong vai tro|bao ve|bi pha huy|giam sut|hoat tinh cua|"
+                r"so luong va hoat tinh|cau tao|co che|trong te bao|trong hong cau)\b",
+                clause,
+            ))
+            if person_role and not test_cue:
+                audit.append({"reason": "person_role_not_test", "entity": _entity_audit(entity)})
+                continue
+            if specimen_pattern:
+                audit.append({"reason": "specimen_not_test", "entity": _entity_audit(entity)})
+                continue
+            if mechanism_pattern and not (tight_test_cue or numeric_near):
+                audit.append({"reason": "biological_object_not_test", "entity": _entity_audit(entity)})
+                continue
+
+        if entity.type == "CHẨN_ĐOÁN":
+            if re.match(r"^(?:voi|cua|trong|tai|theo)\b", folded):
+                audit.append({"reason": "leading_function_phrase_not_diagnosis", "entity": _entity_audit(entity)})
+                continue
+            if re.match(r"^benh hoc(?:\s|$)", folded):
+                audit.append({"reason": "generic_pathology_descriptor", "entity": _entity_audit(entity)})
+                continue
+            if re.fullmatch(r"(?:benh|tinh trang)\s+di truyen(?:\s+(?:lan|troi))?", folded):
+                audit.append({"reason": "generic_inheritance_descriptor", "entity": _entity_audit(entity)})
+                continue
+            if re.match(r"^(?:dot bien|bien the)\s+gen\b", folded):
+                audit.append({"reason": "genetic_finding_without_diagnosis_label", "entity": _entity_audit(entity)})
+                continue
+            abbreviation = _medical_abbreviation(entity.text)
+            lab_neighbors = any(
+                item.type == "TÊN_XÉT_NGHIỆM"
+                and item is not entity
+                and line_start <= item.position[0] < line_end
+                and abs(item.position[0] - start) <= 120
+                for item in entities
+            )
+            assay_shape = bool(re.search(r"[-/+0-9]", entity.text))
+            if abbreviation and assay_shape and score < 0.75 and (
+                lab_neighbors or re.search(r"[↑↓]|\b(?:xet nghiem|men tim|troponin)\b", line)
+            ):
+                replacement = NerEntity(
+                    entity.text,
+                    "TÊN_XÉT_NGHIỆM",
+                    [],
+                    entity.position,
+                    entity.score,
+                    entity.flag,
+                )
+                output.append(replacement)
+                audit.append({
+                    "reason": "low_confidence_assay_abbreviation_retype",
+                    "entity_before": _entity_audit(entity),
+                    "entity_after": _entity_audit(replacement),
+                })
+                continue
+        output.append(entity)
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
 
 
 def _entity_quality(
@@ -1395,12 +1886,31 @@ def finalize_entities_after_editor(
     restored, restore_audit = _restore_strong_contained_drugs(
         raw_text, list(unique.values()), catalogue
     )
-    composed, composition_audit = _recover_catalogue_compositions(
+    expanded, expansion_audit = _recover_single_boundary_expansions(
         raw_text, restored, catalogue
     )
+    composed, composition_audit = _recover_catalogue_compositions(
+        raw_text, expanded, catalogue
+    )
+    dominant, dominant_audit = _restore_dominant_contained_mention(
+        raw_text, composed, catalogue
+    )
+    atomic, atomic_audit = _restore_independent_catalogue_mentions(
+        raw_text, dominant, catalogue
+    )
+    contextual, contextual_audit = _contextual_role_cleanup(
+        raw_text, atomic, catalogue
+    )
     kept: list[NerEntity] = []
-    audit: list[dict[str, Any]] = [*restore_audit, *composition_audit]
-    for entity in sorted(composed, key=lambda item: (*item.position, item.type)):
+    audit: list[dict[str, Any]] = [
+        *restore_audit,
+        *expansion_audit,
+        *composition_audit,
+        *dominant_audit,
+        *atomic_audit,
+        *contextual_audit,
+    ]
+    for entity in sorted(contextual, key=lambda item: (*item.position, item.type)):
         reason = _unsafe_fragment_reason(entity)
         if reason is not None:
             audit.append({
@@ -1412,6 +1922,8 @@ def finalize_entities_after_editor(
         kept.append(entity)
     kept, overlap_audit = _resolve_global_overlaps(kept, catalogue=catalogue)
     audit.extend(overlap_audit)
+    kept, assertion_audit = repair_assertions_only(raw_text, kept)
+    audit.extend(assertion_audit)
     for entity in kept:
         if raw_text[entity.position[0]:entity.position[1]] != entity.text:
             raise ValueError("finalizer produced invalid exact offset")
