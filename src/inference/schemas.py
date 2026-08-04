@@ -7,7 +7,8 @@ Validation fail-fast trước output nằm trong ``io.validate_record_output``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
+
 
 
 VALID_ENTITY_TYPES = frozenset({
