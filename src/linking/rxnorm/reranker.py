@@ -231,7 +231,6 @@ class RxNormRuleReranker:
         product_candidate = candidate.tty in config.PRODUCT_TTYS
         overspecific_product = bool(
             specificity == "ingredient_only"
-            and len(parsed.ingredient_components) <= 1
             and product_candidate
             and not candidate.exact_term_match
         )
@@ -355,7 +354,11 @@ class RxNormRuleReranker:
             candidate.support_level = "exact"
         elif strong_granularity and score >= 0.52:
             candidate.support_level = "strong"
-        elif ingredient in {"exact", "partial"} and score >= 0.45:
+        elif (
+            ingredient in {"exact", "partial"}
+            and score >= 0.45
+            and not features["overspecific_product"]
+        ):
             candidate.support_level = "medium"
         else:
             candidate.support_level = "weak"

@@ -987,7 +987,7 @@ _DRUG_NOISE_TOKENS = frozenset({
     "ngay", "hang", "lieu", "cham", "moi", "tuan", "lan", "cach", "uong",
     "tiem", "truyen", "po", "iv", "im", "bid", "tid", "qid", "prn",
     "mg", "mcg", "g", "ml", "l", "gram", "microgram", "microgam",
-    "giot", "phut", "sui", "vien", "ong", "goi", "chai",
+    "giot", "phut", "sui", "vien", "ong", "goi", "chai", "kem",
 })
 _DRUG_PROCEDURE_PREFIX_RE = re.compile(
     r"^(?:tho|loc mau|phau thuat|dat |chup |xet nghiem|truyen dich\b)"
@@ -1069,6 +1069,108 @@ def _clause_bounds_for_span(raw_text: str, start: int, end: int) -> tuple[int, i
     right_match = re.search(r"[;:.!?]", right_part)
     clause_end = end + (right_match.start() if right_match else len(right_part))
     return clause_start, clause_end
+
+
+
+_SUBTYPE_MODIFIER_RE = re.compile(
+    r"^(?:vo can|man tinh|man tinh|cap tinh|toan bo|toan the|"
+    r"lan toa|khu tru|nguyen phat|thu phat|tai phat)$"
+)
+
+
+def _recover_subtype_modifier_spans(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Restore the medical head before an isolated subtype modifier.
+
+    The rule is evidence-bound: the complete span must already exist as an
+    exact catalogue candidate, end at the modifier boundary, stay within one
+    clause, contain no coordination, and add only a short medical head.  The
+    modifier's selected type is preserved, which resolves mixed CRF/span-head
+    disagreements such as a symptom head plus a diagnosis subtype modifier.
+    """
+    selected = sorted(entities, key=lambda item: (*item.position, item.type))
+    consumed: set[tuple[int, int, str]] = set()
+    additions: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+
+    for modifier in selected:
+        modifier_key = _entity_key(modifier)
+        if modifier_key in consumed or modifier.type != "CHẨN_ĐOÁN":
+            continue
+        folded_modifier = _fold_surface(modifier.text)
+        if not _SUBTYPE_MODIFIER_RE.fullmatch(folded_modifier):
+            continue
+
+        proposals: list[tuple[int, float, CandidateEvidence]] = []
+        for candidate in catalogue:
+            if candidate.position[1] != modifier.position[1]:
+                continue
+            if not (candidate.position[0] < modifier.position[0]):
+                continue
+            if raw_text[candidate.position[0]:candidate.position[1]] != candidate.text:
+                continue
+            if not _same_unit(raw_text, candidate.position[0], candidate.position[1]):
+                continue
+            if re.search(r"[,;/]|\b(?:va|hoac|hay|kem)\b", _fold_surface(candidate.text)):
+                continue
+            tokens = _surface_tokens(candidate.text)
+            modifier_tokens = _surface_tokens(modifier.text)
+            added_count = len(tokens) - len(modifier_tokens)
+            if not (1 <= added_count <= 4 and 2 <= len(tokens) <= 7):
+                continue
+            if not candidate.text.endswith(modifier.text):
+                continue
+            score = _candidate_max_score(candidate)
+            if score < 0.45:
+                continue
+            if not set(candidate.negative_flags) & {"boundary_disagreement", "type_disagreement"}:
+                continue
+            proposals.append((candidate.position[0], score, candidate))
+
+        if not proposals:
+            continue
+        # Prefer the closest complete head, then stronger model evidence.
+        _start, _score, winner = max(
+            proposals,
+            key=lambda row: (row[0], row[1]),
+        )
+        contained = [
+            item for item in selected
+            if winner.position[0] <= item.position[0]
+            and winner.position[1] >= item.position[1]
+            and len(_surface_tokens(item.text)) <= 3
+        ]
+        assertions = list(dict.fromkeys(
+            assertion
+            for item in contained
+            for assertion in item.assertions
+        ))
+        replacement = NerEntity(
+            winner.text,
+            modifier.type,
+            normalize_assertions_for_type(modifier.type, assertions or modifier.assertions),
+            winner.position,
+            max(float(modifier.score or 0.0), _candidate_max_score(winner)),
+            modifier.flag,
+        )
+        for item in contained:
+            consumed.add(_entity_key(item))
+        consumed.add(modifier_key)
+        additions.append(replacement)
+        audit.append({
+            "reason": "subtype_modifier_head_completion",
+            "entities_before": [_entity_audit(item) for item in contained] or [_entity_audit(modifier)],
+            "entity_after": _entity_audit(replacement),
+            "candidate_id": winner.candidate_id,
+        })
+
+    output = [item for item in selected if _entity_key(item) not in consumed]
+    output.extend(additions)
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
 
 
 def _recover_single_boundary_expansions(
@@ -1393,10 +1495,19 @@ def _contextual_role_cleanup(
         )
 
         if entity.type == "KẾT_QUẢ_XÉT_NGHIỆM":
+            physical_exam_context = _fold_surface(
+                raw_text[max(0, line_start - 160):line_end]
+            )
+            if folded in {"deu", "ro", "mem"} and re.search(
+                r"\b(?:kham|cac bo phan|toan than|lam sang|tim|phoi|bung)\b",
+                physical_exam_context,
+            ):
+                audit.append({"reason": "physical_exam_modifier_not_lab_result", "entity": _entity_audit(entity)})
+                continue
             if folded == "khong":
                 audit.append({"reason": "result_function_word", "entity": _entity_audit(entity)})
                 continue
-            if folded in {"tang", "giam", "thay doi"}:
+            if folded in {"tang", "giam", "thay doi", "deu", "ro", "mem"}:
                 nearby_test = any(
                     item.type == "TÊN_XÉT_NGHIỆM"
                     and item.position[0] < clause_end
@@ -1413,6 +1524,15 @@ def _contextual_role_cleanup(
                     continue
 
         if entity.type == "TÊN_XÉT_NGHIỆM":
+            if re.fullmatch(r"\d+(?:[./]\d+)?", folded):
+                audit.append({"reason": "isolated_numeric_not_test_name", "entity": _entity_audit(entity)})
+                continue
+            physical_heads = {"tim", "phoi", "bung", "gan", "lach", "than", "da", "niem mac"}
+            if folded in physical_heads and re.search(
+                r"\b(?:kham|cac bo phan|toan than|lam sang)\b", _fold_surface(raw_text[max(0, line_start - 160):line_end])
+            ):
+                audit.append({"reason": "physical_exam_anatomy_not_test", "entity": _entity_audit(entity)})
+                continue
             test_cue = bool(re.search(
                 r"\b(?:xet nghiem|test|dinh luong|kiem tra|sang loc|ket qua|"
                 r"cay|chup|sieu am|noi soi|dien tam do|ecg|mri|ct|phan tich)\b",
@@ -1460,6 +1580,40 @@ def _contextual_role_cleanup(
                 continue
 
         if entity.type == "CHẨN_ĐOÁN":
+            # A parenthesized English expansion immediately following a
+            # symptom is the same symptom mention, not a new diagnosis.
+            previous_symptoms = [
+                item for item in entities
+                if item.type == "TRIỆU_CHỨNG"
+                and item.position[1] <= start
+                and 0 <= start - item.position[1] <= 4
+            ]
+            if start > 0 and raw_text[start - 1:start] == "(" and raw_text[end:end + 1] == ")" and previous_symptoms:
+                previous = max(previous_symptoms, key=lambda item: item.position[1])
+                replacement = NerEntity(
+                    entity.text, "TRIỆU_CHỨNG", list(previous.assertions),
+                    entity.position, entity.score, entity.flag,
+                )
+                output.append(replacement)
+                audit.append({
+                    "reason": "parenthetical_symptom_alias_retype",
+                    "entity_before": _entity_audit(entity),
+                    "entity_after": _entity_audit(replacement),
+                })
+                continue
+            if folded.startswith("khong ") and re.search(r"\b(?:phan loai|chia thanh)\b", _fold_surface(raw_text[max(0, start - 220):start])):
+                audit.append({"reason": "classification_descriptor_not_diagnosis", "entity": _entity_audit(entity)})
+                continue
+            if re.search(r"\bcham soc\s*$", left) and len(_surface_tokens(entity.text)) <= 4:
+                audit.append({"reason": "care_object_not_diagnosis", "entity": _entity_audit(entity)})
+                continue
+            treatment_context = _fold_surface(raw_text[max(0, start - 180):min(len(raw_text), end + 180)])
+            if _medical_abbreviation(entity.text) and re.search(
+                r"\b(?:lieu phap|quang tri lieu|chieu|duoc su dung|lan dieu tri|psoralen)\b",
+                treatment_context,
+            ) and not re.search(r"\b(?:chan doan|mac|bi)\b", clause):
+                audit.append({"reason": "treatment_abbreviation_not_diagnosis", "entity": _entity_audit(entity)})
+                continue
             if re.match(r"^(?:voi|cua|trong|tai|theo)\b", folded):
                 audit.append({"reason": "leading_function_phrase_not_diagnosis", "entity": _entity_audit(entity)})
                 continue
@@ -1886,8 +2040,11 @@ def finalize_entities_after_editor(
     restored, restore_audit = _restore_strong_contained_drugs(
         raw_text, list(unique.values()), catalogue
     )
-    expanded, expansion_audit = _recover_single_boundary_expansions(
+    subtype_completed, subtype_audit = _recover_subtype_modifier_spans(
         raw_text, restored, catalogue
+    )
+    expanded, expansion_audit = _recover_single_boundary_expansions(
+        raw_text, subtype_completed, catalogue
     )
     composed, composition_audit = _recover_catalogue_compositions(
         raw_text, expanded, catalogue
@@ -1904,6 +2061,7 @@ def finalize_entities_after_editor(
     kept: list[NerEntity] = []
     audit: list[dict[str, Any]] = [
         *restore_audit,
+        *subtype_audit,
         *expansion_audit,
         *composition_audit,
         *dominant_audit,

@@ -178,6 +178,12 @@ class RxNormRetriever:
         if len(compact) < 8:
             return
         lexicon = self.repository.compact_component_terms
+        # Never split a complete exact repository term into smaller valid
+        # substrings. This prevents false unions such as nitroglycerin ->
+        # nitro + glycerin while still allowing genuinely fused mentions such
+        # as doxycyclinebactrim when the whole compact form is absent.
+        if compact in lexicon:
+            return
         recovered: list[str] | None = None
         for split in range(4, len(compact) - 3):
             left, right = compact[:split], compact[split:]

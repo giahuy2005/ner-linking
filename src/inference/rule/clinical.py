@@ -38,6 +38,8 @@ _DEVICE_PREFIXES = (
 )
 _GENERIC_NON_ENTITIES = {
     "kết quả", "xét nghiệm", "thuốc", "mẫu", "dấu hiệu", "triệu chứng",
+    # Bare dosage forms/containers are not medication concepts.
+    "kem", "viên", "ống", "gói", "chai",
 }
 _MEASUREMENT_ONLY_RE = re.compile(
     r"^\d+(?:[.,]\d+)?\s*(?:kg|fr|tuần|week|weeks|w|mg|mcg|micrograms?|"
@@ -127,6 +129,8 @@ def _is_hard_negative(entity: NerEntity) -> str | None:
         return "generic_non_entity"
     if normalized.isdigit():
         return "isolated_number"
+    if entity.type == "TÊN_XÉT_NGHIỆM" and re.fullmatch(r"\d+(?:[./]\d+)?", normalized):
+        return "isolated_numeric_not_test_name"
     if _MEASUREMENT_ONLY_RE.fullmatch(normalized):
         return "isolated_measurement"
     if entity.type == "THUỐC" and _DOSING_ONLY_RE.fullmatch(normalized):
@@ -212,7 +216,7 @@ _DIRECT_NEGATION_BRIDGE_RE = re.compile(
     r"(?:\s+(?:có|còn|hề|từng|hoàn\s+toàn|ghi\s+nhận|thấy|"
     r"bất\s+kỳ|dấu\s+hiệu|triệu\s+chứng|biểu\s+hiện|bằng\s+chứng|"
     r"tình\s+trạng|tiền\s+sử|bị|mắc|xuất\s+hiện|phải|được|coi|là|"
-    r"thực\s+sự|ai|gây)){0,7}$"
+    r"phát\s+hiện|thực\s+sự|ai|gây)){0,7}$"
 )
 _NEGATION_RESET_RE = re.compile(
     r"(?iu)\b(?:nhưng|tuy\s+nhiên|song|ngoại\s+trừ|sau\s+đó|"
@@ -246,7 +250,8 @@ _HISTORY_CUE_RE = re.compile(
     r"đã\s+(?:dùng|sử\s+dụng|uống|tiêm|truyền|ngừng))\b"
 )
 _CURRENT_CUE_RE = re.compile(
-    r"(?iu)\b(?:hiện\s+tại|hiện\s+đang|đang|hôm\s+nay|nay|vẫn|"
+    r"(?iu)\b(?:hiện\s+tại|hiện\s+đang|hiện\s+giờ|đang|"
+    r"đến\s+hôm\s+nay|tới\s+hôm\s+nay|hôm\s+nay|lúc\s+này|nay|vẫn|"
     r"quanh\s+năm|mọi\s+lúc|liên\s+tục|thường\s+xuyên|"
     r"đang\s+có|đang\s+bị)\b"
 )
@@ -281,6 +286,15 @@ def _negation_evidence(raw_text: str, entity: NerEntity) -> str:
             return "blocked"
         return "direct"
 
+    # Parenthesized aliases inherit a directly negated immediately preceding
+    # mention, e.g. "Phủ nhận khó thở ... (paroxysmal nocturnal dyspnea)".
+    start, end = entity.position
+    if start > 0 and raw_text[start - 1:start] == "(" and raw_text[end:end + 1] == ")":
+        alias_prefix = _sentence_prefix(raw_text, start - 1)
+        cue = _STRONG_LIST_NEGATION_RE.search(alias_prefix)
+        if cue is not None and not _NEGATION_RESET_RE.search(alias_prefix[cue.end():]):
+            return "direct"
+
     prefix = _sentence_prefix(raw_text, entity.position[0])
     if re.search(r"(?iu)\b(?:đã\s+)?hết(?:\s+(?:hẳn|hoàn\s+toàn))?$", prefix):
         return "direct"
@@ -307,7 +321,7 @@ def _negation_evidence(raw_text: str, entity: NerEntity) -> str:
     # "không ghi nhận co giật, cứng đờ, cắn lưỡi". Bare "không" does not
     # propagate past a comma because "không sốt, đau ngực" is contrastive.
     strong = _STRONG_LIST_NEGATION_RE.search(segment)
-    linked_list = re.search(r"(?iu),|\b(?:và|hoặc|hay)\b", segment)
+    linked_list = re.search(r"(?iu),|/|\b(?:và|hoặc|hay)\b", segment)
     if strong is not None and linked_list:
         suffix = segment[strong.end():]
         if not _NEGATION_RESET_RE.search(suffix) and len(suffix.split()) <= 18:
@@ -347,24 +361,32 @@ def _history_evidence(
 ) -> tuple[bool, bool]:
     """Return ``(historical, explicitly_current)``."""
     kind = section.get("kind", ASSERTION_SECTION_UNKNOWN)
-    if kind == ASSERTION_SECTION_HISTORICAL:
-        return True, False
-    if kind == ASSERTION_SECTION_FAMILY:
-        return True, False
-
     sentence = _sentence_prefix(raw_text, entity.position[0])
     local_clause = _local_clause_prefix(raw_text, entity.position[0])
     entity_text = _normalize(entity.text)
+
+    # A strong current cue in the same local clause resets a stale historical
+    # block (common in dirty records where a heading such as "Khám lúc vào
+    # viện" is missing or malformed). Explicit past cues in that same clause
+    # still win. Family-history sections retain their historical semantics.
+    local_current = bool(
+        _CURRENT_CUE_RE.search(local_clause)
+        or _CURRENT_CUE_RE.search(entity_text)
+    )
+    local_past = bool(_HISTORY_CUE_RE.search(local_clause))
+    if kind == ASSERTION_SECTION_HISTORICAL:
+        if local_current and not local_past:
+            return False, True
+        return True, False
+    if kind == ASSERTION_SECTION_FAMILY:
+        return True, False
     family_history = bool(_FAMILY_HISTORY_CUE_RE.search(sentence))
     history = bool(
         _HISTORY_CUE_RE.search(sentence)
         or family_history
         or re.search(r"(?iu)\b(?:sau|hậu)\s*$", local_clause)
     )
-    current = bool(
-        _CURRENT_CUE_RE.search(local_clause)
-        or _CURRENT_CUE_RE.search(entity_text)
-    )
+    current = local_current
 
     if kind == ASSERTION_SECTION_CURRENT:
         heading = _normalize(str(section.get("heading") or ""))
@@ -387,7 +409,9 @@ def _history_evidence(
                 sentence,
             ))
             history = past_event
-        return history, current or (strict_current and not history)
+        # Any explicit current section resets a stale model historical label
+        # unless the same sentence contains concrete past evidence.
+        return history, current or not history
     if kind == ASSERTION_SECTION_GENERAL:
         heading = _normalize(str(section.get("heading") or ""))
         question_narrative = heading.startswith((

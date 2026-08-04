@@ -37,6 +37,12 @@ _UNSAFE_SINGLE_DIAGNOSIS_TOKENS = frozenset({
     "virus", "fibrin", "gen", "enzyme", "mau", "dich",
 })
 
+_UNDERSPECIFIED_DIAGNOSIS_RE = re.compile(
+    r"^(?:nhoi mau|ap xe|viem cap|hoai tu(?: lan rong)?|"
+    r"roi loan van dong|benh tim mach|mun|khong viem|"
+    r"vo can|man tinh|toan bo|toan the)$"
+)
+
 _NON_SEMANTIC_TOKENS = {
     "benh", "hoi", "chung", "thuoc", "type", "typ", "khong", "xac", "dinh",
     "va", "hoac", "kem", "mg", "mcg", "g", "ml", "po", "iv", "im", "bid",
@@ -170,8 +176,17 @@ def _is_medical_abbreviation(text: str) -> bool:
     )
 
 
-def _unsafe_linking_fragment(entity_text: str, entity_type: str) -> str | None:
-    """Block ontology linking for obvious NER fragments, not valid short diseases."""
+def _unsafe_linking_fragment(
+    entity_text: str,
+    entity_type: str,
+    context: str = "",
+) -> str | None:
+    """Block ontology linking for fragments or clinically underspecified heads.
+
+    The guard is intentionally lexical only for diagnosis heads that cannot
+    determine an organ/subtype by themselves. More specific spans such as
+    ``nhồi máu cơ tim`` or ``áp xe phổi`` remain linkable.
+    """
     if entity_type != "CHẨN_ĐOÁN" or _is_medical_abbreviation(entity_text):
         return None
     tokens = [
@@ -180,6 +195,9 @@ def _unsafe_linking_fragment(entity_text: str, entity_type: str) -> str | None:
     ]
     if len(tokens) == 1 and tokens[0] in _UNSAFE_SINGLE_DIAGNOSIS_TOKENS:
         return "unsafe_single_token_diagnosis_fragment"
+    folded = _fold_ascii(entity_text)
+    if _UNDERSPECIFIED_DIAGNOSIS_RE.fullmatch(folded):
+        return "underspecified_diagnosis_abstain"
     return None
 
 
@@ -401,7 +419,7 @@ def _prepare_selection(
 ):
     if not candidates:
         return None
-    unsafe_reason = _unsafe_linking_fragment(entity_text, entity_type)
+    unsafe_reason = _unsafe_linking_fragment(entity_text, entity_type, context)
     if unsafe_reason is not None:
         return {
             "entity_text": entity_text,
@@ -570,6 +588,8 @@ def select_supported_top_candidates(
     *,
     max_choices: int = 2,
 ) -> list[str]:
+    if _unsafe_linking_fragment(entity_text, entity_type) is not None:
+        return []
     supported = _rank_supported_candidates(entity_text, entity_type, candidates)
     selected, _reason = _deterministic_decision(
         entity_type,
@@ -664,7 +684,10 @@ def select_candidates_many(
                 audit[index]["status"] = "deterministic_bypass"
             elif prepared["decision_reason"] == "single_medium_abstain":
                 audit[index]["status"] = "single_medium_abstain"
-            elif prepared["decision_reason"] == "unsafe_single_token_diagnosis_fragment":
+            elif prepared["decision_reason"] in {
+                "unsafe_single_token_diagnosis_fragment",
+                "underspecified_diagnosis_abstain",
+            }:
                 audit[index]["status"] = "unsafe_fragment_abstain"
             else:
                 audit[index]["status"] = "unsupported_abstain"
