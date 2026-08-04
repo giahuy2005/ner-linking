@@ -24,7 +24,7 @@ from .editor_schemas import (
 )
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v4_strict_change_only"
+PROMPT_VERSION = "qwen3_locked_editor_v5_routing_contract"
 _EDITOR_RESPONSE_FIELDS = frozenset({"request_id", "changes", "unresolved_ids"})
 
 
@@ -75,18 +75,22 @@ def build_editor_request(
     """Build the strict change-only editor request."""
     drop_reasons = "|".join(sorted(reason.value for reason in DROP_REASON_CODES))
     system = f"""Bạn là bộ biên tập NER y tế bị khóa theo candidate.
-Chỉ trả các THAY ĐỔI cần thiết cho target. Target bị lược khỏi changes nghĩa là KEEP.
+Chỉ trả các THAY ĐỔI cần thiết cho selected_target. Target bị lược khỏi changes nghĩa là KEEP.
 Context-only chỉ để tham khảo; không được tự thêm/promote/chỉnh nó, trừ khi tham gia MERGE với ít nhất một target.
 Action duy nhất hợp lệ: DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS.
-Không được xuất KEEP, FLAG_UNRESOLVED hoặc confidence.
+Không được xuất KEEP, FLAG_UNRESOLVED, confidence, reasoning hoặc markdown.
 ID phải có trong payload. MERGE cần ít nhất 2 ID. Span [start,end) là local exact substring, không qua newline/câu.
-Không chắc chắn: chỉ đưa ID target vào unresolved_ids. Không reasoning/markdown.
+MERGE chỉ dùng khi các mảnh tạo thành MỘT mention y tế bị tách. Không merge hai triệu chứng/chẩn đoán độc lập chỉ vì chúng gần nhau hoặc ngăn bởi dấu phẩy/"và"/"hoặc".
+Nếu candidate là giải phẫu, mẫu bệnh phẩm, cơ chế, hoạt động hoặc khái niệm ngoài 5 loại ontology thì dùng DROP với reason phù hợp; KHÔNG RETYPE sang loại ngoài ontology.
+Không chắc chắn: chỉ đưa ID selected_target vào unresolved_ids.
 Mỗi change phải có đúng 7 field: action,candidate_ids,text,type,assertions,local_position,reason_code.
 Field không dùng phải là null hoặc []. REPAIR_SPAN/MERGE phải trả type và assertions cuối cùng.
+assertions BẮT BUỘC là JSON list[str], chỉ được chứa đúng các chuỗi "isNegated", "isHistorical", "isFamily"; không được chứa object, boolean hoặc key type/text. Không có assertion thì dùng [].
 reason_code bắt buộc: RETYPE=WRONG_TYPE; REPAIR_SPAN=WRONG_BOUNDARY; MERGE=MERGE_REQUIRED; UPDATE_ASSERTIONS=ASSERTION_ERROR;
 DROP chỉ dùng một trong: {drop_reasons}.
-Ontology: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
-Assertion isNegated/isHistorical/isFamily chỉ dùng cho TRIỆU_CHỨNG/CHẨN_ĐOÁN/THUỐC.
+Ontology duy nhất: TRIỆU_CHỨNG, CHẨN_ĐOÁN, THUỐC, TÊN_XÉT_NGHIỆM, KẾT_QUẢ_XÉT_NGHIỆM.
+Ví dụ DROP hợp lệ: {{"action":"DROP","candidate_ids":["id"],"text":null,"type":null,"assertions":[],"local_position":null,"reason_code":"FUNCTION_WORD_OR_FRAGMENT"}}.
+Ví dụ MERGE hợp lệ: {{"action":"MERGE","candidate_ids":["id1","id2"],"text":"mention exact","type":"TRIỆU_CHỨNG","assertions":[],"local_position":[10,23],"reason_code":"MERGE_REQUIRED"}}.
 Output duy nhất: {{"request_id":"...","changes":[],"unresolved_ids":[]}}."""
     target_ids = set(region.target_candidate_ids)
     user = json.dumps({
@@ -113,6 +117,32 @@ Output duy nhất: {{"request_id":"...","changes":[],"unresolved_ids":[]}}."""
         },
     }, ensure_ascii=False, separators=(",", ":"))
     return system, user
+
+
+def build_editor_retry_request(
+    original_prompt: tuple[str, str],
+    invalid_response: str,
+    validation_error: str,
+) -> tuple[str, str]:
+    """Build one corrective retry prompt instead of repeating a deterministic error."""
+    system, user = original_prompt
+    try:
+        payload = json.loads(user)
+    except json.JSONDecodeError:
+        payload = {"original_request": user}
+    payload["retry_correction"] = {
+        "validation_error": validation_error,
+        "previous_response": invalid_response[:1800],
+        "instruction": (
+            "Sửa đúng lỗi validation và trả lại duy nhất JSON envelope. "
+            "assertions phải là list[str]; type chỉ thuộc ontology; "
+            "unresolved_ids chỉ chứa selected_target."
+        ),
+    }
+    return (
+        system + "\nĐây là lần retry duy nhất. Không lặp lại response sai; sửa đúng validation_error.",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def build_missing_request(
@@ -246,13 +276,42 @@ def editor_response_error(
     raw_response: str,
     *,
     expected_request_id: str,
+    allowed_candidate_ids: set[str] | None = None,
+    target_candidate_ids: set[str] | None = None,
 ) -> str | None:
-    """Return an envelope error for retry/audit, otherwise ``None``."""
+    """Validate envelope and operation schema before a response may enter cache."""
     try:
-        _parse_editor_envelope(
+        payload = _parse_editor_envelope(
             raw_response,
             expected_request_id=expected_request_id,
         )
+        operations: list[EditOperation] = []
+        for index, raw_action in enumerate(payload["changes"]):
+            try:
+                operations.append(EditOperation.from_dict(raw_action))
+            except Exception as exc:
+                raise ValueError(f"changes[{index}] invalid: {exc}") from exc
+
+        seen_ids: set[str] = set()
+        for index, operation in enumerate(operations):
+            ids = set(operation.candidate_ids)
+            if allowed_candidate_ids is not None and not ids <= allowed_candidate_ids:
+                unknown = sorted(ids - allowed_candidate_ids)
+                raise ValueError(f"changes[{index}] has unknown candidate_ids: {unknown}")
+            if target_candidate_ids is not None and not (ids & target_candidate_ids):
+                raise ValueError(f"changes[{index}] changes context-only candidates")
+            duplicate = seen_ids & ids
+            if duplicate:
+                raise ValueError(f"candidate appears in multiple changes: {sorted(duplicate)}")
+            seen_ids.update(ids)
+
+        unresolved = set(payload["unresolved_ids"])
+        if target_candidate_ids is not None and not unresolved <= target_candidate_ids:
+            unknown = sorted(unresolved - target_candidate_ids)
+            raise ValueError(f"unresolved_ids contains non-target IDs: {unknown}")
+        conflict = seen_ids & unresolved
+        if conflict:
+            raise ValueError(f"candidate both changed and unresolved: {sorted(conflict)}")
     except Exception as exc:
         return str(exc)
     return None
@@ -262,10 +321,14 @@ def editor_response_is_valid(
     raw_response: str,
     *,
     expected_request_id: str,
+    allowed_candidate_ids: set[str] | None = None,
+    target_candidate_ids: set[str] | None = None,
 ) -> bool:
     return editor_response_error(
         raw_response,
         expected_request_id=expected_request_id,
+        allowed_candidate_ids=allowed_candidate_ids,
+        target_candidate_ids=target_candidate_ids,
     ) is None
 
 

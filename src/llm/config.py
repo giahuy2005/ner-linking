@@ -41,7 +41,10 @@ QWEN3_8B_EDITOR_CONFIG = LocalModelConfig(
     enable_thinking=False,
     batch_size=12,
     temperature=0.0,
-    max_context_length=2048,
+    # Selector prompts can exceed 4k tokens because they include structured
+    # evidence for multiple ontology candidates. Keep this above the observed
+    # selector maximum while dynamic batching controls total batch tokens.
+    max_context_length=8192,
     retry_rounds=1,
     dtype="bfloat16",
     attention_implementation="sdpa",

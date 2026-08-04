@@ -1,16 +1,17 @@
-"""Prompt builder for the whitelisted ontology selector V2."""
-
 from __future__ import annotations
 
 import json
 from typing import Any
 
-SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v2"
+SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v3_supported_whitelist"
 
-_SYSTEM = """Bạn chọn mã RxNorm hoặc ICD-10 từ whitelist cho một mention y tế.
-Không được phát minh mã. THUỐC tối đa 1 mã. CHẨN_ĐOÁN tối đa allowed_max mã và chỉ 2 khi mention phối hợp rõ.
-Nếu bằng chứng yếu hoặc mơ hồ thì ABSTAIN/UNRESOLVED. Không markdown, không reasoning.
-Chỉ xuất đúng JSON schema:
+_SYSTEM = """Bạn chọn mã RxNorm hoặc ICD-10 chỉ từ whitelist đã được retrieval/reranker hỗ trợ.
+Không phát minh mã. Không dùng mã có hard_conflicts.
+Ưu tiên mã khớp đúng mức độ cụ thể của mention; không chọn subtype khi mention thiếu qualifier.
+Nếu mention chung và whitelist có mã không đặc hiệu/phù hợp hơn, ưu tiên mã đó.
+THUỐC tối đa 1 mã. CHẨN_ĐOÁN tối đa allowed_max mã và chỉ 2 khi mention phối hợp rõ.
+Không chọn đồng thời mã cha và mã con. Nếu bằng chứng chưa đủ thì ABSTAIN/UNRESOLVED.
+Không markdown, không reasoning. Chỉ xuất đúng JSON schema:
 {"request_id":"...","decision":"SELECT|ABSTAIN|UNRESOLVED","chosen_codes":["code"],"confidence":"HIGH|MEDIUM|LOW","reason_code":"EXACT_MATCH|STRUCTURED_MATCH|CONTEXT_DISAMBIGUATION|INSUFFICIENT_EVIDENCE|AMBIGUOUS"}"""
 
 
@@ -25,12 +26,21 @@ def build_candidate_selector_prompt(
     payload = {
         "schema_version": SELECTOR_PROMPT_VERSION,
         "request_id": request_id,
-        "entity": {"text": entity_text, "type": entity_type, "local_context": context},
+        "entity": {
+            "text": entity_text,
+            "type": entity_type,
+            "local_context": context[-320:] if context else "",
+        },
         "allowed_max": max_choices,
         "candidates": candidates,
         "response_schema": {
-            "request_id": request_id, "decision": "SELECT", "chosen_codes": ["code"],
-            "confidence": "HIGH", "reason_code": "STRUCTURED_MATCH",
+            "request_id": request_id,
+            "decision": "SELECT",
+            "chosen_codes": ["code"],
+            "confidence": "HIGH",
+            "reason_code": "STRUCTURED_MATCH",
         },
     }
-    return _SYSTEM, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    return _SYSTEM, json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), default=str
+    )

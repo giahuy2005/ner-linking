@@ -306,6 +306,7 @@ class InferencePipeline:
             apply_editor_response,
             apply_missing_decisions,
             build_editor_request,
+            build_editor_retry_request,
             build_missing_request,
             editor_response_error,
             editor_response_is_valid,
@@ -416,13 +417,25 @@ class InferencePipeline:
         raw_outputs = [""] * len(prompt_entries)
         token_budget_by_index: dict[int, int] = {}
         editor_generation_started = time.perf_counter()
-        for token_budget in (128, 160, 224, 256):
-            indexes = [index for index, item in enumerate(prompt_entries) if (
-                128 if len(item[1].target_candidate_ids) <= 2
-                else 160 if len(item[1].target_candidate_ids) <= 4
-                else 224 if not any(reason in {"boundary_disagreement", "merge_required"} for reason in item[1].reasons)
-                else 256
-            ) == token_budget]
+        def initial_editor_budget(region) -> int:
+            target_count = len(region.target_candidate_ids)
+            structural = any(reason in {
+                "contained_by_stronger_span", "adjacent_concept_continuation",
+                "boundary_conflict_with_selected", "type_conflict_with_selected",
+                "boundary_conflict_with_context", "type_conflict_with_context",
+                "possible_merge_with_selected",
+            } for reason in region.reasons)
+            if target_count <= 2:
+                return 256
+            if target_count <= 4:
+                return 320
+            return 512 if structural else 448
+
+        for token_budget in (256, 320, 448, 512):
+            indexes = [
+                index for index, item in enumerate(prompt_entries)
+                if initial_editor_budget(item[1]) == token_budget
+            ]
             for index in indexes:
                 token_budget_by_index[index] = token_budget
             subset_entries = [prompt_entries[index] for index in indexes]
@@ -432,9 +445,12 @@ class InferencePipeline:
                 response: str,
                 entries=subset_entries,
             ) -> bool:
+                region = entries[local_index][1]
                 return editor_response_is_valid(
                     response,
-                    expected_request_id=entries[local_index][1].request_id,
+                    expected_request_id=region.request_id,
+                    allowed_candidate_ids=set(region.candidate_ids),
+                    target_candidate_ids=set(region.target_candidate_ids),
                 )
 
             generated = generate_with_cache(
@@ -453,51 +469,84 @@ class InferencePipeline:
                 raw_outputs[index] = response
 
         initial_raw_outputs = list(raw_outputs)
-        retry_errors = {
-            index: editor_response_error(
+        retry_errors = {}
+        for index, response in enumerate(raw_outputs):
+            region = prompt_entries[index][1]
+            retry_errors[index] = editor_response_error(
                 response,
-                expected_request_id=prompt_entries[index][1].request_id,
+                expected_request_id=region.request_id,
+                allowed_candidate_ids=set(region.candidate_ids),
+                target_candidate_ids=set(region.target_candidate_ids),
             )
-            for index, response in enumerate(raw_outputs)
-        }
         retry_indexes = [
             index for index, error in retry_errors.items() if error is not None
         ]
         workload["editor_retry_count"] = len(retry_indexes)
         if retry_indexes:
-            retry_entries = [prompt_entries[index] for index in retry_indexes]
-            retry_budget = min(
-                512,
-                max(
-                    256,
-                    max(token_budget_by_index.get(index, 128) * 2 for index in retry_indexes),
-                ),
-            )
-
-            def validate_retry_response(
-                local_index: int,
-                response: str,
-                entries=retry_entries,
-            ) -> bool:
-                return editor_response_is_valid(
-                    response,
-                    expected_request_id=entries[local_index][1].request_id,
+            retry_prompt_by_index = {
+                index: build_editor_retry_request(
+                    prompt_entries[index][3],
+                    initial_raw_outputs[index],
+                    retry_errors[index] or "unknown validation error",
+                )
+                for index in retry_indexes
+            }
+            retry_budget_by_index = {
+                index: min(
+                    768,
+                    max(384, token_budget_by_index.get(index, 256) * 2),
+                )
+                for index in retry_indexes
+            }
+            workload["editor_retry_buckets"] = {
+                str(budget): sum(
+                    1 for index in retry_indexes
+                    if retry_budget_by_index[index] == budget
+                )
+                for budget in sorted(set(retry_budget_by_index.values()))
+            }
+            for retry_budget in sorted(set(retry_budget_by_index.values())):
+                bucket_indexes = [
+                    index for index in retry_indexes
+                    if retry_budget_by_index[index] == retry_budget
+                ]
+                retry_entries = [prompt_entries[index] for index in bucket_indexes]
+                retry_prompts = [retry_prompt_by_index[index] for index in bucket_indexes]
+                retry_token_counts = (
+                    qwen_llm.count_prompt_tokens(retry_prompts)
+                    if retry_prompts and hasattr(qwen_llm, "count_prompt_tokens")
+                    else []
                 )
 
-            retry_generated = generate_with_cache(
-                qwen_llm, [item[3] for item in retry_entries],
-                batch_size=batch_size, model_id=model_id,
-                task=f"ner_editor_retry:max{retry_budget}", cache=cache,
-                max_new_tokens=retry_budget,
-                prompt_version=PROMPT_VERSION,
-                max_batch_tokens=max_batch_tokens, min_batch_size=min_batch_size,
-                dynamic_batching=dynamic_batching, progress_every=progress_every,
-                progress_callback=record_progress,
-                prompt_token_counts=[editor_token_counts[index] for index in retry_indexes] if editor_token_counts else None,
-                response_validator=validate_retry_response,
-            )
-            for index, response in zip(retry_indexes, retry_generated):
-                raw_outputs[index] = response
+                def validate_retry_response(
+                    local_index: int,
+                    response: str,
+                    entries=retry_entries,
+                ) -> bool:
+                    region = entries[local_index][1]
+                    return editor_response_is_valid(
+                        response,
+                        expected_request_id=region.request_id,
+                        allowed_candidate_ids=set(region.candidate_ids),
+                        target_candidate_ids=set(region.target_candidate_ids),
+                    )
+
+                retry_generated = generate_with_cache(
+                    qwen_llm, retry_prompts,
+                    batch_size=batch_size, model_id=model_id,
+                    task=f"ner_editor_retry:max{retry_budget}", cache=cache,
+                    max_new_tokens=retry_budget,
+                    prompt_version=PROMPT_VERSION,
+                    max_batch_tokens=max_batch_tokens,
+                    min_batch_size=min_batch_size,
+                    dynamic_batching=dynamic_batching,
+                    progress_every=progress_every,
+                    progress_callback=record_progress,
+                    prompt_token_counts=retry_token_counts or None,
+                    response_validator=validate_retry_response,
+                )
+                for index, response in zip(bucket_indexes, retry_generated):
+                    raw_outputs[index] = response
         editor_generation_seconds = time.perf_counter() - editor_generation_started
         def entity_audit_value(entity: NerEntity) -> dict:
             return {
@@ -856,13 +905,34 @@ class InferencePipeline:
                 else:
                     batches = []
                     for mention in mentions:
-                        value = linker.link(mention, **({"top_k_codes": top_k} if linker_name == "icd10" else {"top_k": top_k}))
+                        value = linker.link(
+                            mention,
+                            **({"top_k_codes": linker_top_k} if linker_name == "icd10" else {"top_k": linker_top_k}),
+                        )
                         batches.append(value.get("candidates", []) if isinstance(value, dict) else value)
                 if len(batches) != len(items):
                     raise ValueError("link_many returned the wrong number of rows")
             except Exception as exc:
-                print(f"[pipeline] batch {linker_name} linking failed: {exc}", file=sys.stderr)
-                batches = [[] for _ in items]
+                print(
+                    f"[pipeline] batch {linker_name} linking failed: {exc}; retrying per mention",
+                    file=sys.stderr,
+                )
+                batches = []
+                for mention in mentions:
+                    try:
+                        value = linker.link(
+                            mention,
+                            **({"top_k_codes": linker_top_k} if linker_name == "icd10" else {"top_k": linker_top_k}),
+                        )
+                        batches.append(
+                            value.get("candidates", []) if isinstance(value, dict) else value
+                        )
+                    except Exception as item_exc:
+                        print(
+                            f"[pipeline] isolated {linker_name} linking error for {mention!r}: {item_exc}",
+                            file=sys.stderr,
+                        )
+                        batches.append([])
             for (rid, index, _entity), candidates in zip(items, batches):
                 results[rid][index] = list(candidates or [])
         self.last_linking_retrieval = results

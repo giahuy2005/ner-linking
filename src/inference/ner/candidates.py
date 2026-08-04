@@ -165,17 +165,176 @@ _DEVICE_OR_PROCEDURE_CUES = (
 _TEST_EQUIPMENT_CUES = (
     "kính hiển", "máy đo", "máy xét nghiệm", "thiết bị", "đầu dò", "màn hình",
 )
+_STRUCTURAL_FLAGS = frozenset({
+    "boundary_disagreement", "type_disagreement", "possible_merge",
+})
+_SENTENCE_BREAK_RE = re.compile(r"(?:[.!?;](?:\\s|$)|[\\r\\n])")
+_TOKEN_RE = re.compile(r"[^\\W_]+", re.UNICODE)
 
 
-def review_reasons(item: CandidateEvidence) -> list[str]:
-    normalized = re.sub(r"\s+", " ", item.text.casefold()).strip()
-    compact = "".join(char for char in normalized if char.isalnum())
-    # Weak span-head audit evidence is retained in the catalog but does not
-    # become an editor target. It can still be attached as context to a
-    # selected target with a structural relation.
+def _normalized_surface(text: str) -> str:
+    return re.sub(r"\\s+", " ", text.casefold()).strip()
+
+
+def _max_score(item: CandidateEvidence) -> float:
+    return max((float(value) for value in item.scores.values()), default=0.0)
+
+
+def _overlaps(left: CandidateEvidence, right: CandidateEvidence) -> bool:
+    return left.position[0] < right.position[1] and left.position[1] > right.position[0]
+
+
+def _contains(outer: CandidateEvidence, inner: CandidateEvidence) -> bool:
+    return (
+        outer.position[0] <= inner.position[0]
+        and outer.position[1] >= inner.position[1]
+        and outer.position != inner.position
+    )
+
+
+def _same_line(raw_text: str, left: CandidateEvidence, right: CandidateEvidence) -> bool:
+    start = min(left.position[1], right.position[1])
+    end = max(left.position[0], right.position[0])
+    if end < start:
+        start, end = min(left.position[0], right.position[0]), max(
+            left.position[1], right.position[1]
+        )
+    between = raw_text[start:end]
+    return "\\n" not in between and "\\r" not in between
+
+
+def _safe_gap(raw_text: str, left: CandidateEvidence, right: CandidateEvidence) -> str | None:
+    first, second = sorted((left, right), key=lambda item: item.position)
+    if first.position[1] > second.position[0]:
+        return ""
+    value = raw_text[first.position[1]:second.position[0]]
+    if _SENTENCE_BREAK_RE.search(value):
+        return None
+    return value
+
+
+def _is_medical_abbreviation(text: str) -> bool:
+    compact = "".join(char for char in text if char.isalnum())
+    if not 2 <= len(compact) <= 10:
+        return False
+    letters = [char for char in compact if char.isalpha()]
+    return bool(letters) and all(char.isupper() for char in letters)
+
+
+def _token_count(text: str) -> int:
+    return len(_TOKEN_RE.findall(text))
+
+
+def _looks_fragmentary(item: CandidateEvidence) -> bool:
+    normalized = _normalized_surface(item.text)
+    if normalized in _FUNCTION_WORDS or normalized in _GENERIC_DIAGNOSIS_NOUNS:
+        return True
+    if _is_medical_abbreviation(item.text):
+        return False
+    return _token_count(item.text) <= 1 and _max_score(item) < 0.82
+
+
+def _context_boundary_is_material(
+    item: CandidateEvidence,
+    other: CandidateEvidence,
+) -> bool:
+    """Whether an audit-only boundary is strong enough to review a selected item."""
+    if not _overlaps(item, other) or item.position == other.position:
+        return False
+    if not (_contains(other, item) or _contains(item, other)):
+        return _max_score(other) >= 0.90
+    if _contains(other, item):
+        extension = (other.position[1] - other.position[0]) - (
+            item.position[1] - item.position[0]
+        )
+        return extension >= 2 and (
+            _max_score(other) >= 0.82
+            or _max_score(other) >= _max_score(item) + 0.08
+        )
+    return _max_score(other) >= 0.92
+
+
+def _structural_review_reasons(
+    item: CandidateEvidence,
+    *,
+    by_id: dict[str, CandidateEvidence],
+    raw_text: str,
+) -> list[str]:
+    reasons: list[str] = []
+    item_score = _max_score(item)
+    for candidate_id in item.related_candidate_ids:
+        other = by_id.get(candidate_id)
+        if other is None or not _same_line(raw_text, item, other):
+            continue
+        other_score = _max_score(other)
+        if _overlaps(item, other):
+            if other.pre_llm_selected:
+                # A clean strong entity must not become a target merely because a
+                # weak selected fragment overlaps it. Review the weak fragment and
+                # keep the strong entity as context instead.
+                if (
+                    item.strong_consensus
+                    and not other.strong_consensus
+                    and other_score < 0.80
+                ):
+                    continue
+                if item.type != other.type:
+                    reasons.append("type_conflict_with_selected")
+                elif item.position != other.position:
+                    reasons.append("boundary_conflict_with_selected")
+            elif _context_boundary_is_material(item, other):
+                if _contains(other, item):
+                    reasons.append("contained_by_stronger_span")
+                elif item.type != other.type:
+                    reasons.append("type_conflict_with_context")
+                else:
+                    reasons.append("boundary_conflict_with_context")
+            continue
+
+        gap = _safe_gap(raw_text, item, other)
+        if gap is None or len(gap) > 12:
+            continue
+        same_type = item.type == other.type
+        if not same_type:
+            continue
+        if other.pre_llm_selected:
+            if (
+                item.strong_consensus
+                and not other.strong_consensus
+                and other_score < 0.80
+            ):
+                continue
+            if _looks_fragmentary(item) or _looks_fragmentary(other):
+                reasons.append("adjacent_concept_continuation")
+            elif not item.strong_consensus and not other.strong_consensus:
+                reasons.append("possible_merge_with_selected")
+        elif (
+            _looks_fragmentary(item)
+            and other_score >= max(0.82, item_score + 0.05)
+        ):
+            reasons.append("adjacent_concept_continuation")
+    return list(dict.fromkeys(reasons))
+
+
+def review_reasons(
+    item: CandidateEvidence,
+    *,
+    by_id: dict[str, CandidateEvidence] | None = None,
+    raw_text: str = "",
+) -> list[str]:
+    """Return target-only reasons; weak alternatives remain context/audit evidence."""
     if not item.pre_llm_selected:
         return []
-    reasons = list(item.negative_flags)
+
+    normalized = _normalized_surface(item.text)
+    compact = "".join(char for char in normalized if char.isalnum())
+    # Structural flags are recomputed directionally below. The old symmetric
+    # flags made a clean CRF/span consensus target whenever any weak audit span
+    # overlapped it, which inflated editor workload and confused MERGE decisions.
+    reasons = [
+        reason for reason in item.negative_flags
+        if reason not in _STRUCTURAL_FLAGS
+    ]
     if len(compact) <= 1 and any(char.isalpha() for char in compact):
         reasons.append("one_character_alphabetic")
     if normalized in _FUNCTION_WORDS:
@@ -194,16 +353,44 @@ def review_reasons(item: CandidateEvidence) -> list[str]:
         reasons.append("result_fragment_without_typed_context")
     if item.type not in ASSERTION_ENTITY_TYPES and item.assertions:
         reasons.append("assertion_not_allowed_for_type")
-    score = max(item.scores.values(), default=0.0)
-    if item.pre_llm_selected and score < 0.80:
+
+    score = _max_score(item)
+    if score < 0.80:
         reasons.append("low_confidence_preselected")
     if (
-        item.pre_llm_selected
-        and "span_head" in item.sources
+        "span_head" in item.sources
         and not ({"crf", "local_crf"} & set(item.sources))
     ):
         reasons.append("span_only_candidate")
+    if by_id is not None and raw_text:
+        reasons.extend(_structural_review_reasons(item, by_id=by_id, raw_text=raw_text))
+
+    # Clean high-confidence consensus bypasses Qwen unless it has an intrinsic
+    # issue or a real conflict with another selected/stronger candidate.
+    if item.strong_consensus:
+        meaningful = [
+            reason for reason in reasons
+            if reason not in {"low_confidence_preselected", "span_only_candidate"}
+        ]
+        if not meaningful:
+            return []
     return list(dict.fromkeys(reasons))
+
+
+def _context_priority(
+    candidate: CandidateEvidence,
+    targets: list[CandidateEvidence],
+) -> tuple[int, int, float, int, int]:
+    overlaps = any(_overlaps(candidate, target) for target in targets)
+    contains_target = any(_contains(candidate, target) for target in targets)
+    selected_clean = candidate.pre_llm_selected and candidate.strong_consensus
+    return (
+        int(contains_target),
+        int(overlaps),
+        _max_score(candidate),
+        int(selected_clean),
+        candidate.position[1] - candidate.position[0],
+    )
 
 
 def build_review_regions(
@@ -211,69 +398,74 @@ def build_review_regions(
     raw_text: str,
     catalog: list[CandidateEvidence],
     *,
-    context_radius: int = 240,
+    context_radius: int = 180,
     group_distance: int = 80,
     max_candidates: int = 6,
     hard_max_candidates: int = 8,
 ) -> list[ReviewRegion]:
-    """Build bounded primary review requests; clean consensus stays local."""
+    """Build structurally connected review regions with clean evidence as context."""
     if not 1 <= max_candidates <= hard_max_candidates <= 8:
         raise ValueError("review candidate limits must satisfy 1 <= max <= hard <= 8")
     by_id = {item.candidate_id: item for item in catalog}
     reasons_by_id = {
-        item.candidate_id: review_reasons(item) for item in catalog
+        item.candidate_id: review_reasons(item, by_id=by_id, raw_text=raw_text)
+        for item in catalog
     }
     suspicious = [item for item in catalog if reasons_by_id[item.candidate_id]]
-    assigned: set[str] = set()
+    suspicious.sort(key=lambda item: (*item.position, item.type))
     regions: list[ReviewRegion] = []
-    for seed in suspicious:
-        if seed.candidate_id in assigned:
-            continue
-        group = [seed]
-        assigned.add(seed.candidate_id)
-        queue = list(seed.related_candidate_ids)
-        while queue and len(group) < max_candidates:
-            candidate_id = queue.pop(0)
-            item = by_id.get(candidate_id)
-            if item is None or candidate_id in assigned or not reasons_by_id[candidate_id]:
-                continue
-            group.append(item)
-            assigned.add(candidate_id)
-            queue.extend(item.related_candidate_ids)
-        for item in suspicious:
-            if len(group) >= max_candidates:
+    cursor = 0
+
+    while cursor < len(suspicious):
+        group = [suspicious[cursor]]
+        cursor += 1
+        while cursor < len(suspicious) and len(group) < max_candidates:
+            item = suspicious[cursor]
+            gap = item.position[0] - group[-1].position[1]
+            total_span = item.position[1] - group[0].position[0]
+            # Independent targets may share one request for efficiency, but all
+            # edit operations remain candidate-locked. The prompt explicitly
+            # forbids merging across sentences/newlines or unrelated concepts.
+            if gap > max(group_distance, 80) or total_span > 360:
                 break
-            if item.candidate_id in assigned:
-                continue
-            gap = item.position[0] - max(member.position[1] for member in group)
-            if 0 <= gap <= group_distance:
-                group.append(item)
-                assigned.add(item.candidate_id)
-        group.sort(key=lambda item: (*item.position, item.type))
-        context_items = []
+            group.append(item)
+            cursor += 1
+
         target_ids = {item.candidate_id for item in group}
+        context_pool: dict[str, CandidateEvidence] = {}
         for target in group:
             for candidate_id in target.related_candidate_ids:
                 item = by_id.get(candidate_id)
-                if item is None or candidate_id in target_ids or item in context_items:
-                    continue
-                if len(group) + len(context_items) >= hard_max_candidates:
-                    break
-                context_items.append(item)
+                if item is not None and candidate_id not in target_ids:
+                    context_pool[candidate_id] = item
+        context_items = sorted(
+            context_pool.values(),
+            key=lambda item: _context_priority(item, group),
+            reverse=True,
+        )[: max(0, hard_max_candidates - len(group))]
+
         all_items = [*group, *context_items]
         core_start = min(item.position[0] for item in all_items)
         core_end = max(item.position[1] for item in all_items)
         context_start = max(0, core_start - context_radius)
         context_end = min(len(raw_text), core_end + context_radius)
-        if context_end - context_start > 900:
-            context_start = max(0, core_start - 300)
-            context_end = min(len(raw_text), context_start + 900)
+        if context_end - context_start > 720:
+            context_start = max(0, core_start - 240)
+            context_end = min(len(raw_text), context_start + 720)
             if context_end < core_end:
                 context_end = core_end
-                context_start = max(0, context_end - 900)
+                context_start = max(0, context_end - 720)
+
         region_reasons = sorted({
             reason for item in group for reason in reasons_by_id[item.candidate_id]
         })
+        high_priority_reasons = {
+            "assertion_not_allowed_for_type", "one_character_alphabetic",
+            "function_word_fragment", "generic_diagnosis_noun",
+            "contained_by_stronger_span", "adjacent_concept_continuation",
+            "boundary_conflict_with_selected", "type_conflict_with_selected",
+            "boundary_conflict_with_context", "type_conflict_with_context",
+        }
         regions.append(ReviewRegion(
             request_id=f"{record_id}:region:{len(regions):04d}",
             record_id=record_id,
@@ -283,10 +475,10 @@ def build_review_regions(
             target_candidate_ids=[item.candidate_id for item in group],
             context_candidate_ids=[item.candidate_id for item in context_items],
             reasons=region_reasons,
-            priority=max((100 if reason in {
-                "assertion_not_allowed_for_type", "boundary_disagreement",
-                "type_disagreement", "one_character_alphabetic",
-            } else 50) for reason in region_reasons),
+            priority=(
+                100 if any(reason in high_priority_reasons for reason in region_reasons)
+                else 50
+            ),
             must_review=True,
         ))
     return regions
