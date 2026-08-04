@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -154,9 +155,11 @@ def build_candidate_catalog(
 _FUNCTION_WORDS = frozenset({
     "có", "không", "ít", "nhiều", "âm", "dương", "và", "hoặc", "của",
     "cho", "với", "trong", "ngoài", "tại", "là", "bị", "được", "còn",
+    "các", "sau", "phải",
 })
 _GENERIC_DIAGNOSIS_NOUNS = frozenset({
     "bệnh", "bệnh lý", "rối loạn", "tình trạng", "hội chứng", "tổn thương",
+    "viêm", "tổn", "miễn",
 })
 _DEVICE_OR_PROCEDURE_CUES = (
     "catheter", "picc", "stent", "đường truyền", "ống thông", "ống dẫn",

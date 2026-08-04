@@ -308,9 +308,13 @@ class InferencePipeline:
             build_editor_request,
             build_editor_retry_request,
             build_missing_request,
+            build_missing_retry_request,
             editor_response_error,
             editor_response_is_valid,
+            finalize_entities_after_editor,
             generate_with_cache,
+            missing_response_error,
+            missing_response_is_valid,
             parse_missing_response,
         )
         from .ner.editor_schemas import ReviewRegion
@@ -607,6 +611,7 @@ class InferencePipeline:
             result = apply_editor_response(
                 raw_texts_by_id[record_id], region_candidates, raw_output,
                 context_start=region.context_start,
+                context_end=region.context_end,
                 validation_candidates=catalogs[record_id],
                 target_candidate_ids=region.target_candidate_ids,
                 expected_request_id=region.request_id,
@@ -663,6 +668,10 @@ class InferencePipeline:
             summary["retried"] += int(was_retried)
             summary["parse_failure" if parse_failed else "parse_success"] += 1
         for record_id in outputs:
+            outputs[record_id], finalization_audit = finalize_entities_after_editor(
+                raw_texts_by_id[record_id], outputs[record_id], catalogs[record_id],
+            )
+            audit[record_id]["post_editor_finalization"] = finalization_audit
             audit[record_id]["entities_after_editor"] = [
                 entity_audit_value(item) for item in outputs[record_id]
             ]
@@ -670,7 +679,7 @@ class InferencePipeline:
 
         recovery_started = time.perf_counter()
         proposals_by_id = {}
-        missing_entries: list[tuple[str, list, int, tuple[str, str]]] = []
+        missing_entries: list[tuple[str, list, int, str, tuple[str, str]]] = []
         for record_id, catalog in catalogs.items():
             proposals = build_missing_proposals(
                 record_id, raw_texts_by_id[record_id], catalog,
@@ -714,10 +723,10 @@ class InferencePipeline:
                     context_start,
                     chunk,
                 )
-                missing_entries.append((record_id, chunk, context_start, prompt))
+                missing_entries.append((record_id, chunk, context_start, request_id, prompt))
         if include_recovery:
             missing_outputs = [""] * len(missing_entries)
-            recovery_prompts = [item[3] for item in missing_entries]
+            recovery_prompts = [item[4] for item in missing_entries]
             recovery_token_counts = (
                 qwen_llm.count_prompt_tokens(recovery_prompts)
                 if recovery_prompts and hasattr(qwen_llm, "count_prompt_tokens") else []
@@ -727,14 +736,28 @@ class InferencePipeline:
                 "recovery_input_tokens_p50": _pctl(recovery_token_counts, 0.50),
                 "recovery_input_tokens_p95": _pctl(recovery_token_counts, 0.95),
                 "recovery_input_tokens_max": max(recovery_token_counts, default=0),
+                "recovery_retry_count": 0,
             })
             print(f"[Qwen:workload-before-recovery] {workload}", file=sys.stderr, flush=True)
+            recovery_budget_by_index: dict[int, int] = {}
             for token_budget in (96, 128, 160):
                 indexes = [index for index, item in enumerate(missing_entries) if (
                     96 if len(item[1]) <= 2 else 128 if len(item[1]) <= 4 else 160
                 ) == token_budget]
+                if not indexes:
+                    continue
+
+                def validate_missing_response(local_index: int, response: str, bucket=indexes) -> bool:
+                    original_index = bucket[local_index]
+                    _record_id, proposals, _context_start, request_id, _prompt = missing_entries[original_index]
+                    return missing_response_is_valid(
+                        response,
+                        expected_request_id=request_id,
+                        allowed_proposal_ids={item.proposal_id for item in proposals},
+                    )
+
                 generated = generate_with_cache(
-                    qwen_llm, [missing_entries[index][3] for index in indexes],
+                    qwen_llm, [missing_entries[index][4] for index in indexes],
                     batch_size=batch_size, model_id=model_id,
                     task=f"missing_proposal:max{token_budget}", cache=cache,
                     max_new_tokens=token_budget,
@@ -743,29 +766,95 @@ class InferencePipeline:
                     dynamic_batching=dynamic_batching, progress_every=progress_every,
                     progress_callback=record_progress,
                     prompt_token_counts=[recovery_token_counts[index] for index in indexes] if recovery_token_counts else None,
+                    response_validator=validate_missing_response,
                 )
                 for index, response in zip(indexes, generated):
                     missing_outputs[index] = response
-            for (record_id, proposals, _context_start, _prompt), raw_output in zip(
-                missing_entries, missing_outputs,
-            ):
-                decisions, rejected = parse_missing_response(raw_output)
+                    recovery_budget_by_index[index] = token_budget
+
+            recovery_errors: dict[int, str | None] = {}
+            for index, response in enumerate(missing_outputs):
+                _record_id, proposals, _context_start, request_id, _prompt = missing_entries[index]
+                recovery_errors[index] = missing_response_error(
+                    response,
+                    expected_request_id=request_id,
+                    allowed_proposal_ids={item.proposal_id for item in proposals},
+                )
+            retry_indexes = [index for index, error in recovery_errors.items() if error is not None]
+            workload["recovery_retry_count"] = len(retry_indexes)
+            if retry_indexes:
+                retry_prompts = [
+                    build_missing_retry_request(
+                        missing_entries[index][4],
+                        missing_outputs[index],
+                        recovery_errors[index] or "unknown validation error",
+                    )
+                    for index in retry_indexes
+                ]
+                retry_token_counts = (
+                    qwen_llm.count_prompt_tokens(retry_prompts)
+                    if hasattr(qwen_llm, "count_prompt_tokens") else []
+                )
+
+                def validate_missing_retry(local_index: int, response: str) -> bool:
+                    original_index = retry_indexes[local_index]
+                    _record_id, proposals, _context_start, request_id, _prompt = missing_entries[original_index]
+                    return missing_response_is_valid(
+                        response,
+                        expected_request_id=request_id,
+                        allowed_proposal_ids={item.proposal_id for item in proposals},
+                    )
+
+                retry_outputs = generate_with_cache(
+                    qwen_llm,
+                    retry_prompts,
+                    batch_size=batch_size,
+                    model_id=model_id,
+                    task="missing_proposal_retry:max256",
+                    cache=cache,
+                    max_new_tokens=256,
+                    prompt_version=PROMPT_VERSION,
+                    max_batch_tokens=max_batch_tokens,
+                    min_batch_size=min_batch_size,
+                    dynamic_batching=dynamic_batching,
+                    progress_every=progress_every,
+                    progress_callback=record_progress,
+                    prompt_token_counts=retry_token_counts or None,
+                    response_validator=validate_missing_retry,
+                )
+                for index, response in zip(retry_indexes, retry_outputs):
+                    missing_outputs[index] = response
+
+            for entry_index, (
+                (record_id, proposals, _context_start, request_id, _prompt), raw_output,
+            ) in enumerate(zip(missing_entries, missing_outputs)):
+                decisions, rejected = parse_missing_response(
+                    raw_output,
+                    expected_request_id=request_id,
+                    allowed_proposal_ids={item.proposal_id for item in proposals},
+                )
                 missing_result = apply_missing_decisions(
-                    raw_texts_by_id[record_id], outputs[record_id],
-                    proposals, decisions,
+                    raw_texts_by_id[record_id], outputs[record_id], proposals, decisions,
                 )
                 outputs[record_id] = [
                     normalize_entity_schema(item) for item in missing_result.entities
                 ]
                 audit[record_id].setdefault("missing_regions", []).append({
+                    "request_id": request_id,
                     "proposal_ids": [item.proposal_id for item in proposals],
                     "raw_response": raw_output,
+                    "retry_attempted": entry_index in retry_indexes,
+                    "initial_response_error": recovery_errors.get(entry_index),
                     "applied": missing_result.applied,
                     "rejected": rejected + missing_result.rejected,
                     "unresolved": missing_result.unresolved,
                 })
         for record_id, entities in outputs.items():
-            outputs[record_id] = [normalize_entity_schema(item) for item in entities]
+            normalized = [normalize_entity_schema(item) for item in entities]
+            outputs[record_id], finalization_audit = finalize_entities_after_editor(
+                raw_texts_by_id[record_id], normalized, catalogs[record_id],
+            )
+            audit[record_id]["post_recovery_finalization"] = finalization_audit
             audit[record_id]["entities_after_recovery"] = [
                 entity_audit_value(item) for item in outputs[record_id]
             ]

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -24,8 +26,9 @@ from .editor_schemas import (
 )
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v5_routing_contract"
+PROMPT_VERSION = "qwen3_locked_editor_v6_safe_finalization"
 _EDITOR_RESPONSE_FIELDS = frozenset({"request_id", "changes", "unresolved_ids"})
+_MISSING_RESPONSE_FIELDS = frozenset({"request_id", "additions", "unresolved_ids"})
 
 
 @dataclass
@@ -78,7 +81,7 @@ def build_editor_request(
 Chỉ trả các THAY ĐỔI cần thiết cho selected_target. Target bị lược khỏi changes nghĩa là KEEP.
 Context-only chỉ để tham khảo; không được tự thêm/promote/chỉnh nó, trừ khi tham gia MERGE với ít nhất một target.
 Action duy nhất hợp lệ: DROP, RETYPE, REPAIR_SPAN, MERGE, UPDATE_ASSERTIONS.
-Không được xuất KEEP, FLAG_UNRESOLVED, confidence, reasoning hoặc markdown.
+Không được xuất KEEP, FLAG_UNRESOLVED, confidence, reasoning hoặc markdown. Mỗi candidate chỉ nên xuất hiện trong một change; nếu MERGE hợp lệ thì không đồng thời DROP/REPAIR cùng candidate đó.
 ID phải có trong payload. MERGE cần ít nhất 2 ID. Span [start,end) là local exact substring, không qua newline/câu.
 MERGE chỉ dùng khi các mảnh tạo thành MỘT mention y tế bị tách. Không merge hai triệu chứng/chẩn đoán độc lập chỉ vì chúng gần nhau hoặc ngăn bởi dấu phẩy/"và"/"hoặc".
 Nếu candidate là giải phẫu, mẫu bệnh phẩm, cơ chế, hoạt động hoặc khái niệm ngoài 5 loại ontology thì dùng DROP với reason phù hợp; KHÔNG RETYPE sang loại ngoài ontology.
@@ -190,42 +193,149 @@ Output duy nhất: {"request_id":"...","additions":[{"proposal_id":"p","type":"C
     return system, user
 
 
+def build_missing_retry_request(
+    original_prompt: tuple[str, str],
+    invalid_response: str,
+    validation_error: str,
+) -> tuple[str, str]:
+    """Build one corrective retry for malformed missing-proposal JSON."""
+    system, user = original_prompt
+    try:
+        payload = json.loads(user)
+    except json.JSONDecodeError:
+        payload = {"original_request": user}
+    payload["retry_correction"] = {
+        "validation_error": validation_error,
+        "previous_response": invalid_response[:1600],
+        "instruction": (
+            "Trả duy nhất JSON envelope đúng request_id. additions phải là list object; "
+            "proposal_id phải thuộc payload; assertions phải là list[str]."
+        ),
+    }
+    return (
+        system + "\nĐây là lần retry duy nhất. Sửa đúng validation_error, không thêm reasoning.",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _parse_missing_envelope(
+    raw_response: str,
+    *,
+    expected_request_id: str = "",
+    allowed_proposal_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    payload = extract_json(raw_response)
+    if not isinstance(payload, dict):
+        raise TypeError("missing response must be a JSON object")
+    fields = set(payload)
+    missing = _MISSING_RESPONSE_FIELDS - fields
+    extra = fields - _MISSING_RESPONSE_FIELDS
+    if missing:
+        raise ValueError(f"missing response missing fields: {sorted(missing)}")
+    if extra:
+        raise ValueError(f"missing response has unsupported fields: {sorted(extra)}")
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str):
+        raise TypeError("request_id must be a string")
+    if expected_request_id and request_id != expected_request_id:
+        raise ValueError(
+            f"request_id mismatch: expected={expected_request_id!r}, got={request_id!r}"
+        )
+    additions = payload.get("additions")
+    unresolved = payload.get("unresolved_ids")
+    if not isinstance(additions, list):
+        raise TypeError("additions must be a list")
+    if not isinstance(unresolved, list) or not all(isinstance(item, str) for item in unresolved):
+        raise TypeError("unresolved_ids must be list[str]")
+    if len(unresolved) != len(set(unresolved)):
+        raise ValueError("unresolved_ids contains duplicates")
+    seen: set[str] = set()
+    for index, row in enumerate(additions):
+        if not isinstance(row, dict):
+            raise TypeError(f"additions[{index}] must be an object")
+        decision = MissingDecision.from_dict({
+            **row,
+            "decision": "ADD_PROPOSAL",
+            "confidence": "HIGH",
+            "reason_code": "VALID_MISSING_ENTITY",
+        })
+        if decision.proposal_id in seen:
+            raise ValueError(f"duplicate proposal_id: {decision.proposal_id}")
+        seen.add(decision.proposal_id)
+        if allowed_proposal_ids is not None and decision.proposal_id not in allowed_proposal_ids:
+            raise ValueError(f"unknown proposal_id: {decision.proposal_id}")
+    if allowed_proposal_ids is not None:
+        unknown = set(unresolved) - allowed_proposal_ids
+        if unknown:
+            raise ValueError(f"unknown unresolved proposal IDs: {sorted(unknown)}")
+    conflict = seen & set(unresolved)
+    if conflict:
+        raise ValueError(f"proposal both added and unresolved: {sorted(conflict)}")
+    return payload
+
+
+def missing_response_error(
+    raw_response: str,
+    *,
+    expected_request_id: str = "",
+    allowed_proposal_ids: set[str] | None = None,
+) -> str | None:
+    try:
+        _parse_missing_envelope(
+            raw_response,
+            expected_request_id=expected_request_id,
+            allowed_proposal_ids=allowed_proposal_ids,
+        )
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def missing_response_is_valid(
+    raw_response: str,
+    *,
+    expected_request_id: str = "",
+    allowed_proposal_ids: set[str] | None = None,
+) -> bool:
+    return missing_response_error(
+        raw_response,
+        expected_request_id=expected_request_id,
+        allowed_proposal_ids=allowed_proposal_ids,
+    ) is None
+
+
 def parse_missing_response(
     raw_response: str,
+    *,
+    expected_request_id: str = "",
+    allowed_proposal_ids: set[str] | None = None,
 ) -> tuple[list[MissingDecision], list[dict[str, Any]]]:
-    rejected: list[dict[str, Any]] = []
     try:
-        payload = extract_json(raw_response)
-        if not isinstance(payload, dict):
-            raise TypeError("missing response must be a JSON object")
-        if "additions" in payload:
-            additions = payload.get("additions")
-            unresolved = payload.get("unresolved_ids", [])
-            if not isinstance(additions, list) or not isinstance(unresolved, list):
-                raise TypeError("additions and unresolved_ids must be lists")
-            if not all(isinstance(item, str) for item in unresolved):
-                raise TypeError("unresolved_ids must be list[str]")
-            rows = [{
-                **row,
-                "decision": "ADD_PROPOSAL",
-                "confidence": "HIGH",
-                "reason_code": "VALID_MISSING_ENTITY",
-            } for row in additions]
-            rows.extend({
-                "proposal_id": proposal_id,
-                "decision": "UNRESOLVED",
-                "type": None,
-                "assertions": [],
-                "confidence": "LOW",
-                "reason_code": "AMBIGUOUS",
-            } for proposal_id in unresolved)
-        else:
-            rows = payload.get("decisions")
-            if not isinstance(rows, list):
-                raise TypeError("decisions must be a list")
+        payload = _parse_missing_envelope(
+            raw_response,
+            expected_request_id=expected_request_id,
+            allowed_proposal_ids=allowed_proposal_ids,
+        )
     except Exception as exc:
         return [], [{"reason": "invalid_json", "detail": str(exc)}]
-    decisions = []
+
+    rows = [{
+        **row,
+        "decision": "ADD_PROPOSAL",
+        "confidence": "HIGH",
+        "reason_code": "VALID_MISSING_ENTITY",
+    } for row in payload["additions"]]
+    rows.extend({
+        "proposal_id": proposal_id,
+        "decision": "UNRESOLVED",
+        "type": None,
+        "assertions": [],
+        "confidence": "LOW",
+        "reason_code": "AMBIGUOUS",
+    } for proposal_id in payload["unresolved_ids"])
+
+    decisions: list[MissingDecision] = []
+    rejected: list[dict[str, Any]] = []
     for row in rows:
         try:
             decisions.append(MissingDecision.from_dict(row))
@@ -236,7 +346,6 @@ def parse_missing_response(
                 "decision": row,
             })
     return decisions, rejected
-
 
 def _parse_editor_envelope(
     raw_response: str,
@@ -279,43 +388,26 @@ def editor_response_error(
     allowed_candidate_ids: set[str] | None = None,
     target_candidate_ids: set[str] | None = None,
 ) -> str | None:
-    """Validate envelope and operation schema before a response may enter cache."""
+    """Validate only the envelope and closed operation schema.
+
+    Semantic/action conflicts are intentionally handled operation-by-operation
+    in ``apply_editor_response``. One bad or duplicate action must not force a
+    retry that discards other valid actions in the same response.
+    """
+    del allowed_candidate_ids, target_candidate_ids
     try:
         payload = _parse_editor_envelope(
             raw_response,
             expected_request_id=expected_request_id,
         )
-        operations: list[EditOperation] = []
         for index, raw_action in enumerate(payload["changes"]):
             try:
-                operations.append(EditOperation.from_dict(raw_action))
+                EditOperation.from_dict(raw_action)
             except Exception as exc:
                 raise ValueError(f"changes[{index}] invalid: {exc}") from exc
-
-        seen_ids: set[str] = set()
-        for index, operation in enumerate(operations):
-            ids = set(operation.candidate_ids)
-            if allowed_candidate_ids is not None and not ids <= allowed_candidate_ids:
-                unknown = sorted(ids - allowed_candidate_ids)
-                raise ValueError(f"changes[{index}] has unknown candidate_ids: {unknown}")
-            if target_candidate_ids is not None and not (ids & target_candidate_ids):
-                raise ValueError(f"changes[{index}] changes context-only candidates")
-            duplicate = seen_ids & ids
-            if duplicate:
-                raise ValueError(f"candidate appears in multiple changes: {sorted(duplicate)}")
-            seen_ids.update(ids)
-
-        unresolved = set(payload["unresolved_ids"])
-        if target_candidate_ids is not None and not unresolved <= target_candidate_ids:
-            unknown = sorted(unresolved - target_candidate_ids)
-            raise ValueError(f"unresolved_ids contains non-target IDs: {unknown}")
-        conflict = seen_ids & unresolved
-        if conflict:
-            raise ValueError(f"candidate both changed and unresolved: {sorted(conflict)}")
     except Exception as exc:
         return str(exc)
     return None
-
 
 def editor_response_is_valid(
     raw_response: str,
@@ -364,55 +456,321 @@ def _entity_audit(entity: NerEntity) -> dict[str, Any]:
     }
 
 
+@dataclass
+class _OperationPlan:
+    operation: EditOperation
+    consumed_ids: set[str]
+    replacement: NerEntity | None
+    before_entities: list[dict[str, Any]]
+    priority: tuple[float, ...]
+    realigned_from: list[int] | None = None
+    realigned_to: list[int] | None = None
+
+
+def _operation_base_priority(action: EditAction) -> int:
+    return {
+        EditAction.MERGE: 500,
+        EditAction.REPAIR_SPAN: 400,
+        EditAction.RETYPE: 300,
+        EditAction.UPDATE_ASSERTIONS: 200,
+        EditAction.DROP: 100,
+    }[action]
+
+
+def _find_exact_occurrences(
+    raw_text: str,
+    text: str,
+    start: int,
+    end: int,
+) -> list[tuple[int, int]]:
+    output: list[tuple[int, int]] = []
+    cursor = raw_text.find(text, start, end)
+    while cursor >= 0:
+        output.append((cursor, cursor + len(text)))
+        cursor = raw_text.find(text, cursor + 1, end)
+    return output
+
+
+def _span_validation_errors(
+    raw_text: str,
+    start: int,
+    end: int,
+    *,
+    operation: EditOperation,
+    targets: list[CandidateEvidence],
+    validation_candidates: list[CandidateEvidence],
+) -> list[str]:
+    errors: list[str] = []
+    if not (0 <= start < end <= len(raw_text)) or raw_text[start:end] != operation.text:
+        return ["invalid_exact_span"]
+    if not _same_unit(raw_text, start, end):
+        errors.append("crosses_structural_boundary")
+    if operation.action == EditAction.REPAIR_SPAN:
+        target = targets[0]
+        if not (start < target.position[1] and end > target.position[0]):
+            errors.append("repair_does_not_overlap_target")
+        # Audit-only alternatives must not block a safe boundary repair. Only a
+        # selected entity that would actually be swallowed requires MERGE.
+        if any(
+            other.candidate_id not in operation.candidate_ids
+            and other.pre_llm_selected
+            and start < other.position[1]
+            and end > other.position[0]
+            for other in validation_candidates
+        ):
+            errors.append("repair_would_swallow_selected_candidate_use_merge")
+    elif operation.action == EditAction.MERGE:
+        if not all(
+            start <= item.position[0] and end >= item.position[1]
+            for item in targets
+        ):
+            errors.append("merge_does_not_cover_targets")
+        ordered = sorted(targets, key=lambda item: item.position)
+        if any(
+            right.position[0] - left.position[1] > 32
+            for left, right in zip(ordered, ordered[1:])
+        ):
+            errors.append("merge_targets_not_adjacent")
+    return errors
+
+
+def _resolve_operation_span(
+    raw_text: str,
+    operation: EditOperation,
+    targets: list[CandidateEvidence],
+    validation_candidates: list[CandidateEvidence],
+    *,
+    context_start: int,
+    context_end: int | None,
+) -> tuple[int | None, int | None, list[str], list[int] | None, list[int] | None]:
+    assert operation.local_position is not None and operation.text is not None
+    original_start = context_start + operation.local_position[0]
+    original_end = context_start + operation.local_position[1]
+    direct_errors = _span_validation_errors(
+        raw_text,
+        original_start,
+        original_end,
+        operation=operation,
+        targets=targets,
+        validation_candidates=validation_candidates,
+    )
+    if not direct_errors:
+        return original_start, original_end, [], None, None
+
+    # Realign only by an exact, unique occurrence inside the review context.
+    # No fuzzy matching is allowed because offsets are a scoring invariant.
+    search_start = max(0, context_start)
+    search_end = min(
+        len(raw_text),
+        context_end if context_end is not None else max(
+            [item.position[1] for item in targets] + [original_end]
+        ) + 256,
+    )
+    valid_occurrences: list[tuple[int, int]] = []
+    for start, end in _find_exact_occurrences(
+        raw_text,
+        operation.text,
+        search_start,
+        search_end,
+    ):
+        if not _span_validation_errors(
+            raw_text,
+            start,
+            end,
+            operation=operation,
+            targets=targets,
+            validation_candidates=validation_candidates,
+        ):
+            valid_occurrences.append((start, end))
+    if len(valid_occurrences) == 1:
+        start, end = valid_occurrences[0]
+        return (
+            start,
+            end,
+            [],
+            [original_start, original_end],
+            [start, end],
+        )
+    if len(valid_occurrences) > 1:
+        return None, None, ["ambiguous_exact_span_realign"], None, None
+    return None, None, direct_errors, None, None
+
+
+def _plan_operation(
+    raw_text: str,
+    operation: EditOperation,
+    *,
+    by_id: dict[str, CandidateEvidence],
+    entity_map: dict[str, NerEntity],
+    target_ids: set[str],
+    validation_candidates: list[CandidateEvidence],
+    context_start: int,
+    context_end: int | None,
+) -> tuple[_OperationPlan | None, list[str]]:
+    ids = operation.candidate_ids
+    errors: list[str] = []
+    if any(candidate_id not in by_id for candidate_id in ids):
+        return None, ["unknown_candidate_id"]
+    if not (set(ids) & target_ids):
+        return None, ["context_only_change_without_target"]
+    if operation.action == EditAction.MERGE:
+        current_target_ids = [
+            candidate_id
+            for candidate_id in ids
+            if candidate_id in target_ids and candidate_id in entity_map
+        ]
+        if not current_target_ids:
+            errors.append("merge_has_no_current_target_entity")
+    elif ids[0] not in entity_map:
+        errors.append("target_not_in_current_entities")
+    if errors:
+        return None, errors
+
+    targets = [by_id[candidate_id] for candidate_id in ids]
+    replacement: NerEntity | None = None
+    realigned_from = realigned_to = None
+    before_entities = [
+        _entity_audit(entity_map[candidate_id])
+        for candidate_id in ids
+        if candidate_id in entity_map
+    ]
+
+    if operation.action == EditAction.DROP:
+        pass
+    elif operation.action == EditAction.RETYPE:
+        target = targets[0]
+        current = entity_map[ids[0]]
+        if operation.type == current.type:
+            errors.append("retype_is_noop")
+        elif (
+            target.strong_consensus
+            and operation.type not in target.allowed_types
+            and "type_disagreement" not in target.negative_flags
+        ):
+            errors.append("strong_candidate_retype_without_competing_evidence")
+        else:
+            final_type = operation.type or current.type
+            replacement = NerEntity(
+                current.text,
+                final_type,
+                normalize_assertions_for_type(final_type, current.assertions),
+                current.position,
+                max(current.score, 1.0),
+            )
+    elif operation.action in {EditAction.REPAIR_SPAN, EditAction.MERGE}:
+        start, end, span_errors, realigned_from, realigned_to = _resolve_operation_span(
+            raw_text,
+            operation,
+            targets,
+            validation_candidates,
+            context_start=context_start,
+            context_end=context_end,
+        )
+        errors.extend(span_errors)
+        if not errors:
+            assert start is not None and end is not None and operation.text is not None
+            final_type = operation.type or targets[0].type
+            replacement = NerEntity(
+                operation.text,
+                final_type,
+                normalize_assertions_for_type(final_type, operation.assertions),
+                (start, end),
+                1.0,
+            )
+    elif operation.action == EditAction.UPDATE_ASSERTIONS:
+        current = entity_map[ids[0]]
+        if current.type not in ASSERTION_ENTITY_TYPES:
+            errors.append("assertions_not_allowed_for_type")
+        else:
+            replacement = NerEntity(
+                current.text,
+                current.type,
+                normalize_assertions_for_type(current.type, operation.assertions),
+                current.position,
+                max(current.score, 1.0),
+            )
+
+    consumed_ids = {candidate_id for candidate_id in ids if candidate_id in entity_map}
+    if replacement is not None:
+        overlapping_unconsumed = [
+            candidate_id
+            for candidate_id, entity in entity_map.items()
+            if candidate_id not in consumed_ids
+            and replacement.position[0] < entity.position[1]
+            and replacement.position[1] > entity.position[0]
+        ]
+        if overlapping_unconsumed:
+            errors.append("replacement_overlaps_unconsumed_entity")
+
+    if errors:
+        return None, errors
+
+    target_count = len(consumed_ids & target_ids)
+    replacement_span = (
+        replacement.position[1] - replacement.position[0]
+        if replacement is not None
+        else 0
+    )
+    target_start = min((item.position[0] for item in targets), default=0)
+    target_end = max((item.position[1] for item in targets), default=0)
+    extra_chars = max(0, replacement_span - (target_end - target_start))
+    priority = (
+        float(_operation_base_priority(operation.action)),
+        float(target_count),
+        float(len(consumed_ids)),
+        float(-extra_chars),
+        float(replacement_span),
+    )
+    return _OperationPlan(
+        operation=operation,
+        consumed_ids=consumed_ids,
+        replacement=replacement,
+        before_entities=before_entities,
+        priority=priority,
+        realigned_from=realigned_from,
+        realigned_to=realigned_to,
+    ), []
+
+
 def apply_editor_response(
     raw_text: str,
     candidates: list[CandidateEvidence],
     raw_response: str,
     *,
     context_start: int = 0,
+    context_end: int | None = None,
     validation_candidates: list[CandidateEvidence] | None = None,
     target_candidate_ids: list[str] | None = None,
     expected_request_id: str = "",
     baseline_entities: list[NerEntity] | None = None,
 ) -> EditorResult:
-    """Apply one strict change-only response without promoting omitted context."""
+    """Apply valid actions independently and resolve duplicate actions safely."""
     target_ids = set(target_candidate_ids or [item.candidate_id for item in candidates])
     by_id = {item.candidate_id: item for item in candidates}
     validation_candidates = validation_candidates or candidates
 
     if baseline_entities is None:
-        baseline_entities = [
-            _to_entity(item) for item in candidates if item.pre_llm_selected
-        ]
+        baseline_entities = [_to_entity(item) for item in candidates if item.pre_llm_selected]
     baseline_by_key = {_entity_key(item): item for item in baseline_entities}
     entity_map = {
         item.candidate_id: baseline_by_key[_entity_key(_to_entity(item))]
         for item in candidates
         if _entity_key(_to_entity(item)) in baseline_by_key
     }
-    region_baseline = list({
-        _entity_key(entity): entity for entity in entity_map.values()
-    }.values())
+    region_baseline = list({_entity_key(entity): entity for entity in entity_map.values()}.values())
     result = EditorResult(
         entities=sorted(region_baseline, key=lambda item: (*item.position, item.type)),
         raw_response=raw_response,
     )
 
     try:
-        payload = _parse_editor_envelope(
-            raw_response,
-            expected_request_id=expected_request_id,
-        )
-        raw_actions = payload["changes"]
-        unresolved_ids = payload["unresolved_ids"]
+        payload = _parse_editor_envelope(raw_response, expected_request_id=expected_request_id)
     except Exception as exc:
-        result.rejected.append({
-            "reason": "invalid_response_envelope",
-            "detail": str(exc),
-        })
+        result.rejected.append({"reason": "invalid_response_envelope", "detail": str(exc)})
         result.unresolved.extend(sorted(target_ids))
         return result
 
+    unresolved_ids = payload["unresolved_ids"]
     for candidate_id in unresolved_ids:
         if candidate_id not in target_ids:
             result.rejected.append({
@@ -422,209 +780,336 @@ def apply_editor_response(
         else:
             result.unresolved.append(candidate_id)
 
-    parsed: list[EditOperation] = []
-    for raw_action in raw_actions:
+    plans: list[_OperationPlan] = []
+    for action_index, raw_action in enumerate(payload["changes"]):
         try:
-            parsed.append(EditOperation.from_dict(raw_action))
+            operation = EditOperation.from_dict(raw_action)
         except Exception as exc:
             result.rejected.append({
                 "reason": "invalid_action_schema",
                 "detail": str(exc),
+                "action_index": action_index,
                 "action": raw_action,
             })
+            continue
+        plan, errors = _plan_operation(
+            raw_text,
+            operation,
+            by_id=by_id,
+            entity_map=entity_map,
+            target_ids=target_ids,
+            validation_candidates=validation_candidates,
+            context_start=context_start,
+            context_end=context_end,
+        )
+        if plan is None:
+            result.rejected.append({
+                "reason": errors,
+                "action_index": action_index,
+                "action": asdict(operation),
+            })
+            continue
+        plans.append(plan)
 
-    eligible_for_duplicate_check = [
-        operation for operation in parsed
-        if all(candidate_id in by_id for candidate_id in operation.candidate_ids)
-        and bool(set(operation.candidate_ids) & target_ids)
-    ]
-    counts: dict[str, int] = {}
-    for operation in eligible_for_duplicate_check:
-        for candidate_id in operation.candidate_ids:
-            counts[candidate_id] = counts.get(candidate_id, 0) + 1
+    # Greedy set packing after full validation: MERGE/REPAIR wins over a DROP
+    # or duplicate lower-information action touching the same candidate.
+    selected: list[_OperationPlan] = []
+    claimed_ids: set[str] = set()
+    for plan in sorted(plans, key=lambda item: item.priority, reverse=True):
+        conflict = claimed_ids & plan.consumed_ids
+        if conflict:
+            result.rejected.append({
+                "reason": "superseded_by_higher_priority_action",
+                "conflicting_candidate_ids": sorted(conflict),
+                "action": asdict(plan.operation),
+            })
+            continue
+        selected.append(plan)
+        claimed_ids.update(plan.consumed_ids)
 
     consumed: set[str] = set()
     additions: list[NerEntity] = []
-    unresolved_set = set(result.unresolved)
-    for operation in parsed:
-        ids = operation.candidate_ids
-        errors: list[str] = []
-        if any(candidate_id not in by_id for candidate_id in ids):
-            errors.append("unknown_candidate_id")
-        if not errors and not (set(ids) & target_ids):
-            errors.append("context_only_change_without_target")
-        if any(counts.get(candidate_id, 0) > 1 for candidate_id in ids):
-            errors.append("duplicate_actions_for_candidate")
-        if set(ids) & unresolved_set:
-            errors.append("candidate_also_marked_unresolved")
-
-        if not errors:
-            if operation.action == EditAction.MERGE:
-                current_target_ids = [
-                    candidate_id for candidate_id in ids
-                    if candidate_id in target_ids and candidate_id in entity_map
-                ]
-                if not current_target_ids:
-                    errors.append("merge_has_no_current_target_entity")
-            elif ids[0] not in entity_map:
-                errors.append("target_not_in_current_entities")
-
-        if errors:
-            result.rejected.append({
-                "reason": errors,
-                "action": asdict(operation),
-            })
-            continue
-
-        targets = [by_id[candidate_id] for candidate_id in ids]
-        name = operation.action
-        replacement: NerEntity | None = None
-        before_entities = [
-            _entity_audit(entity_map[candidate_id])
-            for candidate_id in ids
-            if candidate_id in entity_map
-        ]
-
-        if name == EditAction.DROP:
-            # The strict schema already requires an explicit non-entity reason.
-            # Do not silently veto a valid DROP merely because the deterministic
-            # router did not attach a duplicate semantic flag.
-            pass
-        elif name == EditAction.RETYPE:
-            target = targets[0]
-            current = entity_map[ids[0]]
-            if operation.type == current.type:
-                errors.append("retype_is_noop")
-            elif (
-                target.strong_consensus
-                and operation.type not in target.allowed_types
-                and "type_disagreement" not in target.negative_flags
-            ):
-                errors.append("strong_candidate_retype_without_competing_evidence")
-            else:
-                final_type = operation.type or current.type
-                replacement = NerEntity(
-                    current.text,
-                    final_type,
-                    normalize_assertions_for_type(final_type, current.assertions),
-                    current.position,
-                    current.score,
-                )
-        elif name in {EditAction.REPAIR_SPAN, EditAction.MERGE}:
-            assert operation.local_position is not None and operation.text is not None
-            start = context_start + operation.local_position[0]
-            end = context_start + operation.local_position[1]
-            if not (0 <= start < end <= len(raw_text)) or raw_text[start:end] != operation.text:
-                errors.append("invalid_exact_span")
-            elif not _same_unit(raw_text, start, end):
-                errors.append("crosses_structural_boundary")
-            elif (
-                name == EditAction.REPAIR_SPAN
-                and not (
-                    start < targets[0].position[1]
-                    and end > targets[0].position[0]
-                )
-            ):
-                errors.append("repair_does_not_overlap_target")
-            elif name == EditAction.REPAIR_SPAN and any(
-                other.candidate_id not in ids
-                and start < other.position[1]
-                and end > other.position[0]
-                for other in validation_candidates
-            ):
-                errors.append("repair_would_swallow_other_candidate_use_merge")
-            elif name == EditAction.MERGE and not all(
-                start <= item.position[0] and end >= item.position[1]
-                for item in targets
-            ):
-                errors.append("merge_does_not_cover_targets")
-            elif name == EditAction.MERGE and any(
-                right.position[0] - left.position[1] > 32
-                for left, right in zip(
-                    sorted(targets, key=lambda item: item.position),
-                    sorted(targets, key=lambda item: item.position)[1:],
-                )
-            ):
-                errors.append("merge_targets_not_adjacent")
-            else:
-                final_type = operation.type or targets[0].type
-                replacement = NerEntity(
-                    operation.text,
-                    final_type,
-                    normalize_assertions_for_type(final_type, operation.assertions),
-                    (start, end),
-                    1.0,
-                )
-        elif name == EditAction.UPDATE_ASSERTIONS:
-            current = entity_map[ids[0]]
-            if current.type not in ASSERTION_ENTITY_TYPES:
-                errors.append("assertions_not_allowed_for_type")
-            else:
-                replacement = NerEntity(
-                    current.text,
-                    current.type,
-                    normalize_assertions_for_type(
-                        current.type,
-                        operation.assertions,
-                    ),
-                    current.position,
-                    current.score,
-                )
-
-        if errors:
-            result.rejected.append({
-                "reason": errors,
-                "action": asdict(operation),
-            })
-            continue
-
-        consumed.update(ids)
-        if replacement is not None:
-            additions.append(replacement)
-        result.applied.append({
-            "action": name.value,
-            "candidate_ids": list(ids),
-            "entities_before": before_entities,
-            "entity_after": _entity_audit(replacement) if replacement else None,
-        })
+    for plan in selected:
+        consumed.update(plan.consumed_ids)
+        if plan.replacement is not None:
+            additions.append(plan.replacement)
+        audit_row = {
+            "action": plan.operation.action.value,
+            "candidate_ids": list(plan.operation.candidate_ids),
+            "entities_before": plan.before_entities,
+            "entity_after": _entity_audit(plan.replacement) if plan.replacement else None,
+        }
+        if plan.realigned_to is not None:
+            audit_row["local_position_realigned_from"] = plan.realigned_from
+            audit_row["global_position_realigned_to"] = plan.realigned_to
+        result.applied.append(audit_row)
 
     final = [
-        entity for candidate_id, entity in entity_map.items()
+        entity
+        for candidate_id, entity in entity_map.items()
         if candidate_id not in consumed
     ]
     final.extend(additions)
-    unique = {_entity_key(item): item for item in final}
-    accepted: list[NerEntity] = []
-    for entity in sorted(
-        unique.values(),
-        key=lambda item: (
-            -float(item.score),
-            -(item.position[1] - item.position[0]),
-            *item.position,
-            item.type,
-        ),
-    ):
-        if any(
-            entity.position[0] < old.position[1]
-            and entity.position[1] > old.position[0]
-            for old in accepted
-        ):
-            result.rejected.append({
-                "reason": "post_editor_overlap_resolution",
-                "entity": _entity_audit(entity),
-            })
-            continue
-        accepted.append(entity)
-    result.entities = sorted(accepted, key=lambda item: (*item.position, item.type))
+    result.entities = sorted(
+        {_entity_key(item): item for item in final}.values(),
+        key=lambda item: (*item.position, item.type),
+    )
     result.consumed_candidate_ids = sorted(consumed)
-    result.unresolved = list(dict.fromkeys(result.unresolved))
+    result.unresolved = [
+        candidate_id
+        for candidate_id in dict.fromkeys(result.unresolved)
+        if candidate_id not in consumed
+    ]
     for entity in result.entities:
-        if (
-            raw_text[entity.position[0]:entity.position[1]] != entity.text
-            or any(char in entity.text for char in "\r\n")
+        if raw_text[entity.position[0]:entity.position[1]] != entity.text or any(
+            char in entity.text for char in "\r\n"
         ):
             raise ValueError("editor produced invalid exact offset")
     return result
+
+
+_FOLD_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+_FUNCTION_FRAGMENTS = frozenset({
+    "cac", "co", "con", "cua", "duoc", "hang", "hay", "it", "la",
+    "mot", "nhieu", "nhung", "phai", "sau", "tai", "theo", "trong",
+    "tu", "va", "voi", "hoac",
+})
+_DIAGNOSIS_FRAGMENTS = frozenset({
+    "benh", "viem", "ton", "mien", "xoang", "gan", "tuy", "da", "chi",
+    "virus", "fibrin", "gen", "enzyme", "hong cau",
+})
+_TEST_FRAGMENTS = frozenset({
+    "xet", "chup", "do", "duong", "mau", "phan", "dich", "chi", "gan", "tuy",
+})
+_SYMPTOM_FRAGMENTS = frozenset({"chi", "da", "duoc", "cac", "nhieu", "sau", "ton", "mien"})
+_DRUG_NOISE_TOKENS = frozenset({
+    "ngay", "hang", "lieu", "cham", "moi", "tuan", "lan", "cach", "uong",
+    "tiem", "truyen", "po", "iv", "im", "bid", "tid", "qid", "prn",
+    "mg", "mcg", "g", "ml", "l",
+})
+_COORDINATION_RE = re.compile(r"(?:\b(?:va|hoac|hay|kem)\b|[,;/()]|\s[-–—]\s)")
+
+
+def _fold_surface(text: str) -> str:
+    value = unicodedata.normalize("NFD", text.casefold()).replace("đ", "d")
+    value = "".join(char for char in value if unicodedata.category(char) != "Mn")
+    return re.sub(r"\s+", " ", value).strip(" \t\r\n.,;:()[]{}")
+
+
+def _surface_tokens(text: str) -> list[str]:
+    return [token for token in _FOLD_TOKEN_RE.split(_fold_surface(text)) if token]
+
+
+def _medical_abbreviation(text: str) -> bool:
+    compact = "".join(char for char in text if char.isalnum())
+    letters = [char for char in compact if char.isalpha()]
+    return bool(
+        2 <= len(compact) <= 10
+        and letters
+        and all(char.isupper() for char in letters)
+    )
+
+
+def _unsafe_fragment_reason(entity: NerEntity) -> str | None:
+    folded = _fold_surface(entity.text)
+    tokens = _surface_tokens(entity.text)
+    if _medical_abbreviation(entity.text):
+        return None
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token in _FUNCTION_FRAGMENTS:
+            return "function_word_fragment"
+        if entity.type == "CHẨN_ĐOÁN" and token in _DIAGNOSIS_FRAGMENTS:
+            return "generic_or_non_diagnostic_single_token"
+        if entity.type == "TÊN_XÉT_NGHIỆM" and token in _TEST_FRAGMENTS:
+            return "incomplete_test_name"
+        if entity.type == "TRIỆU_CHỨNG" and token in _SYMPTOM_FRAGMENTS:
+            return "non_symptom_single_token"
+    if entity.type == "THUỐC":
+        meaningful = [
+            token
+            for token in tokens
+            if token not in _DRUG_NOISE_TOKENS and not token.isdigit()
+        ]
+        if entity.text.lstrip().startswith("/") or not meaningful:
+            return "dose_or_administration_fragment"
+    return None
+
+
+def _entity_quality(
+    entity: NerEntity,
+    *,
+    catalogue_by_key: dict[tuple[int, int, str], CandidateEvidence],
+) -> float:
+    candidate = catalogue_by_key.get(_entity_key(entity))
+    score = float(entity.score or 0.0)
+    if candidate is not None:
+        score = max(score, max((float(value) for value in candidate.scores.values()), default=0.0))
+        if candidate.strong_consensus:
+            score += 0.20
+    score += min(0.18, 0.04 * max(0, len(_surface_tokens(entity.text)) - 1))
+    score += min(0.10, 0.002 * len(entity.text))
+    return score
+
+
+def _invalid_outer_overlap(
+    outer: NerEntity,
+    inners: list[NerEntity],
+) -> bool:
+    folded = _fold_surface(outer.text)
+    if re.match(r"^(?:danh rang|an uong|di lai|tap luyen)\b", folded):
+        return True
+    if folded.startswith("ho ") and any(inner.position[0] > outer.position[0] for inner in inners):
+        return True
+    # A long drug span that absorbs a full negated/toxicity clause is not a
+    # medication mention. Keep the contained diagnosis rather than the clause.
+    if outer.type == "THUỐC" and re.search(r"\b(?:khong gay|gay doc|gay quai thai)\b", folded):
+        return True
+    # Result and test mentions should not be fused into one nested span.
+    if outer.type == "KẾT_QUẢ_XÉT_NGHIỆM" and any(
+        inner.type == "TÊN_XÉT_NGHIỆM" for inner in inners
+    ):
+        return True
+    # Alternatives/coordinated diagnoses are not one mention when at least two
+    # independent contained entities already exist.
+    non_overlapping_inners = sorted(inners, key=lambda item: item.position)
+    independent_count = 0
+    cursor = -1
+    for inner in non_overlapping_inners:
+        if inner.position[0] >= cursor:
+            independent_count += 1
+            cursor = inner.position[1]
+    if independent_count >= 2 and re.search(r"(?:\b(?:hoac|hay|va)\b|/)", folded):
+        return True
+    return False
+
+
+def _resolve_global_overlaps(
+    entities: list[NerEntity],
+    *,
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Resolve only true overlap components with conservative containment rules."""
+    if not entities:
+        return [], []
+    catalogue_by_key = {
+        (item.position[0], item.position[1], item.type): item
+        for item in catalogue
+    }
+    ordered = sorted(entities, key=lambda item: (*item.position, item.type))
+    components: list[list[NerEntity]] = []
+    current: list[NerEntity] = []
+    current_end = -1
+    for entity in ordered:
+        if not current or entity.position[0] < current_end:
+            current.append(entity)
+            current_end = max(current_end, entity.position[1])
+        else:
+            components.append(current)
+            current = [entity]
+            current_end = entity.position[1]
+    if current:
+        components.append(current)
+
+    selected: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    for component in components:
+        if len(component) == 1:
+            selected.extend(component)
+            continue
+        # Prefer a semantically complete containing span unless it is a clear
+        # wrapper/activity/alternative. This avoids the old failure where a
+        # dosage fragment beat the full drug mention or "tăng" beat "men gan tăng".
+        ranked_outers = sorted(
+            component,
+            key=lambda item: (
+                item.position[1] - item.position[0],
+                _entity_quality(item, catalogue_by_key=catalogue_by_key),
+            ),
+            reverse=True,
+        )
+        chosen: list[NerEntity] = []
+        remaining = list(component)
+        for outer in ranked_outers:
+            if outer not in remaining:
+                continue
+            inners = [
+                item for item in remaining
+                if item is not outer
+                and outer.position[0] <= item.position[0]
+                and outer.position[1] >= item.position[1]
+            ]
+            if inners and _invalid_outer_overlap(outer, inners):
+                remaining.remove(outer)
+                continue
+            chosen.append(outer)
+            remaining = [
+                item for item in remaining
+                if item is outer
+                or not (
+                    outer.position[0] < item.position[1]
+                    and outer.position[1] > item.position[0]
+                )
+            ]
+            if outer in remaining:
+                remaining.remove(outer)
+        # Any crossing spans left after containment handling: choose the best
+        # evidence one, never emit overlapping final entities.
+        for item in sorted(
+            remaining,
+            key=lambda entity: _entity_quality(entity, catalogue_by_key=catalogue_by_key),
+            reverse=True,
+        ):
+            if any(
+                item.position[0] < kept.position[1]
+                and item.position[1] > kept.position[0]
+                for kept in chosen
+            ):
+                continue
+            chosen.append(item)
+        chosen = sorted(chosen, key=lambda item: (*item.position, item.type))
+        selected.extend(chosen)
+        chosen_keys = {_entity_key(item) for item in chosen}
+        for entity in component:
+            if _entity_key(entity) in chosen_keys:
+                continue
+            conflicts = [
+                kept for kept in chosen
+                if entity.position[0] < kept.position[1]
+                and entity.position[1] > kept.position[0]
+            ]
+            audit.append({
+                "reason": "global_overlap_resolution",
+                "entity": _entity_audit(entity),
+                "kept_conflicts": [_entity_audit(item) for item in conflicts],
+            })
+    return sorted(selected, key=lambda item: (*item.position, item.type)), audit
+
+def finalize_entities_after_editor(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Conservative record-level cleanup after all editor/recovery regions."""
+    unique = {_entity_key(item): item for item in entities}
+    kept: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    for entity in sorted(unique.values(), key=lambda item: (*item.position, item.type)):
+        reason = _unsafe_fragment_reason(entity)
+        if reason is not None:
+            audit.append({
+                "reason": "deterministic_fragment_cleanup",
+                "detail": reason,
+                "entity": _entity_audit(entity),
+            })
+            continue
+        kept.append(entity)
+    kept, overlap_audit = _resolve_global_overlaps(kept, catalogue=catalogue)
+    audit.extend(overlap_audit)
+    for entity in kept:
+        if raw_text[entity.position[0]:entity.position[1]] != entity.text:
+            raise ValueError("finalizer produced invalid exact offset")
+    return kept, audit
 
 
 def apply_missing_decisions(
@@ -654,7 +1139,7 @@ def apply_missing_decisions(
             item for item in result.entities
             if start < item.position[1] and end > item.position[0]
         ]
-        errors = []
+        errors: list[str] = []
         if decision.type not in proposal.allowed_types:
             errors.append("type_not_allowed")
         if not proposal.auto_add_eligible or not proposal.hard_supports:
@@ -662,10 +1147,21 @@ def apply_missing_decisions(
         if proposal.negative_flags:
             errors.append("structural_negative")
         if overlaps:
-            errors.append("unsafe_overlap")
-        if raw_text[start:end] != proposal.text or any(
-            char in proposal.text for char in "\r\n"
-        ):
+            if any(
+                item.position == proposal.position and item.type == decision.type
+                for item in overlaps
+            ):
+                errors.append("duplicate_existing_entity")
+            elif any(
+                item.type == decision.type
+                and item.position[0] <= start
+                and item.position[1] >= end
+                for item in overlaps
+            ):
+                errors.append("covered_by_existing_entity")
+            else:
+                errors.append("unsafe_overlap")
+        if raw_text[start:end] != proposal.text or any(char in proposal.text for char in "\r\n"):
             errors.append("invalid_exact_span")
         if errors:
             result.rejected.append({
@@ -685,6 +1181,7 @@ def apply_missing_decisions(
         result.applied.append({
             "action": "ADD_PROPOSAL",
             "proposal_id": proposal.proposal_id,
+            "entity_after": _entity_audit(entity),
         })
     result.unresolved.extend(sorted(set(by_id) - seen))
     result.unresolved = list(dict.fromkeys(result.unresolved))

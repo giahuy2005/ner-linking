@@ -1,9 +1,11 @@
+"""Prompt builder for the compact whitelisted ontology selector V3."""
+
 from __future__ import annotations
 
 import json
 from typing import Any
 
-SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v3_supported_whitelist"
+SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v4_fragment_safe"
 
 _SYSTEM = """Bạn chọn mã RxNorm hoặc ICD-10 chỉ từ whitelist đã được retrieval/reranker hỗ trợ.
 Không phát minh mã. Không dùng mã có hard_conflicts.

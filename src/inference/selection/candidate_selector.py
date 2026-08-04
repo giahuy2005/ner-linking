@@ -31,6 +31,12 @@ LAST_SELECTION_AUDIT: list[dict] = []
 LAST_SELECTION_WORKLOAD: dict = {}
 
 _SUPPORT_ORDER = {"exact": 4, "strong": 3, "medium": 2, "weak": 1, "rejected": 0}
+
+_UNSAFE_SINGLE_DIAGNOSIS_TOKENS = frozenset({
+    "benh", "viem", "ton", "mien", "xoang", "gan", "tuy", "da", "chi",
+    "virus", "fibrin", "gen", "enzyme", "mau", "dich",
+})
+
 _NON_SEMANTIC_TOKENS = {
     "benh", "hoi", "chung", "thuoc", "type", "typ", "khong", "xac", "dinh",
     "va", "hoac", "kem", "mg", "mcg", "g", "ml", "po", "iv", "im", "bid",
@@ -144,6 +150,29 @@ def _meaningful_tokens(text: str) -> set[str]:
         for token in re.findall(r"[a-z0-9]+", _fold_ascii(text))
         if token not in _NON_SEMANTIC_TOKENS and not token.isdigit()
     }
+
+
+def _is_medical_abbreviation(text: str) -> bool:
+    compact = "".join(char for char in text if char.isalnum())
+    letters = [char for char in compact if char.isalpha()]
+    return bool(
+        2 <= len(compact) <= 10
+        and letters
+        and all(char.isupper() for char in letters)
+    )
+
+
+def _unsafe_linking_fragment(entity_text: str, entity_type: str) -> str | None:
+    """Block ontology linking for obvious NER fragments, not valid short diseases."""
+    if entity_type != "CHẨN_ĐOÁN" or _is_medical_abbreviation(entity_text):
+        return None
+    tokens = [
+        token for token in re.findall(r"[a-z0-9]+", _fold_ascii(entity_text))
+        if not token.isdigit()
+    ]
+    if len(tokens) == 1 and tokens[0] in _UNSAFE_SINGLE_DIAGNOSIS_TOKENS:
+        return "unsafe_single_token_diagnosis_fragment"
+    return None
 
 
 def _lexical_support(entity_text: str, label: str) -> tuple[float, float]:
@@ -342,6 +371,22 @@ def _prepare_selection(
 ):
     if not candidates:
         return None
+    unsafe_reason = _unsafe_linking_fragment(entity_text, entity_type)
+    if unsafe_reason is not None:
+        return {
+            "entity_text": entity_text,
+            "entity_type": entity_type,
+            "choice_limit": 1,
+            "fallback": [],
+            "prompt": None,
+            "request_id": "",
+            "valid_codes": [],
+            "candidates_by_code": {},
+            "decision_reason": unsafe_reason,
+            "supported_count": 0,
+            "shortlist_codes": [],
+            "raw_ranks": {},
+        }
     choice_limit = 1
     if entity_type == "CHẨN_ĐOÁN" and max_choices >= 2 and _explicitly_coordinated_diagnoses(entity_text):
         choice_limit = 2
@@ -559,6 +604,8 @@ def select_candidates_many(
                 audit[index]["status"] = "deterministic_bypass"
             elif prepared["decision_reason"] == "single_medium_abstain":
                 audit[index]["status"] = "single_medium_abstain"
+            elif prepared["decision_reason"] == "unsafe_single_token_diagnosis_fragment":
+                audit[index]["status"] = "unsafe_fragment_abstain"
             else:
                 audit[index]["status"] = "unsupported_abstain"
             audit[index]["selected_codes"] = list(results[index])
