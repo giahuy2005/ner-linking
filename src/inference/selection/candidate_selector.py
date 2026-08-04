@@ -224,26 +224,10 @@ def _candidate_supported(entity_text: str, entity_type: str, candidate) -> bool:
         )
 
     if entity_type == "THUỐC" and not isinstance(candidate, dict):
-        features = getattr(candidate, "features", {}) or {}
-        if getattr(candidate, "exact_term_match", False) and features.get("ingredient_relation") == "exact":
-            return True
-        ingredient = features.get("ingredient_relation")
-        names = [str(getattr(candidate, "name", "") or "")]
-        names.extend(str(value) for value in getattr(candidate, "matched_terms", []) or [])
-        coverage, similarity = max(
-            (_lexical_support(entity_text, name) for name in names if name),
-            default=(0.0, 0.0),
-        )
-        final_score = float(getattr(candidate, "final_score", 0.0) or 0.0)
-        no_conflict = all(
-            features.get(key) not in {"mismatch", "order_dose_mismatch", "conflict"}
-            for key in ("strength_relation", "form_relation", "release_relation")
-        )
-        return bool(
-            ingredient == "exact" and no_conflict and final_score >= 0.42
-            or ingredient == "partial" and coverage >= 0.50 and final_score >= 0.50
-            or coverage >= 0.75 and similarity >= 0.55 and final_score >= 0.48
-        )
+        # RxNormRuleReranker is the single source of truth. The selector must
+        # not create a second, contradictory lexical reranker.
+        level = str(getattr(candidate, "support_level", "weak"))
+        return bool(level in {"exact", "strong", "medium"})
 
     if isinstance(candidate, dict) and not any(
         key in candidate for key in ("score", "features", "final_score", "support_level")
@@ -343,20 +327,21 @@ def _deterministic_decision(entity_type: str, supported: list[tuple[int, Any]]) 
             return [], "single_medium_abstain"
         return [], "ambiguous_supported_candidates"
 
-    # RxNorm keeps its structured exact/strong deterministic policy.
-    features = getattr(top, "features", {}) or {}
+    # RxNorm deterministic bypass follows the structured reranker only.
     level = str(getattr(top, "support_level", "weak"))
-    exact = bool(
-        getattr(top, "exact_term_match", False)
-        and features.get("ingredient_relation") == "exact"
-    )
     margin = float(getattr(top, "top1_margin", 0.0) or 0.0)
-    if exact:
-        return [code], "rxnorm_exact"
-    if level in {"exact", "strong"} and (
-        len(supported) == 1 or margin >= 0.08
+    exact_count = sum(
+        str(getattr(candidate, "support_level", "weak")) == "exact"
+        for _rank, candidate in supported
+    )
+    if level == "exact" and exact_count == 1:
+        return [code], "rxnorm_exact_unique"
+    if level == "strong" and (
+        len(supported) == 1 or margin >= 0.055
     ):
-        return [code], "rxnorm_strong"
+        return [code], "rxnorm_strong_margin"
+    if len(supported) == 1 and level == "medium":
+        return [], "single_medium_abstain"
     return [], "ambiguous_supported_candidates"
 
 

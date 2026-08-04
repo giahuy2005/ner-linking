@@ -10,7 +10,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import faiss
+try:
+    import faiss
+except ImportError:  # Lightweight parser/reranker tests do not need FAISS.
+    faiss = None
 
 from . import config
 from .parser import normalize_text
@@ -144,10 +147,12 @@ class RxNormRepository:
 
         self.exact_term_lookup: dict[str, list[tuple[str, int]]] = {}
         self.core_lookup: dict[str, list[str]] = {}
+        self.brand_lookup: dict[str, list[str]] = {}
         self.rows_by_rxcui: dict[str, list[tuple[str, int]]] = {}
         self.ingredient_strength_lookup: dict[str, list[str]] = {}
         self.ingredient_form_lookup: dict[str, list[str]] = {}
         self.ingredient_release_lookup: dict[str, list[str]] = {}
+        self.compact_component_terms: dict[str, str] = {}
         self._build_exact_lookups()
 
     # ----------------------------------------------------------------
@@ -188,6 +193,8 @@ class RxNormRepository:
         - index_file / metadata_file / embedding_file là path POSIX tuyệt đối.
         """
 
+        if str(self.config["model"].get("revision", "")).casefold() in {"null", "none", ""}:
+            self.config["model"]["revision"] = None
         model_id = self.config["model"]["model_id"]
         model_id_str = str(model_id).replace("\\", "/")
 
@@ -218,8 +225,10 @@ class RxNormRepository:
     # Index & metadata
     # ----------------------------------------------------------------
 
-    def _load_indexes(self) -> dict[str, faiss.Index]:
-        indexes: dict[str, faiss.Index] = {}
+    def _load_indexes(self) -> dict[str, Any]:
+        if faiss is None:
+            raise RuntimeError("FAISS is required to load RxNorm indexes")
+        indexes: dict[str, Any] = {}
 
         for tier in config.VALID_TIERS:
             info = self.config["indexes"][tier]
@@ -285,7 +294,7 @@ class RxNormRepository:
                         "concept_tty": tty,
                         "active": bool(row["active"]),
                         "candidate_priority": row.get("candidate_priority", 99),
-                        "current_rxcuis": row.get("current_rxcuis", []),
+                        "current_rxcuis": [str(value) for value in row.get("current_rxcuis", []) if value],
                     }
                 )
 
@@ -396,6 +405,12 @@ class RxNormRepository:
                 self.rows_by_rxcui.setdefault(row["rxcui"], []).append(
                     (tier, row["vector_id"])
                 )
+                if row["concept_tty"] in {"IN", "PIN", "MIN", "BN"}:
+                    compact = "".join(char for char in term_key if char.isalnum())
+                    if len(compact) >= 4:
+                        previous = self.compact_component_terms.get(compact)
+                        if previous is None or len(term_key) < len(previous):
+                            self.compact_component_terms[compact] = term_key
 
         for rxcui, record in self.clean_by_rxcui.items():
             for ingredient in record.get("ingredients", []):
@@ -414,9 +429,14 @@ class RxNormRepository:
                 for release in record.get("release_types", []):
                     composite = normalize_text(f"{name} {release}")
                     self.ingredient_release_lookup.setdefault(composite, []).append(rxcui)
+            for brand in record.get("brands", []):
+                name = brand.get("name") if isinstance(brand, dict) else brand
+                if name:
+                    self.brand_lookup.setdefault(normalize_text(str(name)), []).append(rxcui)
 
         for lookup in (
             self.core_lookup,
+            self.brand_lookup,
             self.ingredient_strength_lookup,
             self.ingredient_form_lookup,
             self.ingredient_release_lookup,

@@ -76,6 +76,17 @@ DRUG_ALIAS_MAP = {
     "adrenalin": "epinephrine",
     "acid acetylsalicylic": "aspirin",
     "senna": "sennosides",
+    "trimetazidin": "trimetazidine",
+    "levafloxacin": "levofloxacin",
+    "nhôm hydroxid": "aluminum hydroxide",
+    "nhom hydroxid": "aluminum hydroxide",
+    "magie hydroxid": "magnesium hydroxide",
+    "simethicon": "simethicone",
+    "alverin": "alverine",
+    "cotrimoxazol": "sulfamethoxazole / trimethoprim",
+    "cotrimoxazole": "sulfamethoxazole / trimethoprim",
+    "co-trimoxazole": "sulfamethoxazole / trimethoprim",
+    "doxycyclin": "doxycycline",
 }
 
 # value là cụm dose-form chuẩn (không phải release-type đơn thuần)
@@ -95,6 +106,10 @@ PHRASE_MAP = {
     "thuốc mỡ": "topical ointment",
     "dung dịch nhỏ mắt": "ophthalmic solution",
     "thuốc tiêm": "injection",
+    "dung dịch tiêm": "injection",
+    "dung dịch truyền": "injection",
+    "truyền tĩnh mạch": "injection",
+    "tiêm tĩnh mạch": "injection",
     "phóng thích kéo dài": "extended release",
     "giải phóng kéo dài": "extended release",
     "tác dụng kéo dài": "extended release",
@@ -149,6 +164,10 @@ UNIT_MAP = {
     "iu": "IU",
     "unit": "UNIT",
     "units": "UNIT",
+    "unt": "UNIT",
+    "gm": "G",
+    "gram": "G",
+    "grams": "G",
 }
 
 # Đơn vị coi là "quantity" (thể tích/khối lượng dispense) khi đứng một
@@ -174,6 +193,7 @@ DOSE_FORM_TERMS = (
     "topical ointment",
     "ophthalmic solution",
     "injection",
+    "injectable solution",
 )
 
 RELEASE_TYPE_TERMS = (
@@ -185,6 +205,18 @@ RELEASE_TYPE_TERMS = (
 # --------------------------------------------------------------------------
 # Route & frequency (đọc trên text CHƯA strip noise)
 # --------------------------------------------------------------------------
+
+ROUTE_PHRASE_MAP = {
+    "truyền tĩnh mạch": "IV",
+    "tiêm tĩnh mạch": "IV",
+    "đường tĩnh mạch": "IV",
+    "tiêm bắp": "IM",
+    "tiêm dưới da": "SC",
+    "nhỏ mắt": "OPHTH",
+    "bôi ngoài da": "TOP",
+    "ngậm dưới lưỡi": "SL",
+    "đường uống": "PO",
+}
 
 ROUTE_MAP = {
     "po": "PO",
@@ -268,3 +300,43 @@ TTY_BONUS_TABLE = {
         "BPCK": -0.060,
     },
 }
+
+
+# Generic non-linkable medication-class or administration mentions. These are
+# semantic categories rather than RxNorm drug concepts and should abstain.
+GENERIC_DRUG_CLASS_PATTERNS = (
+    r"^(?:thuoc\s+)?khang\s+sinh$",
+    r"^(?:thuoc\s+)?uc\s+che\s+mien\s+dich$",
+    r"^(?:thuoc\s+)?loi\s+tieu$",
+    r"^(?:thuoc\s+)?chong\s+non$",
+    r"^(?:thuoc\s+)?chong\s+tram\s+cam$",
+    r"^(?:thuoc\s+)?khang\s+histamin(?:\s+h1)?$",
+    r"^corticoid(?:\s+lieu.*)?$",
+    r"^nsaids?$",
+    r"^vacc?in(?:e)?(?:\s+song)?$",
+    r"^intravenous\s+fluids?$",
+)
+
+# Route-compatible dose-form keywords used as a hard safety gate only when the
+# route is explicit in the mention.
+ROUTE_FORM_KEYWORDS = {
+    "PO": ("oral", "tablet", "capsule", "solution", "suspension", "sublingual"),
+    "IV": ("injection", "injectable", "intravenous"),
+    "IM": ("injection", "injectable", "intramuscular"),
+    "SC": ("injection", "injectable", "subcutaneous"),
+    "OPHTH": ("ophthalmic",),
+    "TOP": ("topical", "cream", "ointment", "lotion", "foam", "gel"),
+    "SL": ("sublingual",),
+}
+
+ROUTE_CONFLICT_KEYWORDS = {
+    "IV": ("oral", "tablet", "capsule", "topical", "ophthalmic"),
+    "IM": ("oral", "tablet", "capsule", "topical", "ophthalmic"),
+    "SC": ("oral", "tablet", "capsule", "topical", "ophthalmic"),
+    "PO": ("injectable", "injection", "ophthalmic", "topical"),
+    "OPHTH": ("oral", "tablet", "capsule", "injection", "topical"),
+    "TOP": ("oral", "tablet", "capsule", "injection", "ophthalmic"),
+    "SL": ("injection", "ophthalmic", "topical"),
+}
+
+COMBINATION_CONNECTOR_RE = r"(?:\b(?:va|và|and)\b|\+|\s/\s)"

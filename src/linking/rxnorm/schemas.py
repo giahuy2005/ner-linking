@@ -1,4 +1,4 @@
-"""Dataclass dùng chung cho pipeline linking RxNorm. Không chứa logic."""
+"""Dataclasses shared by the RxNorm linking pipeline."""
 
 from __future__ import annotations
 
@@ -11,8 +11,10 @@ class ParsedDrugMention:
     raw_text: str
     normalized_text: str
     ingredient_core: str | None = None
+    ingredient_components: list[str] = field(default_factory=list)
+    brand_hints: list[str] = field(default_factory=list)
     strengths: list[str] = field(default_factory=list)
-    strength_role: str = "missing"  # missing | single | range | ratio
+    strength_role: str = "missing"  # missing | single | range | ratio | percent
     dose_forms: list[str] = field(default_factory=list)
     release_types: list[str] = field(default_factory=list)
     quantity: str | None = None

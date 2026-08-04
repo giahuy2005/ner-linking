@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v4_fragment_safe"
+SELECTOR_PROMPT_VERSION = "qwen3_linking_selector_v5_rxnorm_structured"
 
 _SYSTEM = """Bạn chọn mã RxNorm hoặc ICD-10 chỉ từ whitelist đã được retrieval/reranker hỗ trợ.
 Không phát minh mã. Không dùng mã có hard_conflicts.
 Ưu tiên mã khớp đúng mức độ cụ thể của mention; không chọn subtype khi mention thiếu qualifier.
+Với RxNorm: mọi hoạt chất, strength, dose form, release và route ghi rõ phải tương thích.
+Mention có nhiều thuốc chỉ chọn concept phối hợp chứa đủ mọi hoạt chất; không chọn một thành phần riêng.
+Nếu mention chỉ có hoạt chất, ưu tiên ingredient concept thay vì sản phẩm strength/form cụ thể.
 Nếu mention chung và whitelist có mã không đặc hiệu/phù hợp hơn, ưu tiên mã đó.
 THUỐC tối đa 1 mã. CHẨN_ĐOÁN tối đa allowed_max mã và chỉ 2 khi mention phối hợp rõ.
 Không chọn đồng thời mã cha và mã con. Nếu bằng chứng chưa đủ thì ABSTAIN/UNRESOLVED.

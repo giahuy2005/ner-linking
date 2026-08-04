@@ -7,6 +7,7 @@ candidate nào đúng nhất — việc đó thuộc về reranker.py.
 from __future__ import annotations
 
 from typing import Any
+import unicodedata
 
 import numpy as np
 try:
@@ -25,7 +26,7 @@ except ImportError:
 from . import config
 from .repository import RxNormRepository
 from .schemas import ParsedDrugMention, RxNormCandidate
-from .parser import normalize_text
+from .parser import normalize_text, build_query_variants
 from ..sapbert_encoder import resolve_model_source
 
 from pathlib import Path
@@ -158,6 +159,53 @@ class RxNormRetriever:
             output.append(row_results)
         return output
 
+
+    def _recover_concatenated_components(self, parsed: ParsedDrugMention) -> None:
+        """Recover missing separators using the repository term lexicon.
+
+        Only exact support/brand terms are used. This prevents a concatenated
+        multi-drug span from being linked to one constituent by fuzzy retrieval.
+        """
+        if not parsed.ingredient_core or len(parsed.ingredient_components) != 1:
+            return
+        original = parsed.ingredient_components[0]
+        normalized_original = unicodedata.normalize("NFD", normalize_text(original))
+        normalized_original = "".join(
+            char for char in normalized_original
+            if unicodedata.category(char) != "Mn"
+        ).replace("đ", "d")
+        compact = "".join(char for char in normalized_original if char.isalnum())
+        if len(compact) < 8:
+            return
+        lexicon = self.repository.compact_component_terms
+        recovered: list[str] | None = None
+        for split in range(4, len(compact) - 3):
+            left, right = compact[:split], compact[split:]
+            if left in lexicon and right in lexicon:
+                recovered = [lexicon[left], lexicon[right]]
+                break
+        if recovered is None:
+            admin_suffixes = ("trongngay", "hangngay", "moingay", "nhung", "oral", "ngay")
+            for suffix in admin_suffixes:
+                if compact.endswith(suffix):
+                    prefix = compact[:-len(suffix)]
+                    if prefix in lexicon:
+                        recovered = [lexicon[prefix]]
+                        parsed.parse_warnings.append("attached_administration_suffix_removed")
+                        if suffix == "oral":
+                            parsed.route = parsed.route or "PO"
+                            if "oral" not in parsed.dose_forms:
+                                parsed.dose_forms.append("oral")
+                        break
+        if recovered is None:
+            return
+        parsed.ingredient_components = recovered
+        parsed.ingredient_core = " / ".join(recovered)
+        parsed.ingredient_aliases = list(dict.fromkeys([*recovered, *parsed.brand_hints]))
+        if len(recovered) >= 2 and "multi_ingredient_mention" not in parsed.parse_warnings:
+            parsed.parse_warnings.append("multi_ingredient_mention")
+        parsed.query_variants = build_query_variants(parsed)
+
     def search_full_query(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
 
@@ -197,14 +245,30 @@ class RxNormRetriever:
         return results
 
     def inject_exact_ingredient(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
-        if not parsed.ingredient_core:
+        components = parsed.ingredient_components or (
+            [parsed.ingredient_core] if parsed.ingredient_core else []
+        )
+        if not components:
             return []
-
-        rxcuis = self.repository.core_lookup.get(parsed.ingredient_core, [])
-        if not rxcuis:
+        component_sets = [
+            set(self.repository.core_lookup.get(normalize_text(component), []))
+            for component in components
+        ]
+        component_sets = [values for values in component_sets if values]
+        if not component_sets:
             return []
-
+        if len(components) >= 2 and len(component_sets) == len(components):
+            # True combination candidates must contain every explicit component.
+            rxcuis = sorted(set.intersection(*component_sets))
+        else:
+            rxcuis = sorted(set().union(*component_sets))
         return self._rows_for_rxcuis(rxcuis, exact_ingredient_match=True)
+
+    def inject_exact_brand(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
+        rxcuis: list[str] = []
+        for brand in parsed.brand_hints:
+            rxcuis.extend(self.repository.brand_lookup.get(normalize_text(brand), []))
+        return self._rows_for_rxcuis(rxcuis, exact_term_match=True)
 
     def _rows_for_rxcuis(self, rxcuis, **flags) -> list[dict[str, Any]]:
         results = []
@@ -216,18 +280,29 @@ class RxNormRetriever:
         return results
 
     def inject_structured(self, parsed: ParsedDrugMention) -> list[dict[str, Any]]:
-        if not parsed.ingredient_core:
+        components = parsed.ingredient_components or (
+            [parsed.ingredient_core] if parsed.ingredient_core else []
+        )
+        if not components:
             return []
         rxcuis: list[str] = []
-        for strength in parsed.strengths:
-            key = normalize_text(f"{parsed.ingredient_core} {strength}")
-            rxcuis.extend(self.repository.ingredient_strength_lookup.get(key, []))
-        for form in parsed.dose_forms:
-            key = normalize_text(f"{parsed.ingredient_core} {form}")
-            rxcuis.extend(self.repository.ingredient_form_lookup.get(key, []))
-        for release in parsed.release_types:
-            key = normalize_text(f"{parsed.ingredient_core} {release}")
-            rxcuis.extend(self.repository.ingredient_release_lookup.get(key, []))
+        for component in components:
+            for strength in parsed.strengths:
+                key = normalize_text(f"{component} {strength}")
+                rxcuis.extend(self.repository.ingredient_strength_lookup.get(key, []))
+            for form in parsed.dose_forms:
+                key = normalize_text(f"{component} {form}")
+                rxcuis.extend(self.repository.ingredient_form_lookup.get(key, []))
+            for release in parsed.release_types:
+                key = normalize_text(f"{component} {release}")
+                rxcuis.extend(self.repository.ingredient_release_lookup.get(key, []))
+        if len(components) >= 2:
+            component_sets = [
+                set(self.repository.core_lookup.get(normalize_text(component), []))
+                for component in components
+            ]
+            if all(component_sets):
+                rxcuis.extend(sorted(set.intersection(*component_sets)))
         return self._rows_for_rxcuis(rxcuis, exact_structured_match=True)
 
     # ------------------------------------------------------------
@@ -248,7 +323,7 @@ class RxNormRetriever:
                     rxcui=rxcui,
                     tty=row["concept_tty"],
                     tier=row["tier"],
-                    name=row["text"],
+                    name=str(structured.get("name") or row["text"]),
                     active=row.get("active", True),
                     historical=row["tier"] == "historical",
                     candidate_priority=row.get("candidate_priority", 99),
@@ -281,7 +356,12 @@ class RxNormRetriever:
     def _lexical_score(self, parsed: ParsedDrugMention, candidate: RxNormCandidate) -> float:
         best = 0.0
         for term in candidate.matched_terms:
-            best = max(best, fuzz.partial_ratio(parsed.normalized_text, term) / 100.0)
+            normalized = normalize_text(term)
+            best = max(
+                best,
+                fuzz.ratio(parsed.normalized_text, normalized) / 100.0,
+                fuzz.token_set_ratio(parsed.normalized_text, normalized) / 100.0,
+            )
         return best
 
     def retrieve(self, parsed: ParsedDrugMention) -> dict[str, RxNormCandidate]:
@@ -291,6 +371,8 @@ class RxNormRetriever:
         """High-recall multi-variant retrieval with one unique-query encoding."""
         if not parsed_mentions:
             return []
+        for item in parsed_mentions:
+            self._recover_concatenated_components(item)
         variants_by_mention = [item.query_variants or [{
             "text": item.normalized_text, "source": "full_normalized",
         }] for item in parsed_mentions]
@@ -334,6 +416,7 @@ class RxNormRetriever:
             sources.extend((
                 ("exact_term", self.inject_exact_term(parsed)),
                 ("exact_ingredient", self.inject_exact_ingredient(parsed)),
+                ("exact_brand", self.inject_exact_brand(parsed)),
                 ("exact_structured", self.inject_structured(parsed)),
             ))
             for source_name, raw_results in sources:
@@ -363,6 +446,9 @@ class RxNormRetriever:
                     self._rows_for_rxcuis(historical_current),
                     "historical_current_mapping",
                 ).items():
-                    merged.setdefault(rxcui, candidate)
+                    if rxcui not in merged:
+                        merged[rxcui] = candidate
+                    elif "historical_current_mapping" not in merged[rxcui].retrieval_sources:
+                        merged[rxcui].retrieval_sources.append("historical_current_mapping")
             outputs.append(merged)
         return outputs

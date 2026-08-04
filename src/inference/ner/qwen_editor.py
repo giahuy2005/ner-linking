@@ -26,7 +26,7 @@ from .editor_schemas import (
 )
 
 
-PROMPT_VERSION = "qwen3_locked_editor_v6_safe_finalization"
+PROMPT_VERSION = "qwen3_locked_editor_v7_rxnorm_safe_finalization"
 _EDITOR_RESPONSE_FIELDS = frozenset({"request_id", "changes", "unresolved_ids"})
 _MISSING_RESPONSE_FIELDS = frozenset({"request_id", "additions", "unresolved_ids"})
 
@@ -531,6 +531,34 @@ def _span_validation_errors(
             for left, right in zip(ordered, ordered[1:])
         ):
             errors.append("merge_targets_not_adjacent")
+        if (
+            len(ordered) >= 2
+            and all(item.type == "THUỐC" and item.strong_consensus for item in ordered)
+            and any(
+                re.search(r"\b(?:va|và|and|hoac|hoặc)\b|[+,;]", _fold_surface(
+                    raw_text[left.position[1]:right.position[0]]
+                ))
+                for left, right in zip(ordered, ordered[1:])
+            )
+        ):
+            errors.append("merge_independent_strong_drugs")
+        final_type = operation.type or targets[0].type
+        for other in validation_candidates:
+            other_score = max((float(value) for value in other.scores.values()), default=0.0)
+            is_numeric_measurement = bool(re.search(
+                r"\d\s*(?:mg|mcg|g|ml|l|mmol|meq|iu|%)(?:\s*/\s*\d*\s*[a-z]+)?",
+                _fold_surface(other.text),
+            ))
+            if (
+                other.type == "KẾT_QUẢ_XÉT_NGHIỆM"
+                and final_type != other.type
+                and other_score >= 0.80
+                and is_numeric_measurement
+                and start <= other.position[0]
+                and end >= other.position[1]
+            ):
+                errors.append("merge_would_absorb_typed_measurement")
+                break
     return errors
 
 
@@ -699,6 +727,49 @@ def _plan_operation(
             and replacement.position[0] < entity.position[1]
             and replacement.position[1] > entity.position[0]
         ]
+        if operation.action == EditAction.MERGE and overlapping_unconsumed:
+            # Qwen often names a longer context candidate but omits a selected
+            # fragment fully contained by the same replacement. Auto-consume
+            # only weak/contested contained entities from this review region;
+            # never swallow an independent strong-consensus entity.
+            auto_consumed: set[str] = set()
+            for candidate_id in overlapping_unconsumed:
+                entity = entity_map[candidate_id]
+                candidate = by_id.get(candidate_id)
+                fully_contained = (
+                    replacement.position[0] <= entity.position[0]
+                    and replacement.position[1] >= entity.position[1]
+                )
+                structurally_related = bool(
+                    candidate is not None
+                    and (
+                        candidate_id in target_ids
+                        or set(candidate.related_candidate_ids) & set(ids)
+                        or any(
+                            candidate_id in item.related_candidate_ids
+                            for item in targets
+                        )
+                    )
+                )
+                contested = bool(
+                    candidate is not None
+                    and (
+                        not candidate.strong_consensus
+                        or candidate.negative_flags
+                    )
+                )
+                if fully_contained and structurally_related and contested:
+                    auto_consumed.add(candidate_id)
+            consumed_ids.update(auto_consumed)
+            overlapping_unconsumed = [
+                candidate_id for candidate_id in overlapping_unconsumed
+                if candidate_id not in auto_consumed
+            ]
+            if auto_consumed:
+                before_entities.extend(
+                    _entity_audit(entity_map[candidate_id])
+                    for candidate_id in sorted(auto_consumed)
+                )
         if overlapping_unconsumed:
             errors.append("replacement_overlaps_unconsumed_entity")
 
@@ -885,8 +956,12 @@ _SYMPTOM_FRAGMENTS = frozenset({"chi", "da", "duoc", "cac", "nhieu", "sau", "ton
 _DRUG_NOISE_TOKENS = frozenset({
     "ngay", "hang", "lieu", "cham", "moi", "tuan", "lan", "cach", "uong",
     "tiem", "truyen", "po", "iv", "im", "bid", "tid", "qid", "prn",
-    "mg", "mcg", "g", "ml", "l",
+    "mg", "mcg", "g", "ml", "l", "gram", "microgram", "microgam",
+    "giot", "phut", "sui", "vien", "ong", "goi", "chai",
 })
+_DRUG_PROCEDURE_PREFIX_RE = re.compile(
+    r"^(?:tho|loc mau|phau thuat|dat |chup |xet nghiem|truyen dich\b)"
+)
 _COORDINATION_RE = re.compile(r"(?:\b(?:va|hoac|hay|kem)\b|[,;/()]|\s[-–—]\s)")
 
 
@@ -933,6 +1008,8 @@ def _unsafe_fragment_reason(entity: NerEntity) -> str | None:
         ]
         if entity.text.lstrip().startswith("/") or not meaningful:
             return "dose_or_administration_fragment"
+        if _DRUG_PROCEDURE_PREFIX_RE.match(folded):
+            return "procedure_or_supportive_care_not_drug"
     return None
 
 
@@ -1085,6 +1162,229 @@ def _resolve_global_overlaps(
             })
     return sorted(selected, key=lambda item: (*item.position, item.type)), audit
 
+def _recover_catalogue_compositions(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Recover a semantically complete span from split low-confidence pieces.
+
+    This is a general boundary reconciliation step, not a surface rule. A
+    candidate must exactly cover at least two selected pieces, have structural
+    conflict evidence, and must not swallow multiple strong independent spans.
+    """
+    selected = list(entities)
+    selected_keys = {_entity_key(item) for item in selected}
+    proposals: list[tuple[float, CandidateEvidence, list[NerEntity]]] = []
+    for candidate in catalogue:
+        key = (candidate.position[0], candidate.position[1], candidate.type)
+        if key in selected_keys or not candidate.text or len(candidate.text) > 96:
+            continue
+        if raw_text[candidate.position[0]:candidate.position[1]] != candidate.text:
+            continue
+        score = max((float(value) for value in candidate.scores.values()), default=0.0)
+        if score < 0.50 or not set(candidate.negative_flags) & {
+            "possible_merge", "boundary_disagreement", "type_disagreement",
+        }:
+            continue
+        contained = [
+            entity for entity in selected
+            if candidate.position[0] <= entity.position[0]
+            and candidate.position[1] >= entity.position[1]
+        ]
+        if len(contained) < 2:
+            continue
+        contained_evidence: list[CandidateEvidence | None] = []
+        strong_count = 0
+        for entity in contained:
+            evidence = next((
+                item for item in catalogue
+                if item.position == entity.position and item.type == entity.type
+            ), None)
+            contained_evidence.append(evidence)
+            if evidence is not None and evidence.strong_consensus:
+                strong_count += 1
+        protected_count = sum(
+            evidence is not None and max(
+                (float(value) for value in evidence.scores.values()), default=0.0
+            ) >= 0.90
+            for evidence in contained_evidence
+        )
+        if strong_count >= 2:
+            continue
+        if protected_count >= 1 and len({entity.type for entity in contained}) >= 2:
+            continue
+        # Reconcile token/boundary fragments, not two already-complete
+        # synonymous concepts (e.g. a diagnosis followed by its expansion).
+        fragment_like_count = sum(
+            len(_surface_tokens(entity.text)) == 1 or len(entity.text.strip()) <= 4
+            for entity in contained
+        )
+        if fragment_like_count == 0 and len(contained) < 3:
+            continue
+        type_counts: dict[str, int] = {}
+        for entity in contained:
+            type_counts[entity.type] = type_counts.get(entity.type, 0) + 1
+        majority = max(type_counts.values())
+        if type_counts.get(candidate.type, 0) < majority:
+            continue
+        # Do not fuse two high-confidence independent concepts separated by
+        # punctuation; low-confidence token fragments remain eligible.
+        if re.search(r"[,;]", candidate.text) and sum(float(item.score or 0.0) >= 0.75 for item in contained) >= 2:
+            continue
+        ordered_contained = sorted(contained, key=lambda item: item.position)
+        gaps = " ".join(
+            _fold_surface(raw_text[left.position[1]:right.position[0]])
+            for left, right in zip(ordered_contained, ordered_contained[1:])
+        )
+        if re.search(r"\b(?:sau khi|truoc khi|vi|do|nhung|mac du|het)\b", gaps):
+            continue
+        contained_scores: list[float] = []
+        for entity, evidence in zip(contained, contained_evidence):
+            if evidence is not None:
+                contained_scores.append(max(
+                    (float(value) for value in evidence.scores.values()),
+                    default=float(entity.score or 0.0),
+                ))
+            else:
+                contained_scores.append(float(entity.score or 0.0))
+        average = sum(contained_scores) / len(contained_scores)
+        if score + 0.12 < average:
+            continue
+        completeness = len(contained) + min(2.0, len(candidate.text) / 32.0)
+        proposals.append((score + 0.05 * completeness, candidate, contained))
+
+    audit: list[dict[str, Any]] = []
+    used: set[tuple[int, int, str]] = set()
+    replacements: list[NerEntity] = []
+    for _priority, candidate, contained in sorted(proposals, key=lambda row: row[0], reverse=True):
+        contained_keys = {_entity_key(item) for item in contained}
+        if used & contained_keys:
+            continue
+        replacement = NerEntity(
+            candidate.text,
+            candidate.type,
+            normalize_assertions_for_type(
+                candidate.type,
+                [value for item in contained for value in item.assertions],
+            ),
+            candidate.position,
+            max(1.0, max((float(item.score or 0.0) for item in contained), default=0.0)),
+        )
+        used.update(contained_keys)
+        replacements.append(replacement)
+        audit.append({
+            "reason": "catalogue_composition_recovery",
+            "candidate_id": candidate.candidate_id,
+            "entities_before": [_entity_audit(item) for item in contained],
+            "entity_after": _entity_audit(replacement),
+        })
+    output = [item for item in selected if _entity_key(item) not in used]
+    output.extend(replacements)
+    return sorted(output, key=lambda item: (*item.position, item.type)), audit
+
+
+
+def _restore_strong_contained_drugs(
+    raw_text: str,
+    entities: list[NerEntity],
+    catalogue: list[CandidateEvidence],
+) -> tuple[list[NerEntity], list[dict[str, Any]]]:
+    """Replace unsafe long drug wrappers with exact strong contained mentions.
+
+    This is evidence-driven: no drug name is hard-coded. It handles explanatory
+    clauses ("X không gây...") and independently administered drugs joined by
+    conjunctions, while preserving genuine branded formulations introduced by
+    a nearby ``Brand:`` label.
+    """
+    by_key = {(item.position[0], item.position[1], item.type): item for item in catalogue}
+    output: list[NerEntity] = []
+    audit: list[dict[str, Any]] = []
+    clause_re = re.compile(
+        r"\b(?:khong gay|gay doc|gay quai thai|do dau|van con|nhung|"
+        r"dong thoi|sau khi|truoc khi|de dieu tri|co the su dung)\b"
+    )
+    coordination_re = re.compile(r"(?:\b(?:va|hoac|dong thoi|kem)\b|,)")
+
+    for entity in entities:
+        if entity.type != "THUỐC":
+            output.append(entity)
+            continue
+        folded = _fold_surface(entity.text)
+        outer_evidence = by_key.get(_entity_key(entity))
+        inner_rows: list[tuple[float, CandidateEvidence]] = []
+        for item in catalogue:
+            if item.type != "THUỐC" or item.position == entity.position:
+                continue
+            if not (entity.position[0] <= item.position[0] and entity.position[1] >= item.position[1]):
+                continue
+            score = max((float(value) for value in item.scores.values()), default=0.0)
+            if not (item.strong_consensus or (item.pre_llm_selected and score >= 0.90)):
+                continue
+            if raw_text[item.position[0]:item.position[1]] != item.text:
+                continue
+            inner_rows.append((score, item))
+        if not inner_rows:
+            output.append(entity)
+            continue
+
+        # Keep only a non-overlapping set of strongest exact contained drugs.
+        chosen_evidence: list[CandidateEvidence] = []
+        for _score, item in sorted(inner_rows, key=lambda row: (-row[0], row[1].position)):
+            if any(
+                item.position[0] < kept.position[1] and item.position[1] > kept.position[0]
+                for kept in chosen_evidence
+            ):
+                continue
+            chosen_evidence.append(item)
+        chosen_evidence.sort(key=lambda item: item.position)
+
+        replacement: list[CandidateEvidence] = []
+        marker = clause_re.search(folded)
+        if marker is not None:
+            # Strong candidate sharing the outer start is the medication prefix;
+            # clause candidates are span-head-only and never enter chosen_evidence.
+            prefix_rows = [
+                item for item in chosen_evidence
+                if item.position[0] == entity.position[0]
+            ]
+            if prefix_rows:
+                replacement = [max(
+                    prefix_rows,
+                    key=lambda item: max((float(value) for value in item.scores.values()), default=0.0),
+                )]
+        elif coordination_re.search(folded) and len(chosen_evidence) >= 2:
+            before = raw_text[max(0, entity.position[0] - 32):entity.position[0]]
+            introduced_by_brand = bool(re.search(r"[^\n:]{2,24}:\s*$", before))
+            outer_score = max(
+                (float(value) for value in (outer_evidence.scores if outer_evidence else {}).values()),
+                default=0.0,
+            )
+            outer_is_consensus = bool(outer_evidence and outer_evidence.strong_consensus)
+            if not introduced_by_brand and not outer_is_consensus:
+                replacement = chosen_evidence
+
+        if not replacement:
+            output.append(entity)
+            continue
+        replacement_entities = [
+            NerEntity(
+                item.text, item.type,
+                normalize_assertions_for_type(item.type, entity.assertions),
+                item.position,
+                max((float(value) for value in item.scores.values()), default=entity.score),
+            )
+            for item in replacement
+        ]
+        output.extend(replacement_entities)
+        audit.append({
+            "reason": "restore_strong_contained_drugs",
+            "entity_before": _entity_audit(entity),
+            "entities_after": [_entity_audit(item) for item in replacement_entities],
+        })
+    dedup = {_entity_key(item): item for item in output}
+    return sorted(dedup.values(), key=lambda item: (*item.position, item.type)), audit
+
 def finalize_entities_after_editor(
     raw_text: str,
     entities: list[NerEntity],
@@ -1092,9 +1392,15 @@ def finalize_entities_after_editor(
 ) -> tuple[list[NerEntity], list[dict[str, Any]]]:
     """Conservative record-level cleanup after all editor/recovery regions."""
     unique = {_entity_key(item): item for item in entities}
+    restored, restore_audit = _restore_strong_contained_drugs(
+        raw_text, list(unique.values()), catalogue
+    )
+    composed, composition_audit = _recover_catalogue_compositions(
+        raw_text, restored, catalogue
+    )
     kept: list[NerEntity] = []
-    audit: list[dict[str, Any]] = []
-    for entity in sorted(unique.values(), key=lambda item: (*item.position, item.type)):
+    audit: list[dict[str, Any]] = [*restore_audit, *composition_audit]
+    for entity in sorted(composed, key=lambda item: (*item.position, item.type)):
         reason = _unsafe_fragment_reason(entity)
         if reason is not None:
             audit.append({
